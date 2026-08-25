@@ -1,0 +1,55 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode build products and caches
+build/
+Build/
+BuildOutput/
+DerivedData/
+*.xcarchive
+*.dSYM
+*.dSYM.zip
+*.ipa
+*.app
+
+# Xcode user-specific settings
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods / Carthage generated artifacts
+Pods/
+Carthage/Build/
+
+# Temporary and local working files
+staging/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+
+# IDE metadata
+.idea/
+.vscode/
