@@ -46,6 +46,10 @@ nonisolated struct AISample: Codable, Identifiable, Sendable {
     var rois: [AIRegion]
     var sourceHashes: [String: String]? = nil
     var resultNote: String? = nil
+    var sourcePSD: String? = nil
+    var psdHash: String? = nil
+    var materialKind: String? = nil
+    var answerConfirmed: Bool? = nil
     var dimensions: String { "\(width) × \(height)" }
     var pixelSize: CGSize { CGSize(width: width, height: height) }
     var alignmentTitle: String {
@@ -63,11 +67,12 @@ nonisolated enum AISampleUse: String, Codable, CaseIterable, Identifiable {
 }
 
 nonisolated struct AISampleCuration: Codable, Sendable {
+    // Retain legacy fields when reading/writing existing libraries; they no longer affect training.
     var specimenGroup: String = ""
     var groupConfirmed: Bool = false
     var referenceKind: String = "人工精扣"
     func canTrain(_ sample: AISample) -> Bool {
-        sample.alignment == "aligned" && sample.reference != nil && groupConfirmed && !specimenGroup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        sample.alignment == "aligned" && sample.reference != nil && sample.answerConfirmed == true
     }
 }
 
@@ -77,6 +82,7 @@ nonisolated struct AICuration: Codable, Sendable {
     var imported: [AISample] = []
     var predictions: [String: AIOutput] = [:]
     var resultNotes: [String: String]? = nil
+    var corrections: [String: String]? = nil
     func use(for sampleID: String) -> AISampleUse {
         guard let record = samples[sampleID], record.groupConfirmed else { return .unassigned }
         return groupUses[record.specimenGroup] ?? .unassigned
@@ -89,6 +95,7 @@ nonisolated struct AIOutput: Codable, Sendable {
     var inputHash: String? = nil
     var predictionHash: String? = nil
     var alphaHash: String? = nil
+    var modelName: String? = nil
 }
 
 nonisolated struct AIEvent: Decodable, Sendable {
@@ -100,6 +107,10 @@ nonisolated struct AIEvent: Decodable, Sendable {
     var outputDirectory: String?
     var prediction: String?
     var predictionAlpha: String?
+    var correctionPSD: String?
+    var trainingRun: AITrainingRun?
+    var trainingRuns: [AITrainingRun]?
+    var modelName: String?
 }
 
 nonisolated struct AIViewport {
@@ -122,4 +133,32 @@ nonisolated struct AIViewport {
 nonisolated struct AIWorkspaceError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
+}
+
+nonisolated struct AITrainingRun: Codable, Identifiable, Sendable {
+    var id: String
+    var name: String
+    var status: String
+    var step: Int
+    var totalSteps: Int
+    var epoch: Int
+    var epochs: Int
+    var sampleCount: Int
+    var createdAt: String
+    var outputDirectory: String
+    var message: String
+    var loss: Double?
+    var modelPath: String?
+    var isSmoke: Bool?
+    var progress: Double { totalSteps > 0 ? min(1, Double(step) / Double(totalSteps)) : 0 }
+    var isUsable: Bool { status == "completed" && modelPath != nil && isSmoke != true }
+    var statusTitle: String {
+        switch status {
+        case "running": "训练中"
+        case "completed": "已完成"
+        case "cancelled": "已停止"
+        case "failed": "失败"
+        default: "已中断"
+        }
+    }
 }

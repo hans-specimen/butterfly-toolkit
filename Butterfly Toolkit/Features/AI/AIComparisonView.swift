@@ -148,7 +148,7 @@ struct AICutoutView: View {
                                      subtitle: mode == .original ? "原始底图" : store.record(for: sample).referenceKind,
                                      imageSize: sample.pixelSize, background: background, viewport: $viewport)
                         AIImagePanel(path: mode == .alpha ? sample.predictionAlpha : sample.prediction,
-                                     title: mode == .alpha ? "AI 透明度" : "AI 结果", subtitle: "基础模型",
+                                     title: mode == .alpha ? "AI 透明度" : "AI 结果", subtitle: sample.prediction == nil ? "尚无结果" : (store.curation.predictions[sample.id]?.modelName ?? "预训练基础模型"),
                                      imageSize: sample.pixelSize, background: background, viewport: $viewport)
                     }.background(Color(nsColor: .separatorColor))
                         .onAppear { panelSize = CGSize(width: (proxy.size.width - 1) / 2, height: proxy.size.height - 34) }

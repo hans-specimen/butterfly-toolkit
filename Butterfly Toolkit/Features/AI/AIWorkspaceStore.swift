@@ -9,7 +9,15 @@ final class AIWorkspaceStore: ObservableObject {
     @Published var enginePath: String
     @Published var catalog: AICatalog?
     @Published var samples: [AISample] = []
-    @Published var selectedID: String?
+    @Published var selectedID: String? {
+        didSet {
+            guard selectedID != oldValue else { return }
+            if let id = selectedID, pairedSamples.contains(where: { $0.id == id }) {
+                if !materialSelection.contains(id) { materialSelection = [id] }
+            } else { materialSelection = [] }
+        }
+    }
+    @Published private(set) var materialSelection: Set<String> = []
     @Published var curation = AICuration()
     @Published var isLoading = false
     @Published var processingID: String?
@@ -17,27 +25,45 @@ final class AIWorkspaceStore: ObservableObject {
     @Published var error: String?
     @Published var taskName = "白色缘毛 · 试验 01"
     @Published var trainingSelection: Set<String> = []
+    @Published var trainingRuns: [AITrainingRun] = []
+    @Published var currentTraining: AITrainingRun?
+    @Published var isTraining = false
+    @Published var trainingEpochs = 5
+    @Published var trainingInputSize = 512
+    @Published var inferenceModelID = "base"
+    var trainingRunner: AIProcessRunner?
+    var trainingOperation: Task<Void, Never>?
     @Published var device = "mps"
+    @Published var workspacePath = "/Users/hans/SynologyDrive/Developer/butterfly-ai-footage"
+    @Published var importSummary: [String] = []
     private var runner: AIProcessRunner?
     private var operation: Task<Void, Never>?
     private var hasLoaded = false
-    private var selectedRunPath: String?
 
     init() {
         enginePath = UserDefaults.standard.string(forKey: "aiEnginePath") ?? ""
-        selectedRunPath = UserDefaults.standard.string(forKey: "aiRunPath")
+        UserDefaults.standard.removeObject(forKey: "aiRunPath")
     }
     var selected: AISample? { samples.first { $0.id == selectedID } }
     var engineURL: URL { URL(fileURLWithPath: enginePath, isDirectory: true) }
-    var busy: Bool { isLoading || processingID != nil }
+    var workspaceURL: URL { URL(fileURLWithPath: workspacePath, isDirectory: true) }
+    var busy: Bool { isLoading || processingID != nil || isTraining }
     var pairedSamples: [AISample] { samples.filter { $0.reference != nil } }
+    func setMaterialSelection(_ ids: Set<String>) {
+        let orderedIDs = pairedSamples.map(\.id)
+        let valid = ids.intersection(orderedIDs)
+        if materialSelection != valid { materialSelection = valid }
+        // A range/all selection keeps the current preview; fallback follows table order, never Set order.
+        if let selectedID, valid.contains(selectedID) { return }
+        selectedID = orderedIDs.first { valid.contains($0) }
+    }
     func selectPairedSampleIfAvailable() {
         if selected?.reference == nil, let first = pairedSamples.first { selectedID = first.id }
     }
     var alignedCount: Int { samples.filter { $0.alignment == "aligned" }.count }
     var trainingCandidates: [AISample] { samples.filter { canTrain($0) } }
     func canTrain(_ sample: AISample) -> Bool {
-        record(for: sample).canTrain(sample) && curation.use(for: sample.id) == .training
+        record(for: sample).canTrain(sample)
     }
     func record(for sample: AISample) -> AISampleCuration { curation.samples[sample.id] ?? AISampleCuration() }
 
@@ -50,39 +76,26 @@ final class AIWorkspaceStore: ObservableObject {
         panel.canChooseFiles = false; panel.canChooseDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         enginePath = url.path
-        selectedRunPath = nil
-        UserDefaults.standard.removeObject(forKey: "aiRunPath")
         UserDefaults.standard.set(enginePath, forKey: "aiEnginePath")
         load()
     }
-    func chooseRun() {
-        guard !busy else { return }
-        let panel = NSOpenPanel()
-        panel.title = "载入已有测试批次"
-        panel.message = "选择包含 run.json 的测试结果文件夹。"
-        panel.canChooseFiles = false; panel.canChooseDirectories = true
-        panel.directoryURL = engineURL.appendingPathComponent("outputs")
-        if panel.runModal() == .OK, let url = panel.url { load(run: url) }
-    }
-    func load(run: URL? = nil) {
+    func load() {
         guard !busy, !enginePath.isEmpty else { return }
-        isLoading = true; error = nil; status = "正在读取本机模型与测试记录…"
+        isLoading = true; error = nil; status = "正在读取本机模型与当前素材库…"
         let engine = engineURL
-        let requestedRun = (run?.path ?? selectedRunPath).flatMap { $0.isEmpty ? nil : $0 }
+        let workspace = workspaceURL
         let worker = AIProcessRunner(); runner = worker
         catalog = nil; samples = []; selectedID = nil; trainingSelection = []
         operation = Task {
             defer { isLoading = false; runner = nil; operation = nil }
             do {
-                let event = try await worker.run(engine: engine, arguments: ["catalog"] + (requestedRun.map { ["--run", $0] } ?? [])) { _ in }
+                let event = try await worker.run(engine: engine, arguments: ["catalog"], workspace: workspace) { _ in }
                 guard let loaded = event.catalog, loaded.schemaVersion == 1 else { throw AIWorkspaceError(message: "AI 连接返回了不支持的数据格式，请检查连接脚本版本。") }
                 catalog = loaded
-                selectedRunPath = loaded.runPath.isEmpty ? nil : loaded.runPath
-                UserDefaults.standard.set(selectedRunPath, forKey: "aiRunPath")
                 curation = try await Task.detached {
-                    try AIFileValidation.readCuration(engine: engine, samples: loaded.samples)
+                    try AIFileValidation.readCuration(engine: engine, samples: loaded.samples, workspace: workspace)
                 }.value
-                samples = loaded.samples + curation.imported.filter { item in !loaded.samples.contains(where: { $0.id == item.id }) }
+                samples = curation.imported
                 for index in samples.indices {
                     if let note = curation.resultNotes?[samples[index].id] {
                         samples[index].prediction = nil; samples[index].predictionAlpha = nil; samples[index].resultNote = note
@@ -92,6 +105,8 @@ final class AIWorkspaceStore: ObservableObject {
                     }
                 }
                 selectedID = samples.first?.id
+                await loadTrainingHistory()
+                saveCuration()
                 status = "已载入 \(samples.count) 张图片 · \(pairedSamples.count) 份配对训练素材"
             } catch is CancellationError { status = "已取消读取" }
             catch { catalog = nil; samples = []; self.error = error.localizedDescription; status = "载入失败" }
@@ -105,7 +120,7 @@ final class AIWorkspaceStore: ObservableObject {
         operation = Task {
             defer { processingID = nil; runner = nil; operation = nil }
             do {
-                let result = try await worker.run(engine: engine, arguments: ["infer", "--input", sample.original, "--device", device]) { [self] event in
+                let result = try await worker.run(engine: engine, arguments: ["infer", "--input", sample.original, "--device", device] + (inferenceModelID == "base" ? [] : ["--model", inferenceModelID]), workspace: workspaceURL) { [self] event in
                     if event.event == "status", let message = event.message { await self.setStatus(message) }
                 }
                 guard let prediction = result.prediction, let alpha = result.predictionAlpha,
@@ -113,7 +128,8 @@ final class AIWorkspaceStore: ObservableObject {
                     throw AIWorkspaceError(message: "推理进程结束，但没有找到完整输出。请检查结果目录。")
                 }
                 let verifiedOutput = try await Task.detached {
-                    let output = try AIFileValidation.captureOutput(prediction: prediction, alpha: alpha, original: sample.original)
+                    var output = try AIFileValidation.captureOutput(prediction: prediction, alpha: alpha, original: sample.original)
+                    output.modelName = result.modelName
                     let recordURL = URL(fileURLWithPath: prediction).deletingLastPathComponent().appendingPathComponent("result.json")
                     let record = try JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any]
                     guard record?["inputSha256"] as? String == output.inputHash else {
@@ -134,21 +150,13 @@ final class AIWorkspaceStore: ObservableObject {
     private func setStatus(_ message: String) { status = message }
     func cancel() { status = "正在停止处理…"; runner?.cancel() }
 
-    func updateCuration(sample: AISample, group: String, confirmed: Bool, use: AISampleUse) {
-        let group = group.trimmingCharacters(in: .whitespacesAndNewlines)
-        var record = record(for: sample)
-        record.specimenGroup = group; record.groupConfirmed = confirmed && !group.isEmpty
-        curation.samples[sample.id] = record
-        if record.groupConfirmed { curation.groupUses[group] = use }
-        trainingSelection = trainingSelection.filter { id in samples.contains { $0.id == id && canTrain($0) } }
-        saveCuration()
-    }
-    private func saveCuration() {
+    @discardableResult func saveCuration() -> Bool {
         do {
-            let url = engineURL.appendingPathComponent("outputs/toolkit-ai/workspace.json")
+            let url = workspaceURL.appendingPathComponent("outputs/toolkit-ai/workspace.json")
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try JSONEncoder().encode(curation).write(to: url, options: .atomic)
-        } catch { self.error = "素材设置未能保存：\(error.localizedDescription)" }
+            return true
+        } catch { self.error = "素材设置未能保存：\(error.localizedDescription)"; return false }
     }
     func reveal(_ path: String?) {
         guard let path else { return }
@@ -201,7 +209,7 @@ final class AIWorkspaceStore: ObservableObject {
         for (index, url) in urls.enumerated() {
             status = "正在添加 \(index + 1)/\(urls.count)：\(url.lastPathComponent)…"
             do {
-                let event = try await AIProcessRunner().run(engine: engineURL, arguments: ["import-image", "--input", url.path]) { _ in }
+                let event = try await AIProcessRunner().run(engine: engineURL, arguments: ["import-image", "--input", url.path], workspace: workspaceURL) { _ in }
                 guard event.event == "imported", let sample = event.sample, sample.reference == nil else {
                     throw AIWorkspaceError(message: "导入返回了无效图片记录，请检查 AI 连接脚本。")
                 }
@@ -213,10 +221,10 @@ final class AIWorkspaceStore: ObservableObject {
         if !failures.isEmpty { error = failures.joined(separator: "\n") }
     }
 
-    func importPair(original: URL, reference: URL, group: String, kind: String, confirmed: Bool) async -> Bool {
+    func importPair(original: URL, reference: URL, kind: String, confirmed: Bool) async -> Bool {
         guard !busy, catalog != nil else { return false }
         isLoading = true; defer { isLoading = false }
-        let engine = engineURL
+        let engine = workspaceURL
         do {
             var sample = try await Task.detached(priority: .userInitiated) {
                 var imported = try Self.preparePair(original: original, reference: reference, engine: engine)
@@ -225,8 +233,9 @@ final class AIWorkspaceStore: ObservableObject {
             }.value
             sample.alignment = confirmed ? "aligned" : "unverified"
             sample.alignmentNote = confirmed ? "用户已检查并确认原图与人工答案对齐" : "尺寸一致；内容对齐仍需人工确认，暂不可训练"
+            sample.answerConfirmed = confirmed
             curation.imported.append(sample)
-            curation.samples[sample.id] = AISampleCuration(specimenGroup: group.trimmingCharacters(in: .whitespacesAndNewlines), groupConfirmed: confirmed && !group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, referenceKind: kind)
+            curation.samples[sample.id] = AISampleCuration(referenceKind: kind)
             samples.append(sample); selectedID = sample.id; saveCuration()
             status = "已复制导入素材；源文件保持不变"
             return true

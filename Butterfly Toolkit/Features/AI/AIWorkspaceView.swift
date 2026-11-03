@@ -8,7 +8,6 @@ struct AIWorkspaceView: View {
     var navigate: (ToolPage) -> Void
     @State private var inspector = true
     @State private var showImport = false
-    @State private var showCuration = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -16,14 +15,14 @@ struct AIWorkspaceView: View {
                 ContentUnavailableView {
                     Label("连接 Butterfly AI", systemImage: "brain")
                 } description: {
-                    Text("选择已配置好的 AI 项目文件夹，载入本机模型与已有测试结果。Toolkit 与 AI 项目保持独立。")
+                    Text("选择已配置好的 AI 项目以连接本机模型。素材只从指定的 butterfly-ai-footage 素材库载入。")
                 } actions: { Button("选择 AI 项目…", action: store.chooseEngine).buttonStyle(.borderedProminent) }
             } else if store.isLoading && store.catalog == nil {
                 ProgressView("正在读取本机资料…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 switch page {
                 case .aiCutout: AICutoutView(store: store)
-                case .aiSamples: AISamplesView(store: store)
+                case .aiSamples: AISamplesView(store: store, navigate: navigate)
                 case .aiTraining: AITrainingView(store: store)
                 case .aiModels: AIModelsView(store: store, navigate: navigate)
                 default: EmptyView()
@@ -46,7 +45,6 @@ struct AIWorkspaceView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 Menu {
                     Button("选择 AI 项目…", action: store.chooseEngine)
-                    Button("载入测试批次…", action: store.chooseRun).disabled(store.enginePath.isEmpty)
                     Button("刷新记录") { store.load() }.disabled(store.enginePath.isEmpty)
                     Divider()
                     Text(store.enginePath.isEmpty ? "尚未连接" : store.enginePath)
@@ -57,10 +55,16 @@ struct AIWorkspaceView: View {
                         .disabled(store.catalog == nil || store.busy).help("添加 PNG 或 JPEG，可多选，无需人工答案")
                 }
                 if page == .aiSamples {
-                    Button { showImport = true } label: { Label("导入训练素材", systemImage: "plus") }
-                        .disabled(store.catalog == nil || store.busy).help("导入原图与人工答案 PNG")
+                    Menu {
+                        Button("导入三层 PSD…") { store.choosePSDs() }
+                        Button("读取 PS 修正…") { store.choosePSDs(correction: true) }
+                        Divider()
+                        Button("导入已有成对 PNG…") { showImport = true }
+                    } label: { Label("导入素材", systemImage: "plus") }.disabled(store.catalog == nil || store.busy)
                 }
                 if page == .aiCutout {
+                    Button("在 PS 中修正", action: store.editSelectedInPhotoshop).disabled(store.busy || store.selected?.prediction == nil)
+                    Button("读取 PS 修正…") { store.choosePSDs(correction: true); navigate(.aiSamples) }.disabled(store.busy)
                     Button(action: store.exportSelected) { Label("另存结果", systemImage: "square.and.arrow.up") }
                         .disabled(store.selected?.prediction == nil)
                 }
@@ -75,7 +79,6 @@ struct AIWorkspaceView: View {
             }.inspectorColumnWidth(min: 230, ideal: 260, max: 300)
         }
         .sheet(isPresented: $showImport) { AIImportSheet(store: store) }
-        .sheet(isPresented: $showCuration) { if let sample = store.selected { AICurationSheet(store: store, sample: sample) } }
         .alert("AI 工作区", isPresented: Binding(get: { store.error != nil }, set: { if !$0 { store.error = nil } })) {
             Button("好", role: .cancel) { store.error = nil }
         } message: { Text(store.error ?? "") }
@@ -102,6 +105,10 @@ struct AIWorkspaceView: View {
                 AIInfoRow("状态", store.processingID == sample.id ? "处理中" : (sample.prediction == nil ? "尚未处理" : "已有结果"))
                 AIInfoRow("输出", "原尺寸透明 PNG")
                 if let note = sample.resultNote, sample.prediction == nil { Text(note).font(.caption).foregroundStyle(.orange) }
+                Picker("抠图模型", selection: $store.inferenceModelID) {
+                    Text("预训练基础模型").tag("base")
+                    ForEach(store.trainedModels) { run in Text(run.name).tag(run.id) }
+                }.disabled(store.busy)
                 Picker("计算设备", selection: $store.device) { Text("Mac GPU").tag("mps"); Text("CPU").tag("cpu") }.disabled(store.busy)
                 Button(sample.prediction == nil ? "开始抠图" : "重新抠图", action: store.runInference)
                     .buttonStyle(.borderedProminent).disabled(store.busy || store.catalog?.model.available != true)
@@ -128,20 +135,18 @@ struct AIWorkspaceView: View {
                 Label(sample.alignmentTitle, systemImage: sample.alignment == "aligned" ? "checkmark.circle" : "exclamationmark.circle")
                     .foregroundStyle(sample.alignment == "aligned" ? Color.secondary : .orange)
                 Text(sample.alignmentNote).font(.callout).foregroundStyle(.secondary)
-                if sample.alignment != "aligned" { Text("对齐问题处理并重新核对前，不能选入训练。请导入修正后的成对 PNG。").font(.caption).foregroundStyle(.orange) }
-                Divider()
-                Text("训练用途").fontWeight(.semibold)
-                AIInfoRow("标本组", store.record(for: sample).specimenGroup.isEmpty ? "待确认" : store.record(for: sample).specimenGroup)
-                AIInfoRow("用途", store.curation.use(for: sample.id).rawValue)
-                Text("同一只标本的正反面及所有裁切共用标本组；修改用途会作用于整组。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Button("设置标本组与用途…") { showCuration = true }
+                if sample.alignment != "aligned" { Text("检查未通过，不能选入训练。请修正 PSD 后重新导入。").font(.caption).foregroundStyle(.orange) }
+                if store.pendingAnswerCount > 0 {
+                    Text("审阅所选素材后，点击确认答案；检查通过的素材即可用于训练。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    AIConfirmAnswersButton(store: store)
+                }
             }
         case .aiTraining:
             Text("训练准备").font(.headline)
             Divider()
             Text("本轮目标").fontWeight(.semibold)
-            Text("从少量人工精扣样本验证模型能否学会保留细毛。真实训练需后续接入。").foregroundStyle(.secondary)
+            Text("用已确认的素材微调抠图模型，新版本单独保存。").foregroundStyle(.secondary)
             Divider()
             AIInfoRow("基础模型", store.catalog?.model.available == true ? "本机文件可用" : "未就绪")
             AIInfoRow("人工答案", "\(store.samples.filter { $0.reference != nil }.count) 份")
@@ -149,8 +154,8 @@ struct AIWorkspaceView: View {
             AIInfoRow("可选训练素材", "\(store.trainingCandidates.count) 份")
             AIInfoRow("本次已选", "\(store.trainingSelection.count) 份")
             Divider()
-            Label("训练后端未接入", systemImage: "pause.circle").foregroundStyle(.secondary)
-            Text("尚无真实训练任务、进度或训练结果。当前设置只用于准备，不会运行训练。")
+            Label(store.isTraining ? "训练中" : "训练已接入", systemImage: store.isTraining ? "clock" : "checkmark.circle").foregroundStyle(.secondary)
+            Text("使用 CPU 训练；新模型保存在 butterfly-matte/models，任务记录保存在项目 outputs/training。成功后，素材库中未变化的 PSD 会移入“已训练PSD”。")
                 .font(.callout).foregroundStyle(.secondary)
         case .aiModels:
             Text("模型信息").font(.headline)
@@ -180,47 +185,21 @@ struct AIInfoRow: View {
     }
 }
 
-struct AICurationSheet: View {
-    @ObservedObject var store: AIWorkspaceStore
-    let sample: AISample
-    @Environment(\.dismiss) private var dismiss
-    @State private var group = ""
-    @State private var confirmed = false
-    @State private var use: AISampleUse = .unassigned
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("标本组与用途").font(.title2).fontWeight(.semibold)
-            Text(sample.name).foregroundStyle(.secondary)
-            TextField("标本编号（同只标本使用同一编号）", text: $group)
-            Toggle("我已确认：此编号涵盖同一只标本的正反面与所有裁切", isOn: $confirmed)
-            Picker("整组用途", selection: $use) { ForEach(AISampleUse.allCases) { Text($0.rawValue).tag($0) } }
-            Text("这只保存分组信息，不启动训练。对齐异常的图片即使属于训练组，也无法选入训练任务。")
-                .font(.callout).foregroundStyle(.secondary)
-            HStack { Button("取消", role: .cancel) { dismiss() }; Spacer(); Button("保存") {
-                store.updateCuration(sample: sample, group: group, confirmed: confirmed, use: use); dismiss()
-            }.buttonStyle(.borderedProminent).disabled(group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !confirmed) }
-        }.padding(26).frame(width: 500)
-            .onAppear { let record = store.record(for: sample); group = record.specimenGroup; confirmed = record.groupConfirmed; use = store.curation.use(for: sample.id) }
-    }
-}
-
 struct AIImportSheet: View {
     @ObservedObject var store: AIWorkspaceStore
     @Environment(\.dismiss) private var dismiss
     @State private var original: URL?
     @State private var reference: URL?
-    @State private var group = ""
     @State private var kind = "人工精扣"
     @State private var confirmed = false
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("导入成对训练素材").font(.title2).fontWeight(.semibold)
-            Text("无损复制到 AI 项目的派生素材目录，原始文件保持不变。请先从 PSD 导出同尺寸、同位置的 PNG。")
+            Text("将已有 PNG 无损复制到素材库。PSD 请优先使用“三层 PSD”入口自动提取并检查。此 PNG 入口的内容对齐由你核对。")
                 .foregroundStyle(.secondary)
             HStack { Button("选择原图 PNG…") { original = choosePNG("选择原图 PNG") }; Text(original?.lastPathComponent ?? "未选择").lineLimit(1) }
             HStack { Button("选择人工答案 PNG…") { reference = choosePNG("选择带透明度的人工答案 PNG") }; Text(reference?.lastPathComponent ?? "未选择").lineLimit(1) }
             Picker("答案来源", selection: $kind) { Text("人工精扣").tag("人工精扣"); Text("AI 结果经人工修正").tag("AI 结果经人工修正") }
-            TextField("标本组编号（同只标本使用同一编号）", text: $group)
             Toggle("我已逐像素检查对齐，并确认人工答案可作为标准答案", isOn: $confirmed)
             Text("未确认时可以导入供检查，但不能选入训练。AI 原始结果不能直接作为标准答案。")
                 .font(.caption).foregroundStyle(.secondary)
@@ -231,8 +210,8 @@ struct AIImportSheet: View {
                 if store.isLoading { ProgressView().controlSize(.small) }
                 Button("复制并导入") {
                     guard let original, let reference else { return }
-                    Task { if await store.importPair(original: original, reference: reference, group: group, kind: kind, confirmed: confirmed) { dismiss() } }
-                }.buttonStyle(.borderedProminent).disabled(original == nil || reference == nil || store.busy || (confirmed && group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                    Task { if await store.importPair(original: original, reference: reference, kind: kind, confirmed: confirmed) { dismiss() } }
+                }.buttonStyle(.borderedProminent).disabled(original == nil || reference == nil || store.busy)
             }
         }.padding(26).frame(width: 560)
     }

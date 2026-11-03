@@ -14,10 +14,10 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
         if running?.isRunning == true { running?.terminate() }
     }
 
-    func run(engine: URL, arguments: [String], onEvent: @escaping @Sendable (AIEvent) async -> Void) async throws -> AIEvent {
+    func run(engine: URL, arguments: [String], workspace: URL? = nil, onEvent: @escaping @Sendable (AIEvent) async -> Void) async throws -> AIEvent {
         try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) { [self] in
-                try await execute(engine: engine, arguments: arguments, onEvent: onEvent)
+                try await execute(engine: engine, arguments: (workspace.map { ["--workspace", $0.path] } ?? []) + arguments, onEvent: onEvent)
             }.value
         } onCancel: { self.cancel() }
     }
