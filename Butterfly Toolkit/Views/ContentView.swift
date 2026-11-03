@@ -9,6 +9,11 @@ import SwiftUI
 
 enum ToolPage: String, CaseIterable, Identifiable {
 
+    case aiCutout = "AI 抠图"
+    case aiSamples = "训练素材"
+    case aiTraining = "模型训练"
+    case aiModels = "模型版本"
+
     case rename = "批量重命名"
     case compress = "图片压缩"
     case rotate = "批量旋转"
@@ -26,6 +31,11 @@ enum ToolPage: String, CaseIterable, Identifiable {
     var icon: String {
 
         switch self {
+
+        case .aiCutout: return "viewfinder"
+        case .aiSamples: return "photo.stack"
+        case .aiTraining: return "brain"
+        case .aiModels: return "square.3.layers.3d"
 
         case .rename:
             return "textformat"
@@ -59,29 +69,37 @@ enum ToolPage: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
 
-    @State private var selectedPage: ToolPage? = .rename
+    @State private var selectedPage: ToolPage? = .aiCutout
+    @StateObject private var aiStore = AIWorkspaceStore()
 
     var body: some View {
 
         NavigationSplitView {
 
-            List(
-                ToolPage.allCases,
-                selection: $selectedPage
-            ) { page in
-
-                Label(
-                    page.rawValue,
-                    systemImage: page.icon
-                )
-                .tag(page)
+            List(selection: $selectedPage) {
+                Section("AI 工作区") {
+                    ForEach([ToolPage.aiCutout, .aiSamples, .aiTraining, .aiModels]) { page in
+                        Label(page.rawValue, systemImage: page.icon).tag(page)
+                    }
+                }
+                Section("图片工具") {
+                    ForEach([ToolPage.rename, .compress, .rotate, .smartCrop, .focusStack, .xianyuProduct, .psdExport, .transparentPNGTrim]) { page in
+                        Label(page.rawValue, systemImage: page.icon).tag(page)
+                    }
+                }
+                Section {
+                    Label(ToolPage.about.rawValue, systemImage: ToolPage.about.icon).tag(ToolPage.about)
+                }
             }
-            .navigationTitle("HANS蝴蝶工具")
-            .frame(minWidth: 190)
+            .navigationTitle("Butterfly Toolkit")
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
 
         } detail: {
 
             switch selectedPage {
+
+            case .aiCutout, .aiSamples, .aiTraining, .aiModels:
+                AIWorkspaceView(store: aiStore, page: selectedPage ?? .aiCutout) { selectedPage = $0 }
 
             case .rename:
                 RenameView()
@@ -117,7 +135,7 @@ struct ContentView: View {
         }
         .frame(
             minWidth: 1200,
-            minHeight: 800
+            minHeight: 720
         )
     }
 }

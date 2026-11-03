@@ -6,11 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXFileReference section */
-		3AE0A8743021AACD00D0ACE5 /* Butterfly Toolkit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Butterfly Toolkit.app"; sourceTree = BUILT_PRODUCTS_DIR; };
-		A10000000000000000000001 /* Butterfly ToolkitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Butterfly ToolkitTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
-/* End PBXFileReference section */
-
 /* Begin PBXContainerItemProxy section */
 		A10000000000000000000007 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -20,6 +15,11 @@
 			remoteInfo = "Butterfly Toolkit";
 		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		3AE0A8743021AACD00D0ACE5 /* Butterfly Toolkit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Butterfly Toolkit.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000001 /* Butterfly ToolkitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Butterfly ToolkitTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		3AE0A8763021AACD00D0ACE5 /* Butterfly Toolkit */ = {

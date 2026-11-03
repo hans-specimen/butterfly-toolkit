@@ -13,5 +13,6 @@ struct Butterfly_ToolkitApp: App {
         WindowGroup {
             ContentView()
         }
+        .defaultSize(width: 1440, height: 920)
     }
 }
