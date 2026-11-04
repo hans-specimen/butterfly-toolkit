@@ -266,12 +266,15 @@ struct FocusStackView: View {
 
         Task {
             var failures: [String] = []
+            let owner = UUID()
             for (index, job) in jobs.enumerated() {
                 currentFileName = job.destinationURL.lastPathComponent
                 do {
-                    try await Task.detached(priority: .userInitiated) {
-                        try FocusStackProcessor.process(job, photoshopApplicationName: photoshop)
-                    }.value
+                    try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
+                        try await Task.detached(priority: .userInitiated) {
+                            try FocusStackProcessor.process(job, photoshopApplicationName: photoshop)
+                        }.value
+                    }
                 } catch {
                     failures.append("\(job.destinationURL.lastPathComponent)：\(error.localizedDescription)")
                     break

@@ -198,7 +198,7 @@ final class WorkflowStateTests: XCTestCase {
     func testMaskOnlyPSDChangeRequiresGeometryAndHDValidationWithoutRerunningAI() throws {
         var batch = try finishedFixture()
         batch.specimens[0].front.geometryRequest.angleStrategy = .manual(degrees: 3.5)
-        batch.specimens[0].front.geometrySolution = GeometrySolution(sourceVersion: "psd-v1", angleDegrees: 3.5,
+        batch.specimens[0].front.geometrySolution = GeometrySolution(sourceVersion: "psd-v1", angleDegrees: 3.5, rotationPivot: CGPoint(x: 50, y: 50),
             leftWingTip: nil, rightWingTip: nil, subjectBounds: CGRect(x: 100, y: 100, width: 2400, height: 1800),
             sourceCropRect: CGRect(x: 0, y: 0, width: 3000, height: 2250), outputSize: CGSize(width: 3000, height: 2250),
             actualMargins: WorkflowMargins(left: 0.1, top: 0.1, right: 0.1, bottom: 0.1), isApplicable: true, reason: nil)

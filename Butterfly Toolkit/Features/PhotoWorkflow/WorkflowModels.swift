@@ -211,6 +211,7 @@ nonisolated struct StackPNG: Codable, Equatable, Sendable {
     var pixelSize: CGSize
     var orientation: Int
     var colorProfile: String
+    /// Read the alpha channel for source-background validity; this may be the RGBA PNG itself, never its luminance.
     var validBackgroundAlphaURL: URL?
 }
 
@@ -253,8 +254,11 @@ nonisolated struct GeometrySolution: Codable, Equatable, Sendable {
     var sourceVersion: String
     /// Incremental to the identified saved source snapshot, never an instruction to repeat a prior PS edit.
     var angleDegrees: Double
+    /// Current saved PSD coordinates, x right/y down; positive angles rotate clockwise about this pivot.
+    var rotationPivot: CGPoint
     var leftWingTip: CGPoint?
     var rightWingTip: CGPoint?
+    /// Bounds and crop are in the current saved PSD plane AFTER rotation, before the crop-origin shift.
     var subjectBounds: CGRect
     var sourceCropRect: CGRect
     var outputSize: CGSize
