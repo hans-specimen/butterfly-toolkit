@@ -81,7 +81,9 @@ nonisolated enum WorkflowStateMachine {
             let tasks = batch.specimens.filter { ids.contains($0.id) }.flatMap { [$0.front, $0.back] }
             guard Set(versions.keys) == Set(tasks.map(\.id)) else { throw WorkflowStateError.invalidTransition }
             for task in tasks {
-                guard task[stage].state == .waitingReview, versions[task.id] == task[stage].outputVersion else {
+                let ready = task[stage].state == .waitingReview ||
+                    (task[stage].state == .completed && task[stage].confirmedVersion == task[stage].outputVersion)
+                guard ready, versions[task.id] == task[stage].outputVersion else {
                     throw WorkflowStateError.staleVersion
                 }
             }
@@ -252,7 +254,12 @@ nonisolated enum WorkflowStateMachine {
             (onlyAsset == nil || task.artifacts[index].kind == onlyAsset) {
             task.artifacts[index].state = .pending
         }
-        if stage == .stack { task.snapshot = nil; task.stackPNG = nil; task.matteArtifact = nil; task.roleImages = nil }
+        if stage == .stack {
+            task.stackAttemptURL = nil
+            task.snapshot = nil; task.stackPNG = nil; task.matteArtifact = nil; task.roleImages = nil
+        }
+        if stages.contains(.geometry) { task.exportHD = nil; task.geometryApplySourceVersion = nil }
+        if stages.contains(.png4k) { task.fourKExportRequested = nil }
         if stages.contains(.geometry) {
             task.geometrySolution = nil
             task.geometryRevalidationRequired = false

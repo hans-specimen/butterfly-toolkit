@@ -250,6 +250,26 @@ nonisolated struct PreparedMaskGeometry: Sendable {
         return solution(crop: best,applicable: true,reason: [review,"留白不足：已保留完整主体与真实背景"].compactMap { $0 }.joined(separator: "；"))
     }
 
+    /// Validate an exact saved fit without estimating wing tips or choosing a different crop.
+    @discardableResult
+    func validate(solution: GeometrySolution) throws -> GeometrySolution {
+        let rect = solution.sourceCropRect
+        guard solution.sourceVersion == input.sourceVersion, solution.isApplicable,
+              solution.angleDegrees.isFinite, solution.rotationPivot.x.isFinite, solution.rotationPivot.y.isFinite,
+              rect == rect.integral, rect.size == solution.outputSize,
+              rect.width > 0, rect.height > 0,
+              rect.contains(support.rotatedBounds(angle: solution.angleDegrees,pivot: solution.rotationPivot)),
+              background.isValid(rect,rotation: GeometryRotation(degrees: solution.angleDegrees,pivot: solution.rotationPivot)) else {
+            throw WorkflowBridgeError.invalidImage("当前蒙版或真实背景不再适合此构图，请调整后重新确认")
+        }
+        var current = solution
+        let bounds = support.rotatedBounds(angle: solution.angleDegrees,pivot: solution.rotationPivot)
+        current.subjectBounds = bounds
+        current.actualMargins = WorkflowMargins(left: (bounds.minX-rect.minX)/rect.width,top: (bounds.minY-rect.minY)/rect.height,
+            right: (rect.maxX-bounds.maxX)/rect.width,bottom: (rect.maxY-bounds.maxY)/rect.height)
+        return current
+    }
+
     private func wingTips() -> (CGPoint?,CGPoint?,String?) {
         let b = support.wingBounds,o = input.coordinateOrigin
         let mid = b.midX-o.x,tops = columnTops,counts = columnCounts
@@ -378,9 +398,12 @@ private nonisolated struct GeometryBackground: Sendable {
         }
         return nil
     }
-    private func isValid(_ rect: CGRect,rotation: GeometryRotation) -> Bool {
-        guard let invalid else { return true } // Corners already checked against the real source extent.
+    fileprivate func isValid(_ rect: CGRect,rotation: GeometryRotation) -> Bool {
         let polygon = [CGPoint(x: rect.minX,y: rect.minY),CGPoint(x: rect.maxX,y: rect.minY),CGPoint(x: rect.maxX,y: rect.maxY),CGPoint(x: rect.minX,y: rect.maxY)].map { rotation.inverse($0) }
+        guard polygon.allSatisfy({ $0.x.isFinite && $0.y.isFinite &&
+            $0.x >= origin.x-1e-8 && $0.x <= origin.x+Double(width)+1e-8 &&
+            $0.y >= origin.y-1e-8 && $0.y <= origin.y+Double(height)+1e-8 }) else { return false }
+        guard let invalid else { return true }
         let stride = width+1
         func empty(x0: Int,y0: Int,x1: Int,y1: Int) -> Bool {
             let a = invalid[y1*stride+x1],b = invalid[y0*stride+x1],c = invalid[y1*stride+x0],d = invalid[y0*stride+x0]

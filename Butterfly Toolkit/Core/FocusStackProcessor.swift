@@ -36,7 +36,7 @@ enum FocusStackError: LocalizedError, Sendable {
     }
 }
 
-struct FocusStackJob: Identifiable, Sendable {
+nonisolated struct FocusStackJob: Identifiable, Sendable {
     let id: Int
     let sourceFiles: [URL]
     let destinationURL: URL

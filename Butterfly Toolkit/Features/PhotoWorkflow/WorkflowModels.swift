@@ -75,6 +75,10 @@ nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable 
     var sourceRevision: Int = 1
     var records: [WorkflowStage: WorkflowStageRecord] = Dictionary(uniqueKeysWithValues:
         WorkflowStage.allCases.map { ($0, WorkflowStageRecord(stage: $0)) })
+    var stackAttemptURL: URL?
+    var exportHD: Bool?
+    var geometryApplySourceVersion: String?
+    var fourKExportRequested: Bool?
     var snapshot: PSDSnapshot?
     var stackPNG: StackPNG?
     var matteArtifact: MatteArtifact?
@@ -110,6 +114,9 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var checkAfterStack: Bool = true
     var checkAfterMatte: Bool = true
     var specimens: [WorkflowSpecimen]
+    /// nil is the legacy default; [] explicitly selects no derivatives.
+    var selectedDerivativeKinds: [WorkflowAssetKind]?
+    var watermarkURL: URL?
     var presets: WorkflowPresets = WorkflowPresets()
     var revision: Int = 0
     var isPaused: Bool = false
@@ -126,19 +133,39 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
     func task(id: UUID) -> WorkflowSideTask? { sideTasks.first { $0.id == id } }
 
+    /// Compare canonical components so nested symlinks cannot escape, while /var aliases remain valid.
+    func validateOutputURL(_ url: URL) throws {
+        let root = outputDirectory.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let destination = url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard url.isFileURL, !url.pathComponents.contains(".."), destination.count > root.count,
+              destination.prefix(root.count).elementsEqual(root) else {
+            throw WorkflowStateError.invalidManifest("Output destination escapes batch directory")
+        }
+    }
+    private static func isSafeBaseName(_ name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "." && trimmed != ".." &&
+            !name.contains("/") && !name.contains("\\") && name.rangeOfCharacter(from: .controlCharacters) == nil
+    }
+
     func validate() throws {
         guard schemaVersion == 1, revision >= 0, sourceDirectory.isFileURL, outputDirectory.isFileURL else {
             throw WorkflowStateError.invalidManifest("Unsupported schema or batch metadata")
         }
+        for folder in ["PSD", ".work", "高清堆栈", "png 4k", "闲鱼产品图", "1K 白底", "png 素材"] {
+            try validateOutputURL(outputDirectory.appendingPathComponent(folder))
+        }
         let identities = specimens.map(\.id) + sideTasks.map(\.id)
         guard Set(identities).count == identities.count else { throw WorkflowStateError.invalidManifest("Duplicate task identity") }
         for specimen in specimens {
-            guard !specimen.baseName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            guard Self.isSafeBaseName(specimen.baseName),
                   specimen.front.side == .front, specimen.back.side == .back,
                   specimen.exclusionReason == nil || specimen.exclusionReason?.isEmpty == false else {
                 throw WorkflowStateError.invalidManifest("Invalid specimen mapping")
             }
             for task in [specimen.front, specimen.back] {
+                if let attempt = task.stackAttemptURL { try validateOutputURL(attempt) }
+                for artifact in task.artifacts { try validateOutputURL(artifact.url) }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
                       task.sources.files.allSatisfy({ $0.url.isFileURL && !$0.fingerprint.isEmpty }) else {
                     throw WorkflowStateError.invalidManifest("Incomplete source or stage records")

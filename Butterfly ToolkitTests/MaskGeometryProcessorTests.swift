@@ -4,6 +4,23 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class MaskGeometryProcessorTests: XCTestCase {
+    func testExactFitRejectsOutsideExtentAndRotatedEmptyCorners() throws {
+        let fixture = try Fixture(width: 100,height: 100,subject: CGRect(x: 35,y: 35,width: 30,height: 30))
+        defer { fixture.remove() }
+        var input = fixture.input
+        input.coordinateOrigin = CGPoint(x: -20,y: -30)
+        input.cropViewport = CGRect(x: -20,y: -30,width: 100,height: 100)
+        let prepared = try MaskGeometryProcessor().prepare(input: input)
+        var solution = try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0)))
+        try prepared.validate(solution: solution)
+        solution.sourceCropRect = CGRect(x: -25,y: -30,width: 105,height: 100)
+        solution.outputSize = solution.sourceCropRect.size
+        XCTAssertThrowsError(try prepared.validate(solution: solution))
+        solution.sourceCropRect = input.cropViewport; solution.outputSize = input.cropViewport.size
+        solution.angleDegrees = 45
+        XCTAssertThrowsError(try prepared.validate(solution: solution))
+    }
+
     // These literal examples catch margin arithmetic, stretching and ratio rounding regressions.
     func testKnownAdaptiveAndSquareGeometry() throws {
         let fixture = try Fixture(width: 4000, height: 3600, subject: CGRect(x: 800,y: 900,width: 2400,height: 1800))
