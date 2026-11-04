@@ -156,7 +156,7 @@ struct TransparentPNGTrimProcessor {
         )
     }
 
-    nonisolated static func trim(_ job: TransparentPNGTrimJob) throws {
+    nonisolated static func trim(_ job: TransparentPNGTrimJob, visibleBounds: CGRect? = nil) throws {
         let fileManager = FileManager.default
         let name = job.sourceURL.lastPathComponent
 
@@ -174,7 +174,8 @@ struct TransparentPNGTrimProcessor {
             throw TransparentPNGTrimError.cannotReadImage(name)
         }
 
-        let bounds = try visiblePixelBounds(of: image, fileName: name)
+        // Workflow supplies the shared complete-subject support; directory trimming retains its legacy rule.
+        let bounds = try visibleBounds ?? visiblePixelBounds(of: image, fileName: name)
         guard let cropped = image.cropping(to: bounds) else {
             throw TransparentPNGTrimError.cannotReadImage(name)
         }

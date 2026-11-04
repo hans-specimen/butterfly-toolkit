@@ -37,7 +37,7 @@ struct XianyuProductScanResult {
     let totalCount: Int
 }
 
-struct XianyuProductProcessor {
+nonisolated struct XianyuProductProcessor {
     static let canvasSize = 2000
     private static let dropShadowOffset = CGSize(width: 0, height: -24)
     private static let dropShadowBlur: CGFloat = 49
