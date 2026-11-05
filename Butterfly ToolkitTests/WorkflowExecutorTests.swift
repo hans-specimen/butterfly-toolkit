@@ -14,7 +14,7 @@ final class WorkflowExecutorTests: XCTestCase {
     }
 }
 
-private actor ExecutorProbe {
+actor ExecutorProbe {
     var calls: [String] = []
     var failing: Set<WorkflowAssetKind> = []
     var gate: CheckedContinuation<Void, Never>?
@@ -32,12 +32,12 @@ private actor ExecutorProbe {
     func release() { blockRender = false; gate?.resume(); gate = nil }
 }
 
-private struct ExecutorFixture {
+struct ExecutorFixture {
     let batch: WorkflowBatch
     let manifest: URL
     let services: WorkflowExecutor.Services
     let probe: ExecutorProbe
-    nonisolated init(checks: Bool, count: Int = 1) throws {
+    nonisolated init(checks: Bool, count: Int = 1, checkMatte: Bool? = nil) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("executor-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let probe = ExecutorProbe(); self.probe = probe
@@ -50,7 +50,7 @@ private struct ExecutorFixture {
             return WorkflowSources(first: files[0], second: files[1], third: files[2])
         }
         batch = try WorkflowBatch(sourceDirectory: root, outputDirectory: root,
-            checkAfterStack: checks, checkAfterMatte: checks,
+            checkAfterStack: checks, checkAfterMatte: checkMatte ?? checks,
             specimens: (0..<count).map { index in
                 try WorkflowSpecimen(baseName: "sample\(index)",
                     front: WorkflowSideTask(side: .front, sources: sources(index*6)),
