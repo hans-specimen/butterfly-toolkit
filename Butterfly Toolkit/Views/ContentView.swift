@@ -9,6 +9,7 @@ import SwiftUI
 
 enum ToolPage: String, CaseIterable, Identifiable {
 
+    case photoWorkflow = "照片工作流"
     case aiCutout = "AI 抠图"
     case aiSamples = "训练素材"
     case aiTraining = "模型训练"
@@ -32,6 +33,7 @@ enum ToolPage: String, CaseIterable, Identifiable {
 
         switch self {
 
+        case .photoWorkflow: return "camera.macro"
         case .aiCutout: return "viewfinder"
         case .aiSamples: return "photo.stack"
         case .aiTraining: return "brain"
@@ -71,12 +73,16 @@ struct ContentView: View {
 
     @State private var selectedPage: ToolPage? = .aiCutout
     @StateObject private var aiStore = AIWorkspaceStore()
+    @StateObject private var workflowStore = PhotoWorkflowStore()
 
     var body: some View {
 
         NavigationSplitView {
 
             List(selection: $selectedPage) {
+                Section("标本照片") {
+                    Label(ToolPage.photoWorkflow.rawValue, systemImage: ToolPage.photoWorkflow.icon).tag(ToolPage.photoWorkflow)
+                }
                 Section("AI 工作区") {
                     ForEach([ToolPage.aiCutout, .aiSamples, .aiTraining, .aiModels]) { page in
                         Label(page.rawValue, systemImage: page.icon).tag(page)
@@ -97,6 +103,9 @@ struct ContentView: View {
         } detail: {
 
             switch selectedPage {
+
+            case .photoWorkflow:
+                PhotoWorkflowView(store: workflowStore)
 
             case .aiCutout, .aiSamples, .aiTraining, .aiModels:
                 AIWorkspaceView(store: aiStore, page: selectedPage ?? .aiCutout) { selectedPage = $0 }

@@ -27,6 +27,7 @@ nonisolated enum WorkflowStatus: String, Codable, Sendable {
 
 nonisolated struct WorkflowSourceFile: Codable, Equatable, Sendable {
     var url: URL
+    /// Empty only for an excluded specimen's unchecked historical source reference.
     var fingerprint: String
 }
 
@@ -167,7 +168,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                 if let attempt = task.stackAttemptURL { try validateOutputURL(attempt) }
                 for artifact in task.artifacts { try validateOutputURL(artifact.url) }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
-                      task.sources.files.allSatisfy({ $0.url.isFileURL && !$0.fingerprint.isEmpty }) else {
+                      task.sources.files.allSatisfy({ $0.url.isFileURL && (specimen.isExcluded || !$0.fingerprint.isEmpty) }) else {
                     throw WorkflowStateError.invalidManifest("Incomplete source or stage records")
                 }
                 for stage in WorkflowStage.allCases {
