@@ -348,7 +348,7 @@ final class MaskGeometryProcessorTests: XCTestCase {
             extra?(&p)
         })
     }
-    private struct Fixture {
+    struct Fixture {
         let directory: URL
         let input: MaskGeometryInput
         init(width: Int,height: Int,subject: CGRect,origin: CGPoint = .zero,viewport: CGRect? = nil,extras: ((inout [UInt8]) -> Void)? = nil,background: ((inout [UInt8]) -> Void)? = nil) throws {

@@ -21,7 +21,7 @@ actor WorkflowExecutor {
         var contentFingerprint: @Sendable (RoleImages) async throws -> String
         var validateInstalledMatte: @Sendable (RoleImages, StackPNG, MatteArtifact) async throws -> Void
 
-        static func live(bridge: PhotoshopWorkflowBridge, matte: WorkflowMatteService) -> Self {
+        static func live(bridge: PhotoshopWorkflowBridge, matte: WorkflowMatteService, geometry: WorkflowGeometryCache = WorkflowGeometryCache()) -> Self {
             let renderer = WorkflowAssetRenderer(), artifacts = WorkflowArtifactStore()
             return Self(stack: { try await bridge.stack(job: $0,owner: $1) },
                 refresh: { try await bridge.refreshSavedPSD(document: $0,owner: $1,expectedSources: $2) },
@@ -29,9 +29,9 @@ actor WorkflowExecutor {
                 infer: { try await matte.infer(input: $0) },
                 install: { try await bridge.installMatte(snapshot: $0,matte: $1) },
                 extract: { try await bridge.extractRoles(snapshot: $0) },
-                analyze: { roles, request in try await MaskGeometryProcessor().analyzeInBackground(input: input(roles),request: request) },
+                analyze: { roles, request in try await geometry.geometry(source: roles,request: request) },
                 validateGeometry: { roles, solution in
-                    try await Task.detached { try MaskGeometryProcessor().prepare(input: input(roles)).validate(solution: solution) }.value
+                    try await geometry.geometry(source: roles,request: GeometryRequest(),savedCandidate: solution)
                 },
                 apply: { try await bridge.applyGeometry(snapshot: $0,solution: $1) },
                 render: { kind, roles, layout, source, watermark, destination in
@@ -66,11 +66,7 @@ actor WorkflowExecutor {
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
                 }.value })
         }
-        private static func input(_ roles: RoleImages) -> MaskGeometryInput {
-            MaskGeometryInput(sourceVersion: roles.snapshotVersion,sourcePixelSize: roles.pixelSize,
-                maskURL: roles.maskPNG,validBackgroundAlphaURL: roles.basePNG,
-                coordinateOrigin: roles.coordinateOrigin,cropViewport: roles.cropViewport)
-        }
+
     }
 
     private let store: WorkflowBatchStore

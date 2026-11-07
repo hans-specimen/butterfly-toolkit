@@ -407,3 +407,80 @@ import UniformTypeIdentifiers
         XCTAssertLessThanOrEqual(store.images.values.filter { $0.width > 2048 }.count,1)
     }
 }
+
+@MainActor extension WorkflowPreviewTests {
+    private actor GeometrySources {
+        var versions: [String] = []
+        func record(_ source: RoleImages) { versions.append(source.snapshotVersion) }
+    }
+    func testVisibleSpecimenPreparesFirstAndEverySelectedFaceCanConfirm() async throws {
+        let batch = try imageFixture(specimens: 3); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let probe = GeometrySources()
+        let cache = WorkflowGeometryCache(prepare: { source in
+            await probe.record(source)
+            return try WorkflowGeometryCacheTests.prepare(source)
+        })
+        let store = PhotoWorkflowStore(geometry: cache)
+        store.stage = .geometry; store.batch = batch
+        store.currentSpecimenID = batch.specimens[2].id; store.selectedSpecimens = Set(batch.specimens.map(\.id))
+        store.prepareSelected(); try await waitUntil { store.canConfirm }
+        let versions = await probe.versions
+        XCTAssertEqual(Set(versions.prefix(2)),Set([batch.specimens[2].front, batch.specimens[2].back].map { $0.roleImages!.snapshotVersion }))
+        XCTAssertEqual(versions.count,6)
+        for task in batch.activeTasks {
+            XCTAssertNotNil(store.displayImage(for: task)); XCTAssertTrue(store.gates[task.id]?.canConfirm == true)
+            XCTAssertEqual(store.solutions[task.id]?.sourceVersion,task.snapshot?.contentVersion)
+        }
+        let retained = await cache.retainedCount; XCTAssertEqual(retained,4)
+    }
+    func testBatchSwitchAndCloseClearSharedGeometryCache() async throws {
+        let first = try imageFixture(specimens: 1),second = try imageFixture(specimens: 1)
+        defer { try? FileManager.default.removeItem(at: first.outputDirectory); try? FileManager.default.removeItem(at: second.outputDirectory) }
+        let cache = WorkflowGeometryCache(),store = PhotoWorkflowStore(geometry: cache)
+        for batch in [first,second] {
+            let manifest = batch.outputDirectory.appendingPathComponent("batch.json")
+            try await WorkflowBatchStore().save(batch,to: manifest)
+            store.openBatch(manifest)
+            try await waitUntil { !store.busy && store.batch?.id == batch.id && store.loading.isEmpty }
+            let count = await cache.retainedCount
+            XCTAssertEqual(count,2,"Switching must discard the previous batch's entries")
+        }
+        store.closeBatch(); try await waitUntil { !store.busy && store.batch == nil }
+        let count = await cache.retainedCount,bytes = await cache.retainedBytes
+        XCTAssertEqual(count,0); XCTAssertEqual(bytes,0)
+    }
+}
+
+// Hold only this actor during the reset test, exposing the otherwise tiny removeAll await window.
+extension WorkflowGeometryCache {
+    func holdForLifecycleTest(entered: XCTestExpectation,release: DispatchSemaphore) {
+        entered.fulfill()
+        _ = release.wait(timeout: .now()+5)
+    }
+}
+
+@MainActor extension WorkflowPreviewTests {
+    func testPreviewControlsCannotRestartOldBatchWhileCacheClears() async throws {
+        let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let manifest = batch.outputDirectory.appendingPathComponent("batch.json")
+        try await WorkflowBatchStore().save(batch,to: manifest)
+        let cache = WorkflowGeometryCache(),store = PhotoWorkflowStore(geometry: cache)
+        store.openBatch(manifest)
+        try await waitUntil { !store.busy && store.batch != nil && store.loading.isEmpty }
+        XCTAssertEqual(store.gates.count,2)
+        let entered = expectation(description: "Cache actor held"),release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let held = Task { await cache.holdForLifecycleTest(entered: entered,release: release) }
+        await fulfillment(of: [entered],timeout: 2)
+        store.closeBatch()
+        try await waitUntil { store.gates.isEmpty }
+        XCTAssertNotNil(store.batch,"The old batch is still selected while removeAll waits")
+        store.face = .back; store.refreshVisibleImage(); store.prepareSelected(); store.loadCurrentDetail()
+        XCTAssertTrue(store.previewTasks.isEmpty,"UI controls must not restart old previews during reset")
+        XCTAssertTrue(store.gates.isEmpty)
+        release.signal(); await held.value
+        try await waitUntil { !store.busy && store.batch == nil }
+        XCTAssertTrue(store.previewTasks.isEmpty); XCTAssertTrue(store.gates.isEmpty)
+        let count = await cache.retainedCount; XCTAssertEqual(count,0)
+    }
+}

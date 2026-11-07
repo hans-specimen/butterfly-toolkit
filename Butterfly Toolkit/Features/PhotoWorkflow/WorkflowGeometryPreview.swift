@@ -46,8 +46,8 @@ nonisolated protocol WorkflowPreviewServing: Sendable {
 /// Full editable-extent thumbnails are decoded off the UI actor; source geometry always stays full resolution.
 actor WorkflowPreviewService: WorkflowPreviewServing {
     private var images: [String: CGImage] = [:]
-    private var prepared: [String: PreparedMaskGeometry] = [:]
-    private var preparing: [String: Task<PreparedMaskGeometry,Error>] = [:]
+    private let geometryCache: WorkflowGeometryCache
+    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache()) { geometryCache = geometry }
     private var decoding: [String: Task<CGImage,Error>] = [:]
     func image(url: URL,version: String,maximumPixelSize: Int = 2048) async throws -> CGImage {
         let key = "\(version)|\(url.path)|\(maximumPixelSize)"
@@ -69,23 +69,7 @@ actor WorkflowPreviewService: WorkflowPreviewServing {
         return result
     }
     func geometry(source: RoleImages,request: GeometryRequest,savedCandidate: GeometrySolution? = nil) async throws -> GeometrySolution {
-        let key = "\(source.snapshotVersion)|\(source.maskPNG.path)|\(source.basePNG.path)"
-        let analysis: PreparedMaskGeometry
-        if let cached = prepared[key] { analysis = cached }
-        else {
-            let pending = preparing[key] ?? Task.detached(priority: .userInitiated) {
-                try MaskGeometryProcessor().prepare(input: MaskGeometryInput(sourceVersion: source.snapshotVersion,sourcePixelSize: source.pixelSize,maskURL: source.maskPNG,validBackgroundAlphaURL: source.basePNG,coordinateOrigin: source.coordinateOrigin,cropViewport: source.cropViewport))
-            }
-            preparing[key] = pending
-            do { analysis = try await pending.value; preparing[key] = nil }
-            catch { preparing[key] = nil; throw error }
-            if prepared.count >= 2 { prepared.removeAll() }; prepared[key] = analysis
-        }
-        try Task.checkCancellation()
-        return try await Task.detached(priority: .userInitiated) {
-            if let savedCandidate { return try analysis.validate(solution: savedCandidate) }
-            return try analysis.analyze(request: request)
-        }.value
+        try await geometryCache.geometry(source: source,request: request,savedCandidate: savedCandidate)
     }
 
 }

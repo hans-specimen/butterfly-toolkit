@@ -109,10 +109,14 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var manualChange: WorkflowPSDChange = .maskOnly
     private var executor: WorkflowExecutor?
     private var manifestURL: URL?
+    private var isResettingPreviews = false
+    private let geometry: WorkflowGeometryCache
     private let previews: any WorkflowPreviewServing
     private(set) var previewTasks: [UUID: Task<Void,Never>] = [:]
     private var command: Task<Void,Never>?
-    init(previews: any WorkflowPreviewServing = WorkflowPreviewService()) { self.previews = previews }
+    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil) {
+        self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
+    }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
     var currentSolution: GeometrySolution? { currentTask.flatMap { solutions[$0.id] ?? $0.geometrySolution } }
@@ -193,7 +197,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)
-            executor = e; manifestURL = manifest
+            await clearPreviewState(); executor = e; manifestURL = manifest
             batch = try await e.batch(batchID: frozen.id); currentSpecimenID = frozen.specimens.first { !$0.isExcluded }?.id; selectedSpecimens = Set(frozen.specimens.filter { !$0.isExcluded }.map(\.id))
             try await e.runPending(batchID: frozen.id)
         }
@@ -218,7 +222,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             let e = makeExecutor(output: url.deletingLastPathComponent())
             let id = try await e.register(manifestURL: url)
             let value = try await e.batch(batchID: id)
-            clearPreviewState(); executor = e; manifestURL = url; batch = value
+            await clearPreviewState(); executor = e; manifestURL = url; batch = value
             currentSpecimenID = value.specimens.first { !$0.isExcluded }?.id
             selectedSpecimens = Set(value.specimens.filter { !$0.isExcluded }.map(\.id))
             stage = value.currentStage ?? .png4k
@@ -228,7 +232,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard canSwitchBatch else { error = "请先结束当前操作，并保存、刷新及明确继续人工 PSD 编辑"; return }
         launch { [self] in
             try await persistBeforeSwitch()
-            clearPreviewState(); executor = nil; manifestURL = nil; batch = nil
+            await clearPreviewState(); executor = nil; manifestURL = nil; batch = nil
             currentSpecimenID = nil; selectedSpecimens = []; draft = nil; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
         }
     }
@@ -255,14 +259,17 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         try await WorkflowBatchStore().save(paused,to: manifestURL)
         self.batch = paused
     }
-    private func clearPreviewState() {
+    private func clearPreviewState() async {
+        isResettingPreviews = true
+        defer { isResettingPreviews = false }
         for task in previewTasks.values { task.cancel() }
         previewTasks = [:]; images = [:]; imageIdentities = [:]; requestedImageIdentities = [:]
         gates = [:]; solutions = [:]; requests = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; warmSources = []; cancelMove()
+        await geometry.removeAll()
     }
     private func makeExecutor(output: URL,engine: URL? = nil) -> WorkflowExecutor {
         let workspace = output.appendingPathComponent(".work")
-        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace)))
+        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace),geometry: geometry))
     }
     private func launch(_ action: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil
@@ -288,8 +295,16 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     func prepareSelected() {
         guard manualTaskID == nil,let batch else { return }
-        for task in batch.specimens.filter({ selectedSpecimens.contains($0.id) || $0.id == currentSpecimenID }).flatMap({ [$0.front,$0.back] }) where task.roleImages != nil {
-            if gates[task.id] == nil || requestedImageIdentities[task.id] != desiredImageIdentity(task) { requestPreview(task: task) }
+        let ordered = batch.specimens.filter { $0.id == currentSpecimenID }
+            + batch.specimens.filter { $0.id != currentSpecimenID && selectedSpecimens.contains($0.id) }
+        var visible: [Task<Void,Never>] = []
+        for specimen in ordered {
+            for task in [specimen.front,specimen.back] where task.roleImages != nil {
+                if gates[task.id] == nil || requestedImageIdentities[task.id] != desiredImageIdentity(task) {
+                    requestPreview(task: task,after: specimen.id == currentSpecimenID ? [] : visible)
+                }
+                if specimen.id == currentSpecimenID,let pending = previewTasks[task.id] { visible.append(pending) }
+            }
         }
     }
     func refreshVisibleImage() {
@@ -340,8 +355,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let l = layouts[task.id] ?? task.squareLayout,b = solution.subjectBounds,s = min(Double(l.canvasSide-2*l.safeMargin)/b.width,Double(l.canvasSide-2*l.safeMargin)/b.height)
         return l.safeMargin >= 0 && l.safeMargin <= 512 && l.center.x-b.width*s/2 >= 0 && l.center.y-b.height*s/2 >= 0 && l.center.x+b.width*s/2 <= 4096 && l.center.y+b.height*s/2 <= 4096
     }
-    private func requestPreview(task: WorkflowSideTask,request: GeometryRequest? = nil) {
-        guard let roles = task.roleImages,let identity = desiredImageIdentity(task) else { return }
+    private func requestPreview(task: WorkflowSideTask,request: GeometryRequest? = nil,after predecessors: [Task<Void,Never>] = []) {
+        guard !isResettingPreviews,let roles = task.roleImages,let identity = desiredImageIdentity(task) else { return }
         previewTasks[task.id]?.cancel()
         requestedImageIdentities[task.id] = identity
         if imageIdentities[task.id] != identity { images[task.id] = nil; imageIdentities[task.id] = nil }
@@ -350,7 +365,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let saved = task.geometrySolution
         let useSaved = requests[task.id] == nil && (task[.geometry].state == .completed || task.geometryRevalidationRequired)
         previewTasks[task.id] = Task { [self] in
+            for predecessor in predecessors { await predecessor.value }
             do {
+                try Task.checkCancellation()
                 let image = try await previews.image(url: identity.url,version: roles.snapshotVersion,maximumPixelSize: identity.maximumPixelSize)
                 guard !Task.isCancelled,gates[task.id]?.token == token,desiredImageIdentity(task) == identity else { return }
                 imageIdentities[task.id] = identity; images[task.id] = image

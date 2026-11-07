@@ -27,6 +27,7 @@ nonisolated struct MeaningfulMaskSupport: Sendable {
     fileprivate let wingPixels: [UInt8]
     private let rowMin: [Int]
     private let rowMax: [Int]
+    fileprivate var estimatedStorageBytes: Int { pixels.count + wingPixels.count + (rowMin.count + rowMax.count) * MemoryLayout<Int>.stride }
 
     init(values: [UInt8],width: Int,height: Int,origin: CGPoint) throws {
         self.width = width; self.height = height; coordinateOrigin = origin
@@ -153,6 +154,11 @@ nonisolated struct PreparedMaskGeometry: Sendable {
     private let leftArea: Int
     private let rightArea: Int
     private let background: GeometryBackground
+    /// Retained array payload only; transient decode/label buffers and allocator overhead are excluded.
+    var estimatedStorageBytes: Int {
+        support.estimatedStorageBytes + (columnTops.count + columnCounts.count) * MemoryLayout<Int>.stride
+            + (background.invalid?.count ?? 0) * MemoryLayout<UInt32>.stride
+    }
     fileprivate init(input: MaskGeometryInput,support: MeaningfulMaskSupport,maskValues: [UInt8],background: GeometryBackground) {
         self.input = input; self.support = support; self.background = background
         let w = support.width,h = support.height,mid = support.wingBounds.midX-input.coordinateOrigin.x
