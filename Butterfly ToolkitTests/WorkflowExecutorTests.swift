@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class WorkflowExecutorTests: XCTestCase {
+    func testMatteSessionEndsBeforeReviewOrGeometryAndOnPause() async throws {
+        for checkMatte in [true,false] {
+            let f = try ExecutorFixture(checks: false,checkMatte: checkMatte)
+            defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+            var services = f.services
+            services.endInferenceSession = { await f.probe.record("end-session") }
+            let executor = WorkflowExecutor(services: services)
+            try await executor.register(batch: f.batch,manifestURL: f.manifest)
+            try await executor.runPending(batchID: f.batch.id)
+            let calls = await f.probe.values()
+            let ai = calls.indices.filter { calls[$0] == "ai" }
+            XCTAssertEqual(ai.count,2)
+            let ended = try XCTUnwrap(calls.firstIndex(of: "end-session"))
+            XCTAssertGreaterThan(ended,try XCTUnwrap(ai.last),"Both consecutive faces must share a session")
+            if let analysis = calls.firstIndex(of: "analyze") { XCTAssertLessThan(ended,analysis) }
+            let count = calls.filter { $0 == "end-session" }.count
+            await executor.pause(batchID: f.batch.id)
+            let after = await f.probe.values()
+            XCTAssertGreaterThan(after.filter { $0 == "end-session" }.count,count)
+        }
+    }
     func testAutomaticUntilGeometryWhenOff() async throws {
         let fixture = try ExecutorFixture(checks: false)
         let executor = WorkflowExecutor(services: fixture.services)

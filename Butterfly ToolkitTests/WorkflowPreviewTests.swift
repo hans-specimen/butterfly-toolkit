@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -482,5 +483,77 @@ extension WorkflowGeometryCache {
         try await waitUntil { !store.busy && store.batch == nil }
         XCTAssertTrue(store.previewTasks.isEmpty); XCTAssertTrue(store.gates.isEmpty)
         let count = await cache.retainedCount; XCTAssertEqual(count,0)
+    }
+}
+
+@MainActor extension WorkflowPreviewTests {
+    func testBatchSwitchEngineChangeAndCloseShutDownSharedInferenceWorker() async throws {
+        let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let fake = try AIInferenceWorkerTests.Fixture(); defer { fake.remove() }
+        let worker = AIInferenceWorker(),store = PhotoWorkflowStore(inference: worker)
+        let manifest = batch.outputDirectory.appendingPathComponent("batch.json")
+        try await WorkflowBatchStore().save(batch,to: manifest)
+        _ = try await worker.infer(fake.request("before-open"))
+        store.openBatch(manifest); try await waitUntil { !store.busy && store.batch != nil }
+        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
+        _ = try await worker.infer(fake.request("before-engine"))
+        store.configureEngine(fake.root); try await waitUntil { !store.busy }
+        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
+        _ = try await worker.infer(fake.request("before-close"))
+        store.closeBatch(); try await waitUntil { !store.busy && store.batch == nil }
+        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
+        XCTAssertEqual(try fake.starts().count,3)
+    }
+}
+
+@MainActor extension WorkflowPreviewTests {
+    private actor SnapshotGate {
+        let entered: XCTestExpectation
+        var waiting: CheckedContinuation<Void,Never>?
+        init(_ entered: XCTestExpectation) { self.entered = entered }
+        func hold() async { await withCheckedContinuation { waiting = $0; entered.fulfill() } }
+        func release() { waiting?.resume(); waiting = nil }
+    }
+    func testDelayedSnapshotCannotRestoreClosedOrReplacedBatchOrError() async throws {
+        for action in ["switch","close","engine","error"] {
+            let first = try imageFixture(specimens: 1),second = try imageFixture(specimens: 1)
+            defer { try? FileManager.default.removeItem(at: first.outputDirectory); try? FileManager.default.removeItem(at: second.outputDirectory) }
+            let cache = WorkflowGeometryCache(),store = PhotoWorkflowStore(geometry: cache)
+            let firstManifest = first.outputDirectory.appendingPathComponent("batch.json")
+            let secondManifest = second.outputDirectory.appendingPathComponent("batch.json")
+            try await WorkflowBatchStore().save(first,to: firstManifest)
+            try await WorkflowBatchStore().save(second,to: secondManifest)
+            store.openBatch(firstManifest); try await waitUntil { !store.busy && store.batch?.id == first.id && store.loading.isEmpty }
+            let entered = expectation(description: "Old snapshot captured"),gate = SnapshotGate(entered)
+            defer { Task { await gate.release() } }
+            let oldRead = Task {
+                await store.sync { executor,id in
+                    let value = try await executor.batch(batchID: id)
+                    await gate.hold()
+                    if action == "error" { throw WorkflowBridgeError.staleSource }
+                    return value
+                }
+            }
+            await fulfillment(of: [entered],timeout: 2)
+            let expected: UUID?
+            if action == "close" { store.closeBatch(); expected = nil }
+            else if action == "engine" {
+                let engine = first.outputDirectory.appendingPathComponent("engine")
+                try FileManager.default.createDirectory(at: engine.appendingPathComponent("scripts"),withIntermediateDirectories: true)
+                try Data().write(to: engine.appendingPathComponent("scripts/toolkit_bridge.py"))
+                store.configureEngine(engine); expected = first.id
+            } else { store.openBatch(secondManifest); expected = second.id }
+            try await waitUntil { !store.busy && store.batch?.id == expected && store.loading.isEmpty }
+            let ids = Set(store.gates.keys),paused = store.batch?.isPaused
+            store.error = "Current session message"
+            await gate.release(); await oldRead.value
+            try await waitUntil { store.loading.isEmpty }
+            XCTAssertEqual(store.batch?.id,expected,action)
+            XCTAssertEqual(store.batch?.isPaused,paused,action)
+            XCTAssertEqual(Set(store.gates.keys),ids,action)
+            XCTAssertEqual(store.error,"Current session message",action)
+            let count = await cache.retainedCount
+            XCTAssertEqual(count,action == "close" ? 0 : 2,action)
+        }
     }
 }

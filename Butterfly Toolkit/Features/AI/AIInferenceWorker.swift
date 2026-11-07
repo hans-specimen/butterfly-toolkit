@@ -1,0 +1,205 @@
+import Foundation
+import Darwin
+
+nonisolated struct WorkflowInferenceRequest: Sendable {
+    let engine: URL
+    let workspace: URL
+    let input: URL
+    let device: String
+}
+
+/// A batch session has an explicit FIFO lease; actor reentrancy alone does not serialize inference.
+actor AIInferenceWorker {
+    private struct Job {
+        let id: UUID
+        let request: WorkflowInferenceRequest
+        let result: CheckedContinuation<AIEvent,Error>
+    }
+    private var queue: [Job] = []
+    private var active: Job?
+    private var connection: AIWorkerConnection?
+    private var runner: Task<Void,Never>?
+    private var stopping = false
+    private var shutdownTask: Task<Void,Never>?
+    private var sessionFailure: Error?
+    var queuedCount: Int { queue.count }
+
+    func infer(_ request: WorkflowInferenceRequest) async throws -> AIEvent {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            guard !stopping else { throw CancellationError() }
+            if let sessionFailure { throw sessionFailure }
+            return try await withCheckedThrowingContinuation { result in
+                queue.append(Job(id: id,request: request,result: result))
+                if runner == nil { runner = Task { await self.drain() } }
+            }
+        } onCancel: { Task { await self.cancel(id) } }
+    }
+    func shutdown() async {
+        if let pending = shutdownTask { await pending.value; return }
+        stopping = true
+        failQueued(CancellationError())
+        connection?.cancel()
+        let running = runner
+        let pending = Task { [self] in
+            await running?.value
+            if let current = connection { await Task.detached { current.finish() }.value }
+            connection = nil; sessionFailure = nil; stopping = false; shutdownTask = nil
+        }
+        shutdownTask = pending
+        await pending.value
+    }
+    private func cancel(_ id: UUID) async {
+        if let index = queue.firstIndex(where: { $0.id == id }) {
+            queue.remove(at: index).result.resume(throwing: CancellationError())
+        } else if active?.id == id { await shutdown() }
+    }
+    private func failQueued(_ error: Error) {
+        let waiting = queue; queue.removeAll()
+        for job in waiting { job.result.resume(throwing: error) }
+    }
+    private func drain() async {
+        defer { runner = nil }
+        while !queue.isEmpty && !stopping {
+            let job = queue.removeFirst(); active = job
+            do {
+                if connection == nil { connection = try AIWorkerConnection(request: job.request) }
+                let current = connection!
+                let event = try await Task.detached(priority: .userInitiated) { try current.exchange(job.request,id: job.id) }.value
+                if stopping { throw CancellationError() }
+                job.result.resume(returning: event)
+            } catch {
+                if stopping {
+                    if let current = connection { await Task.detached { current.finish() }.value }
+                    connection = nil; active = nil
+                    job.result.resume(throwing: CancellationError()); return
+                }
+                if error is AIWorkerRequestError { job.result.resume(throwing: error) }
+                else {
+                    // Keep the session failed until its owner ends it; a next automatic face cannot restart it.
+                    sessionFailure = error; stopping = true; failQueued(error)
+                    if let current = connection { current.cancel(); await Task.detached { current.finish() }.value }
+                    connection = nil; stopping = false; active = nil
+                    job.result.resume(throwing: error); return
+                }
+            }
+            active = nil
+        }
+    }
+}
+
+private nonisolated struct AIWorkerRequestError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// One blocking exchange at a time, always on a detached task. Only cancel is concurrent.
+private nonisolated final class AIWorkerConnection: @unchecked Sendable {
+    private struct Envelope: Decodable {
+        let event: String
+        let requestID: String?
+        let version: Int?
+        enum CodingKeys: String,CodingKey { case event,requestID; case version = "protocol" }
+    }
+    private let identity: WorkflowInferenceRequest
+    private let child = Process()
+    private let input = Pipe(),output = Pipe()
+    private let logURL: URL
+    private let log: FileHandle
+    private let lock = NSLock()
+    private var cancelled = false
+    private var started = false
+    private var ready = false
+    private var buffer = Data()
+
+    init(request: WorkflowInferenceRequest) throws {
+        identity = request
+        let python = request.engine.appendingPathComponent(".venv/bin/python")
+        let script = request.engine.appendingPathComponent("scripts/toolkit_bridge.py")
+        guard FileManager.default.isExecutableFile(atPath: python.path),FileManager.default.fileExists(atPath: script.path),
+              ["mps","cpu"].contains(request.device) else { throw AIWorkspaceError(message: "AI 项目环境或设备配置无效。") }
+        logURL = FileManager.default.temporaryDirectory.appendingPathComponent("butterfly-worker-\(UUID()).log")
+        FileManager.default.createFile(atPath: logURL.path,contents: nil)
+        log = try FileHandle(forWritingTo: logURL)
+        child.executableURL = python; child.currentDirectoryURL = request.engine
+        child.arguments = ["-u","-B",script.path,"--workspace",request.workspace.path,"serve","--device",request.device]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONUNBUFFERED"] = "1"; environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        child.environment = environment
+        child.standardInput = input; child.standardOutput = output; child.standardError = log
+        // A dead child must produce a write error, never SIGPIPE in the application.
+        _ = fcntl(input.fileHandleForWriting.fileDescriptor,F_SETNOSIGPIPE,1)
+    }
+    func cancel() {
+        lock.lock(); cancelled = true
+        let running = started && child.isRunning
+        if running { child.terminate() }
+        lock.unlock()
+        if running {
+            DispatchQueue.global().asyncAfter(deadline: .now()+1) { [self] in
+                lock.lock(); defer { lock.unlock() }
+                if child.isRunning { kill(child.processIdentifier,SIGKILL) }
+            }
+        }
+    }
+    func finish() {
+        cancel()
+        if started { child.waitUntilExit() }
+        try? input.fileHandleForWriting.close(); try? output.fileHandleForReading.close()
+        try? input.fileHandleForReading.close(); try? output.fileHandleForWriting.close()
+        try? log.close(); try? FileManager.default.removeItem(at: logURL)
+    }
+    private func launch() throws {
+        lock.lock(); defer { lock.unlock() }
+        if cancelled { throw CancellationError() }
+        if !started { try child.run(); started = true }
+    }
+    func exchange(_ request: WorkflowInferenceRequest,id: UUID) throws -> AIEvent {
+        guard request.engine.standardizedFileURL == identity.engine.standardizedFileURL,
+              request.workspace.standardizedFileURL == identity.workspace.standardizedFileURL,request.device == identity.device else {
+            throw AIWorkerRequestError(message: "AI 会话不能切换引擎、工作目录或设备，请先关闭会话。")
+        }
+        try launch()
+        if !ready {
+            let data = try line(),envelope = try JSONDecoder().decode(Envelope.self,from: data)
+            guard envelope.event == "ready",envelope.version == 1,envelope.requestID == nil else { throw protocolError() }
+            ready = true
+        }
+        let payload = try JSONSerialization.data(withJSONObject: ["requestID":id.uuidString,"input":request.input.path])
+        try input.fileHandleForWriting.write(contentsOf: payload+Data([10]))
+        while true {
+            let data = try line(),envelope = try JSONDecoder().decode(Envelope.self,from: data)
+            guard envelope.requestID == id.uuidString else { throw protocolError() }
+            let event = try JSONDecoder().decode(AIEvent.self,from: data)
+            switch event.event {
+            case "status": continue
+            case "error": throw AIWorkerRequestError(message: event.message ?? "AI 推理失败。")
+            case "completed":
+                guard event.input.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath() }) == request.input.resolvingSymlinksInPath(),
+                      let directory = event.outputDirectory,let prediction = event.prediction,let alpha = event.predictionAlpha else { throw protocolError() }
+                let root = request.workspace.resolvingSymlinksInPath().appendingPathComponent("outputs").path+"/"
+                let folder = URL(fileURLWithPath: directory).resolvingSymlinksInPath()
+                guard folder.path.hasPrefix(root),[prediction,alpha].allSatisfy({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().deletingLastPathComponent().path == folder.path }) else { throw protocolError() }
+                return event
+            default: throw protocolError()
+            }
+        }
+    }
+    private func line() throws -> Data {
+        while true {
+            if let end = buffer.firstIndex(of: 10) {
+                let result = Data(buffer[..<end]); buffer.removeSubrange(...end)
+                guard !result.isEmpty,result.count <= 1_048_576 else { throw protocolError() }; return result
+            }
+            guard buffer.count <= 1_048_576 else { throw protocolError() }
+            let bytes = output.fileHandleForReading.availableData
+            guard !bytes.isEmpty else {
+                let diagnostic = ((try? String(contentsOf: logURL,encoding: .utf8)) ?? "").split(separator: "\n").suffix(3).joined(separator: "\n")
+                throw AIWorkspaceError(message: "AI worker 已退出或输出中断；请重试失败项。\n"+diagnostic)
+            }
+            buffer.append(bytes)
+        }
+    }
+    private func protocolError() -> AIWorkspaceError { AIWorkspaceError(message: "AI worker 协议或输入身份不匹配，已停止本次队列。") }
+}

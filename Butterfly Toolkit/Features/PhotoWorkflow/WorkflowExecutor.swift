@@ -21,6 +21,8 @@ actor WorkflowExecutor {
         var contentFingerprint: @Sendable (RoleImages) async throws -> String
         var validateInstalledMatte: @Sendable (RoleImages, StackPNG, MatteArtifact) async throws -> Void
 
+        var endInferenceSession: @Sendable () async -> Void = {}
+
         static func live(bridge: PhotoshopWorkflowBridge, matte: WorkflowMatteService, geometry: WorkflowGeometryCache = WorkflowGeometryCache()) -> Self {
             let renderer = WorkflowAssetRenderer(), artifacts = WorkflowArtifactStore()
             return Self(stack: { try await bridge.stack(job: $0,owner: $1) },
@@ -64,7 +66,7 @@ actor WorkflowExecutor {
                           zip(expectedMask.pixels,mask.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 1 }),
                           zip(expectedCutout.pixels,cutout.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 4 }) else { throw WorkflowBridgeError.staleSource }
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
-                }.value })
+                }.value },endInferenceSession: { await matte.shutdown() })
         }
 
     }
@@ -151,6 +153,7 @@ actor WorkflowExecutor {
     func pause(batchID: UUID) async {
         guard let value = batches[batchID] else { return }
         try? reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try? await persist(batchID)
+        await services.endInferenceSession()
     }
     func continueAutomatic(batchID: UUID) async throws {
         if let owner = manual[batchID] {
@@ -218,17 +221,22 @@ actor WorkflowExecutor {
                         try await execute(batchID,item.id,stage: stage); advanced = true
                         if try batch(batchID: batchID).isPaused { break }
                     }
+                    if stage == .matte { await services.endInferenceSession() }
                     if try batch(batchID: batchID).isPaused { break }
                 }
                 try await finish4KIntents(batchID)
                 if try await advanceUncheckedReviews(batchID) { advanced = true }
-                if !advanced { return }
+                if !advanced { break }
             }
         } catch is CancellationError {
+            await services.endInferenceSession()
             let value = try batch(batchID: batchID)
             try reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try await persist(batchID)
             throw CancellationError()
+        } catch {
+            await services.endInferenceSession(); throw error
         }
+        await services.endInferenceSession()
     }
 
     private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {

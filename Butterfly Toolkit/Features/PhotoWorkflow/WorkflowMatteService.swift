@@ -17,16 +17,17 @@ nonisolated enum WorkflowBridgeError: LocalizedError, Equatable {
 }
 
 nonisolated struct WorkflowMatteService: Sendable {
-    typealias Run = @Sendable (URL, [String]) async throws -> AIEvent
+    typealias Run = @Sendable (WorkflowInferenceRequest) async throws -> AIEvent
     let engine: URL
     let workspace: URL
     let device: String
     private let run: Run
-    init(engine: URL, workspace: URL, device: String = "mps", run: @escaping Run = { engine, arguments in
-        try await AIProcessRunner().run(engine: engine, arguments: arguments) { _ in }
-    }) {
-        self.engine = engine; self.workspace = workspace; self.device = device; self.run = run
+    private let worker: AIInferenceWorker
+    init(engine: URL,workspace: URL,device: String = "mps",worker: AIInferenceWorker = AIInferenceWorker(),run: Run? = nil) {
+        self.engine = engine; self.workspace = workspace; self.device = device; self.worker = worker
+        self.run = run ?? { try await worker.infer($0) }
     }
+    func shutdown() async { await worker.shutdown() }
     func infer(input: StackPNG) async throws -> MatteArtifact {
         let task = Task.detached(priority: .userInitiated) { try await performInference(input: input) }
         return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
@@ -38,7 +39,8 @@ nonisolated struct WorkflowMatteService: Sendable {
               original.orientation == 1, !input.colorProfile.isEmpty, original.hasProfile else {
             throw WorkflowBridgeError.staleSource
         }
-        let result = try await run(engine, ["--workspace", workspace.path, "infer", "--input", input.pngURL.path, "--device", device])
+        let result = try await run(WorkflowInferenceRequest(engine: engine,workspace: workspace,input: input.pngURL,device: device))
+        try Task.checkCancellation()
         guard result.event == "completed", result.input.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath() }) == input.pngURL.resolvingSymlinksInPath(),
               let alphaPath = result.predictionAlpha, let cutoutPath = result.prediction else {
             throw WorkflowBridgeError.invalidImage("缺少完整推理事件或输入身份不符")

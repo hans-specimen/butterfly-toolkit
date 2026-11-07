@@ -119,17 +119,19 @@ final class WorkflowBridgeTests: XCTestCase {
         let record = directory.appendingPathComponent("result.json")
         try JSONSerialization.data(withJSONObject: ["inputSha256": input.fingerprint]).write(to: record)
         let event = AIEvent(event: "completed", input: inputURL.path, prediction: cutout.path, predictionAlpha: alpha.path)
-        let service = WorkflowMatteService(engine: directory, workspace: directory, device: "cpu", run: { engine, arguments in
-            XCTAssertEqual(engine, directory)
-            XCTAssertEqual(arguments, ["--workspace", directory.path, "infer", "--input", inputURL.path, "--device", "cpu"])
+        let service = WorkflowMatteService(engine: directory, workspace: directory, device: "cpu", run: { request in
+            XCTAssertEqual(request.engine, directory)
+            XCTAssertEqual(request.workspace, directory)
+            XCTAssertEqual(request.input, inputURL)
+            XCTAssertEqual(request.device, "cpu")
             return event
         })
         _ = try await service.infer(input: input)
         let wrongInputEvent = AIEvent(event: "completed",input: "/other-source.png",prediction: cutout.path,predictionAlpha: alpha.path)
-        let wrongInput = WorkflowMatteService(engine: directory,workspace: directory,run: { _,_ in wrongInputEvent })
+        let wrongInput = WorkflowMatteService(engine: directory,workspace: directory,run: { _ in wrongInputEvent })
         await rejects { _ = try await wrongInput.infer(input: input) }
         let missingAlphaEvent = AIEvent(event: "completed",input: inputURL.path,prediction: cutout.path)
-        let missingAlpha = WorkflowMatteService(engine: directory,workspace: directory,run: { _,_ in missingAlphaEvent })
+        let missingAlpha = WorkflowMatteService(engine: directory,workspace: directory,run: { _ in missingAlphaEvent })
         await rejects { _ = try await missingAlpha.infer(input: input) }
         try JSONSerialization.data(withJSONObject: ["inputSha256": "other-input"]).write(to: record)
         await rejects { _ = try await service.infer(input: input) }

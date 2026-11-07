@@ -110,12 +110,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     private var executor: WorkflowExecutor?
     private var manifestURL: URL?
     private var isResettingPreviews = false
+    private let inference: AIInferenceWorker
     private let geometry: WorkflowGeometryCache
     private let previews: any WorkflowPreviewServing
     private(set) var previewTasks: [UUID: Task<Void,Never>] = [:]
     private var command: Task<Void,Never>?
-    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil) {
-        self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
+    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),inference: AIInferenceWorker = AIInferenceWorker(),previews: (any WorkflowPreviewServing)? = nil) {
+        self.inference = inference; self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
     }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
@@ -265,11 +266,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         for task in previewTasks.values { task.cancel() }
         previewTasks = [:]; images = [:]; imageIdentities = [:]; requestedImageIdentities = [:]
         gates = [:]; solutions = [:]; requests = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; warmSources = []; cancelMove()
+        await inference.shutdown()
         await geometry.removeAll()
     }
     private func makeExecutor(output: URL,engine: URL? = nil) -> WorkflowExecutor {
         let workspace = output.appendingPathComponent(".work")
-        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace),geometry: geometry))
+        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace,worker: inference),geometry: geometry))
     }
     private func launch(_ action: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil
@@ -281,17 +283,21 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             poll.cancel(); await sync(); busy = false; prepareSelected()
         }
     }
-    private func sync() async {
+    func sync(readBatch: @Sendable (WorkflowExecutor,UUID) async throws -> WorkflowBatch = { try await $0.batch(batchID: $1) }) async {
         guard let executor,let id = batch?.id else { return }
         do {
-            let value = try await executor.batch(batchID: id)
+            let value = try await readBatch(executor,id)
+            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id else { return }
             let previous = batch; batch = value
             if let current = value.currentStage,previous?.currentStage != current { stage = current }
             for task in value.sideTasks where task.roleImages?.snapshotVersion != previous?.task(id: task.id)?.roleImages?.snapshotVersion {
                 images[task.id] = nil; solutions[task.id] = nil; requests[task.id] = nil; gates[task.id] = nil
                 if task.roleImages != nil { requestPreview(task: task) }
             }
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id else { return }
+            self.error = error.localizedDescription
+        }
     }
     func prepareSelected() {
         guard manualTaskID == nil,let batch else { return }
