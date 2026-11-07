@@ -215,7 +215,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         // Callers have already checked the saved PSD. Reuse only the exact validated pixels.
         let receipt = workspace.appendingPathComponent("role-cache/\(snapshot.taskID)/\(snapshot.contentVersion).json")
         if let cache = try? JSONDecoder().decode(RoleCache.self, from: Data(contentsOf: receipt)),
-           cache.snapshot == snapshot, cache.images.snapshotVersion == snapshot.contentVersion,
+           sameExtractionSource(cache.snapshot, snapshot), cache.images.snapshotVersion == snapshot.contentVersion,
            (try? roleFingerprints(cache.images)) == cache.fingerprints {
             return cache.images
         }
@@ -240,6 +240,12 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try? data.write(to: receipt, options: .atomic)
         }
         return images
+    }
+    private func sameExtractionSource(_ lhs: PSDSnapshot, _ rhs: PSDSnapshot) -> Bool {
+        // Publication changes the working path, not the validated immutable extraction source.
+        lhs.taskID == rhs.taskID && lhs.contentVersion == rhs.contentVersion &&
+        lhs.snapshotURL == rhs.snapshotURL && lhs.pixelSize == rhs.pixelSize &&
+        lhs.roles == rhs.roles && lhs.structureSummary == rhs.structureSummary
     }
     private func roleFingerprints(_ images: RoleImages) throws -> [String] {
         try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try AIFileValidation.hash($0.path) }
