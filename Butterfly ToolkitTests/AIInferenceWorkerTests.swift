@@ -106,7 +106,9 @@ import Darwin
         let running = Task { try await executor.runPending(batchID: workflow.batch.id) }
         try await waitUntil { f.events().contains("hold") }
         await executor.pause(batchID: workflow.batch.id)
-        do { try await running.value; XCTFail("Paused inference must be cancelled") } catch is CancellationError {}
+        try await running.value
+        let calls = await workflow.probe.values()
+        XCTAssertFalse(calls.contains("ai"),"Paused inference must not complete after its worker exits")
         let paused = try await executor.batch(batchID: workflow.batch.id)
         XCTAssertTrue(paused.isPaused)
         XCTAssertTrue(paused.activeTasks.allSatisfy { $0[.matte].state != .failed })
@@ -225,5 +227,29 @@ import Darwin
             emit('ready',protocol=1)
             for line in sys.stdin:respond(json.loads(line))
         """#
+    }
+}
+
+@MainActor extension AIInferenceWorkerTests {
+    func testRepeatedStartupShutdownCompletesWithinDeadline() async {
+        let finished = expectation(description: "Repeated worker shutdowns finish after child exit")
+        Task {
+            do {
+                for _ in 0..<10 {
+                    let f = try Fixture(); defer { f.remove() }
+                    try Data().write(to: f.root.appendingPathComponent("hold-ready"))
+                    let worker = AIInferenceWorker()
+                    let pending = Task { try await worker.infer(f.request("one")) }
+                    try await waitUntil { (try? f.starts().count) == 1 }
+                    async let a: Void = worker.shutdown()
+                    async let b: Void = worker.shutdown()
+                    _ = await (a,b)
+                    do { _ = try await pending.value; XCTFail("Startup accepted after shutdown") } catch is CancellationError {}
+                    for pid in try f.starts() { XCTAssertEqual(kill(pid,0),-1) }
+                }
+            } catch { XCTFail("\(error)") }
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished],timeout: 15)
     }
 }

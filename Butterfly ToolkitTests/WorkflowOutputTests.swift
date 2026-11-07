@@ -225,16 +225,29 @@ final class WorkflowOutputTests: XCTestCase {
         XCTAssertThrowsError(try batch.validateArtifactURL(export.appendingPathComponent("escape/test.png"), kind: .png4k))
     }
 
-    func testGeometryAnd4KCheckpointCombinationsRespectReviewChoices() async throws {
+    func testAllFourCheckpointSwitchCombinationsRespectReviewChoices() async throws {
+        for stackCheck in [false,true] { for matteCheck in [false,true] {
         for geometryCheck in [false, true] {
             for fourKCheck in [false, true] {
-                let f = try ExecutorFixture(checks: false)
+                let f = try ExecutorFixture(checks: stackCheck,count: 2,checkMatte: matteCheck)
                 defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
                 var batch = f.batch; batch.checkGeometry = geometryCheck; batch.check4K = fourKCheck
                 let e = WorkflowExecutor(services: f.services)
                 try await e.register(batch: batch, manifestURL: f.manifest)
                 try await e.runPending(batchID: batch.id)
                 var result = try await e.batch(batchID: batch.id)
+                if stackCheck {
+                    XCTAssertEqual(result.currentStage,.stack)
+                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("ai"))
+                    try await e.continueAfterReview(batchID: batch.id,stage: .stack,specimenIDs: batch.specimens.map(\.id))
+                    result = try await e.batch(batchID: batch.id)
+                }
+                if matteCheck {
+                    XCTAssertEqual(result.currentStage,.matte)
+                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("analyze"))
+                    try await e.continueAfterReview(batchID: batch.id,stage: .matte,specimenIDs: batch.specimens.map(\.id))
+                    result = try await e.batch(batchID: batch.id)
+                }
                 if geometryCheck {
                     XCTAssertEqual(result.currentStage, .geometry)
                     let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
@@ -250,6 +263,7 @@ final class WorkflowOutputTests: XCTestCase {
                 XCTAssertTrue(result.allSucceeded)
             }
         }
+        } }
     }
 
 }

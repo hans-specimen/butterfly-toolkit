@@ -28,8 +28,8 @@ actor AIInferenceWorker {
         let id = UUID()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            guard !stopping else { throw CancellationError() }
             if let sessionFailure { throw sessionFailure }
+            guard !stopping else { throw CancellationError() }
             return try await withCheckedThrowingContinuation { result in
                 queue.append(Job(id: id,request: request,result: result))
                 if runner == nil { runner = Task { await self.drain() } }
@@ -108,6 +108,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
     private let logURL: URL
     private let log: FileHandle
     private let lock = NSLock()
+    private let exited = DispatchGroup()
     private var cancelled = false
     private var started = false
     private var ready = false
@@ -127,6 +128,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"; environment["PYTHONDONTWRITEBYTECODE"] = "1"
         child.environment = environment
+        child.terminationHandler = { [exited] _ in exited.leave() }
         child.standardInput = input; child.standardOutput = output; child.standardError = log
         // A dead child must produce a write error, never SIGPIPE in the application.
         _ = fcntl(input.fileHandleForWriting.fileDescriptor,F_SETNOSIGPIPE,1)
@@ -145,7 +147,8 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
     }
     func finish() {
         cancel()
-        if started { child.waitUntilExit() }
+        // Launch and cleanup can use different threads; wait on exit notification, not a thread's run loop.
+        if started { exited.wait() }
         try? input.fileHandleForWriting.close(); try? output.fileHandleForReading.close()
         try? input.fileHandleForReading.close(); try? output.fileHandleForWriting.close()
         try? log.close(); try? FileManager.default.removeItem(at: logURL)
@@ -153,7 +156,11 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
     private func launch() throws {
         lock.lock(); defer { lock.unlock() }
         if cancelled { throw CancellationError() }
-        if !started { try child.run(); started = true }
+        if !started {
+            exited.enter()
+            do { try child.run(); started = true }
+            catch { exited.leave(); throw error }
+        }
     }
     func exchange(_ request: WorkflowInferenceRequest,id: UUID) throws -> AIEvent {
         guard request.engine.standardizedFileURL == identity.engine.standardizedFileURL,

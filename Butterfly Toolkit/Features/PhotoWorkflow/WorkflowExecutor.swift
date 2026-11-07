@@ -80,10 +80,14 @@ actor WorkflowExecutor {
     private var running: Set<UUID> = []
     private var manual: [UUID: UUID] = [:]
     private var confirming: Set<UUID> = []
+    private var stageRuns: [UUID: [UUID: Task<Void,Error>]] = [:]
+    private let exportLimit: Int
+    private let matteLimit: Int
 
     init(store: WorkflowBatchStore = WorkflowBatchStore(), services: Services,
-         coordinator: PhotoshopExecutionCoordinator = .shared) {
+         coordinator: PhotoshopExecutionCoordinator = .shared, exportLimit: Int = 2, matteLimit: Int = 2) {
         self.store = store; self.services = services; self.coordinator = coordinator
+        self.exportLimit = max(1,min(2,exportLimit)); self.matteLimit = max(1,min(2,matteLimit))
     }
 
     func register(batch: WorkflowBatch, manifestURL: URL) async throws {
@@ -152,10 +156,13 @@ actor WorkflowExecutor {
 
     func pause(batchID: UUID) async {
         guard let value = batches[batchID] else { return }
-        try? reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try? await persist(batchID)
+        try? reduce(batchID,.cancelRunning(expectedRevision: value.revision))
+        for run in stageRuns[batchID]?.values ?? [:].values { run.cancel() }
+        try? await persist(batchID)
         await services.endInferenceSession()
     }
     func continueAutomatic(batchID: UUID) async throws {
+        guard !running.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         if let owner = manual[batchID] {
             let before = try task(batchID,owner)
             guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
@@ -212,14 +219,14 @@ actor WorkflowExecutor {
         do {
             while !(try batch(batchID: batchID)).isPaused {
                 try Task.checkCancellation()
-                let value = try batch(batchID: batchID)
                 var advanced = false
                 for stage in WorkflowStage.processingStages {
-                    for item in value.activeTasks where item[stage].state == .pending {
-                        let current = try task(batchID,item.id)
-                        guard eligible(current,stage: stage,batch: try batch(batchID: batchID)) else { continue }
-                        try await execute(batchID,item.id,stage: stage); advanced = true
-                        if try batch(batchID: batchID).isPaused { break }
+                    let value = try batch(batchID: batchID)
+                    let ids = value.activeTasks.filter { $0[stage].state == .pending && eligible($0,stage: stage,batch: value) }.map(\.id)
+                    if !ids.isEmpty {
+                        let limit = stage == .matte ? matteLimit : (stage == .hd || stage == .png4k ? exportLimit : 1)
+                        try await runStageTasks(batchID: batchID,stage: stage,taskIDs: ids,limit: limit)
+                        advanced = true
                     }
                     if stage == .matte { await services.endInferenceSession() }
                     if try batch(batchID: batchID).isPaused { break }
@@ -237,6 +244,36 @@ actor WorkflowExecutor {
             await services.endInferenceSession(); throw error
         }
         await services.endInferenceSession()
+    }
+
+    private func runStageTasks(batchID: UUID,stage: WorkflowStage,taskIDs: [UUID],limit: Int) async throws {
+        defer { stageRuns[batchID] = nil }
+        do {
+            try await withThrowingTaskGroup(of: UUID.self) { group in
+                var pending = taskIDs.makeIterator(), exhausted = false, active = 0
+                while !exhausted || active > 0 {
+                    while active < limit && !exhausted {
+                        try Task.checkCancellation()
+                        guard let id = pending.next() else { exhausted = true; break }
+                        let value = try batch(batchID: batchID)
+                        guard let item = value.activeTasks.first(where: { $0.id == id }),item[stage].state == .pending,
+                              eligible(item,stage: stage,batch: value) else { continue }
+                        let run = Task { try await self.execute(batchID,id,stage: stage) }
+                        stageRuns[batchID,default: [:]][id] = run
+                        group.addTask {
+                            try await withTaskCancellationHandler { try await run.value } onCancel: { run.cancel() }
+                            return id
+                        }
+                        active += 1
+                    }
+                    if active > 0,let id = try await group.next() { stageRuns[batchID]?[id] = nil; active -= 1 }
+                }
+            }
+        } catch is CancellationError {
+            // Explicit pause has already persisted pending states; parent cancellation still propagates.
+            let paused = try batch(batchID: batchID).isPaused
+            if Task.isCancelled || !paused { throw CancellationError() }
+        }
     }
 
     private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {
@@ -423,11 +460,16 @@ actor WorkflowExecutor {
     }
 
     private func execute(_ batchID: UUID, _ id: UUID, stage: WorkflowStage) async throws {
-        let pending = try task(batchID,id)
+        try Task.checkCancellation()
+        let value = try batch(batchID: batchID)
+        guard let pending = value.activeTasks.first(where: { $0.id == id }),pending[stage].state == .pending,
+              eligible(pending,stage: stage,batch: value) else { return }
         try reduce(batchID,.stageStarted(taskID: id,stage: stage,expectedVersion: pending[stage].revision))
-        try await persist(batchID)
         var before = try task(batchID,id)
+        try await persist(batchID)
         do {
+            try Task.checkCancellation()
+            try check(batchID,before,stage: stage)
             var output = ""
             switch stage {
             case .stack:
