@@ -134,7 +134,6 @@ extension WorkflowExecutorTests {
     private func ready(checks: Bool = false, count: Int = 1) async throws -> (ExecutorFixture, WorkflowExecutor) {
         let f = try ExecutorFixture(checks: checks,count: count), e = WorkflowExecutor(services: f.services)
         try await e.register(batch: f.batch,manifestURL: f.manifest)
-        try await e.configureDerivatives(batchID: f.batch.id,kinds: [.white1k,.footage],watermarkURL: nil)
         try await e.runPending(batchID: f.batch.id)
         return (f,e)
     }
@@ -216,16 +215,16 @@ extension WorkflowExecutorTests {
     }
     func testRetryOnlyFailedAsset() async throws {
         let (f,e) = try await ready(); try await geometry(f,e)
-        await f.probe.fail([.white1k]); try await square(f,e)
+        await f.probe.fail([.png4k]); try await square(f,e)
         var b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.derivatives].state == .failed })
+        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .failed })
         let old = await f.probe.values()
         await f.probe.fail([])
-        try await e.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .derivatives)
+        try await e.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .png4k)
         b = try await e.batch(batchID: b.id); XCTAssertTrue(b.allSucceeded)
         let calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "render-footage" }.count,old.filter { $0 == "render-footage" }.count)
-        XCTAssertEqual(calls.filter { $0 == "render-png4k" }.count,2)
+        XCTAssertEqual(calls.filter { $0 == "render-hd" }.count,old.filter { $0 == "render-hd" }.count)
+        XCTAssertEqual(calls.filter { $0 == "render-png4k" }.count,old.filter { $0 == "render-png4k" }.count+2)
     }
     func testStaleRenderCannotPublishAfterSourceChange() async throws {
         let (f,e) = try await ready(); await f.probe.block()
@@ -252,7 +251,6 @@ extension WorkflowExecutorTests {
     }
     func testNoDerivativesSelectionSurvivesReload() async throws {
         let (f,e) = try await ready()
-        try await e.configureDerivatives(batchID: f.batch.id,kinds: [],watermarkURL: nil)
         let reopened = WorkflowExecutor(services: f.services)
         _ = try await reopened.register(manifestURL: f.manifest)
         try await geometry(f,reopened); try await square(f,reopened)
@@ -452,32 +450,6 @@ extension WorkflowExecutorTests {
         try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
         do { try await geometry(f,e); XCTFail("stale saved PSD accepted") } catch WorkflowStateError.staleVersion {}
         let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
-    }
-    func testWatermarkFailureIsIsolatedAndContentChangeRerendersOnlyXianyu() async throws {
-        let f = try ExecutorFixture(checks: false)
-        var services = f.services; let render = services.render
-        services.render = { kind,roles,layout,source,mark,url in
-            if kind == .xianyu && mark == nil { throw WorkflowBridgeError.invalidImage("missing watermark") }
-            try await render(kind,roles,layout,source,mark,url)
-        }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-        try await geometry(f,e); try await square(f,e)
-        var b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { task in task[.derivatives].state == .failed && task.artifacts.contains { $0.kind == .footage && $0.state == .completed } && task.artifacts.contains { $0.kind == .xianyu && $0.state == .failed } })
-        let mark = f.batch.outputDirectory.appendingPathComponent("watermark.png")
-        try Data("watermark1".utf8).write(to: mark)
-        try await e.configureDerivatives(batchID: b.id,kinds: [.xianyu,.white1k,.footage],watermarkURL: mark)
-        try await e.runPending(batchID: b.id)
-        let old = await f.probe.values()
-        try Data("watermark2".utf8).write(to: mark)
-        try await e.configureDerivatives(batchID: b.id,kinds: [.xianyu,.white1k,.footage],watermarkURL: mark)
-        try await e.runPending(batchID: b.id)
-        let calls = await f.probe.values(); b = try await e.batch(batchID: b.id)
-        XCTAssertTrue(b.allSucceeded)
-        XCTAssertEqual(calls.filter { $0 == "render-xianyu" }.count,old.filter { $0 == "render-xianyu" }.count+2)
-        XCTAssertEqual(calls.filter { $0 == "render-footage" }.count,old.filter { $0 == "render-footage" }.count)
-        XCTAssertEqual(calls.filter { $0 == "render-hd" }.count,2)
     }
 }
 

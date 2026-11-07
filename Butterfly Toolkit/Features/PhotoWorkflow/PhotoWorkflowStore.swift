@@ -33,7 +33,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let count = photos.count/6
         return Self(directory: directory,groups: (0..<count).map { WorkflowDraftGroup(files: photos[($0*6)..<($0*6+6)].map { Optional($0) }) },remainder: Array(photos.dropFirst(count*6)),otherFiles: files.filter { !["jpg","jpeg"].contains($0.pathExtension.lowercased()) })
     }
-    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool) throws -> WorkflowBatch {
+    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true) throws -> WorkflowBatch {
         let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
         guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage("请明确排除剩余未分组照片") }
@@ -58,15 +58,16 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             }
             return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,3),exclusionReason: group.excluded ? "建批次时排除" : nil)
         }
-        let batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,checkAfterStack: checkStack,checkAfterMatte: checkMatte,specimens: specimens)
-        try batch.validate(); return batch
+        let batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,outputLocations: locations,checkAfterStack: checkStack,checkAfterMatte: checkMatte,checkGeometry: checkGeometry,check4K: check4K,specimens: specimens)
+        try batch.validate(); try batch.validateStart(); return batch
     }
 }
 
 @MainActor final class PhotoWorkflowStore: ObservableObject {
     @Published var draft: WorkflowBatchDraft?
     @Published var names = ""
-    @Published var outputDirectory: URL?
+    @Published var hdDirectory: URL?
+    @Published var png4kDirectory: URL?
     @Published var enginePath = UserDefaults.standard.string(forKey: "aiEnginePath") ?? ""
     @Published var checkAfterStack = UserDefaults.standard.object(forKey: "workflowCheckStack") as? Bool ?? true {
         didSet { UserDefaults.standard.set(checkAfterStack,forKey: "workflowCheckStack") }
@@ -74,6 +75,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var checkAfterMatte = UserDefaults.standard.object(forKey: "workflowCheckMatte") as? Bool ?? true {
         didSet { UserDefaults.standard.set(checkAfterMatte,forKey: "workflowCheckMatte") }
     }
+    @Published var checkGeometry = true
+    @Published var check4K = true
+    var needsExportDirectories: Bool { !checkAfterStack && !checkAfterMatte && !checkGeometry && !check4K }
+    var canStart: Bool { draft != nil && (!needsExportDirectories || (hdDirectory != nil && png4kDirectory != nil)) }
     @Published var batch: WorkflowBatch?
     @Published var selectedSpecimens: Set<UUID> = []
     @Published var currentSpecimenID: UUID? { didSet { if currentSpecimenID != oldValue { retainCurrentDetailOnly() } } }
@@ -81,9 +86,6 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var stage: WorkflowStage = .stack { didSet { if stage != oldValue { cancelMove(); prepareSelected() } } }
     @Published var error: String?
     @Published var busy = false
-    @Published var exportHD = true
-    @Published var selectedDerivatives: Set<WorkflowAssetKind> = [.white1k,.footage]
-    @Published var watermarkURL: URL?
     @Published var previewMode = "底图" { didSet { if previewMode != oldValue { prepareSelected() } } }
     @Published var previewBackground = "棋盘"
     @Published var zoom = 1.0
@@ -179,20 +181,34 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         do { draft = try WorkflowBatchDraft.scan(directory: directory); error = nil } catch { self.error = error.localizedDescription }
     }
     func start() {
-        guard let draft,let outputDirectory else { error = "请选择输入与输出文件夹"; return }
-        let names = names,stack = checkAfterStack,matte = checkAfterMatte
+        guard let draft else { error = "请选择输入文件夹"; return }
+        let outputDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Butterfly Toolkit/PhotoWorkflow/\(UUID().uuidString)", isDirectory: true)
+        let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
+        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K
         launch { [self] in
             guard FileManager.default.fileExists(atPath: URL(fileURLWithPath: enginePath).appendingPathComponent("scripts/toolkit_bridge.py").path) else { throw WorkflowBridgeError.invalidImage("请选择 butterfly-matte 引擎目录；仅本批次使用，不会改变 AI 工作区设置") }
-            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte) }.value
+            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK) }.value
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)
             executor = e; manifestURL = manifest
-            try await e.configureDerivatives(batchID: frozen.id,kinds: Array(selectedDerivatives),watermarkURL: watermarkURL)
             batch = try await e.batch(batchID: frozen.id); currentSpecimenID = frozen.specimens.first { !$0.isExcluded }?.id; selectedSpecimens = Set(frozen.specimens.filter { !$0.isExcluded }.map(\.id))
             try await e.runPending(batchID: frozen.id)
         }
     }
+    func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
+        if let batch { return batch.exportDirectory(for: kind) }
+        return kind == .hd ? hdDirectory : png4kDirectory
+    }
+    func selectExportDirectory(_ url: URL, kind: WorkflowAssetKind) {
+        guard let executor, let batch else {
+            if kind == .hd { hdDirectory = url } else { png4kDirectory = url }
+            return
+        }
+        launch { try await executor.setExportDirectory(batchID: batch.id, kind: kind, directory: url) }
+    }
+
     private var canSwitchBatch: Bool { !busy && manualTaskID == nil }
     func openBatch(_ url: URL) {
         guard canSwitchBatch else { error = "请先结束当前操作，并保存、刷新及明确继续人工 PSD 编辑"; return }
@@ -204,8 +220,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             clearPreviewState(); executor = e; manifestURL = url; batch = value
             currentSpecimenID = value.specimens.first { !$0.isExcluded }?.id
             selectedSpecimens = Set(value.specimens.filter { !$0.isExcluded }.map(\.id))
-            selectedDerivatives = Set(value.selectedDerivativeKinds ?? []); watermarkURL = value.watermarkURL
-            stage = value.currentStage ?? .derivatives
+            stage = value.currentStage ?? .png4k
         }
     }
     func closeBatch() {
@@ -213,7 +228,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         launch { [self] in
             try await persistBeforeSwitch()
             clearPreviewState(); executor = nil; manifestURL = nil; batch = nil
-            currentSpecimenID = nil; selectedSpecimens = []; draft = nil; names = ""; outputDirectory = nil; stage = .stack
+            currentSpecimenID = nil; selectedSpecimens = []; draft = nil; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
         }
     }
     func configureEngine(_ url: URL) {
@@ -354,11 +369,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         launch { [self] in
             switch stage {
             case .stack,.matte: try await e.continueAfterReview(batchID: b.id,stage: stage,specimenIDs: b.specimens.filter { !$0.isExcluded }.map(\.id))
-            case .geometry: try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: selected.compactMap { task in solutions[task.id].map { (task.id,$0) } }),exportHD: exportHD)
+            case .geometry: try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: selected.compactMap { task in solutions[task.id].map { (task.id,$0) } }),exportHD: true)
             case .png4k:
-                try await e.configureDerivatives(batchID: b.id,kinds: Array(selectedDerivatives),watermarkURL: watermarkURL)
                 try await e.confirm4K(batchID: b.id,layouts: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,layouts[$0.id] ?? $0.squareLayout) }))
-            case .hd,.derivatives: try await e.retry(batchID: b.id,specimenIDs: Array(selectedSpecimens),stage: stage)
+            case .derivatives: throw WorkflowStateError.invalidTransition
+            case .hd: try await e.retry(batchID: b.id,specimenIDs: Array(selectedSpecimens),stage: stage)
             }
         }
     }

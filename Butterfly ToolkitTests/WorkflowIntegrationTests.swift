@@ -110,7 +110,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertEqual(b.activeTasks.count, 2)
         XCTAssertEqual(b.specimens[1].baseName, "sample1")
         XCTAssertFalse(b.allSucceeded, "Excluded specimen remains visible and prevents an all-success claim")
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.derivatives].state == .completed })
+        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .completed })
     }
 
     func testUnsavedPSDPreventsRefreshAndResumeUntilSavedAndExplicitContinue() async throws {
@@ -209,7 +209,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertFalse(b.allSucceeded)
     }
 
-    func testRealRendererAndPublisherUseConfirmed4KForReframed1KAndIsolateMissingWatermark() async throws {
+    func testRealRendererAndPublisherFinishWithConfirmedTransparent4K() async throws {
         let f = try ExecutorFixture(checks: false)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let image = try WorkflowAssetRendererTests.Fixture(subject: CGRect(x: 10, y: 10, width: 80, height: 60))
@@ -238,48 +238,29 @@ final class WorkflowIntegrationTests: XCTestCase {
         }
         services.publish = { try store.publish(temp: $0, artifact: $1) }
         services.recover = { try store.recover(artifact: $0) }
-        let e = try await start(f, services: services, kinds: [.xianyu, .white1k, .footage])
+        let e = try await start(f, services: services)
         try await confirmGeometry(f, e)
         try await confirm4K(f, e)
         let b = try await e.batch(batchID: f.batch.id)
-        XCTAssertFalse(b.allSucceeded)
+        XCTAssertTrue(b.allSucceeded)
         for task in b.activeTasks {
             XCTAssertEqual(task[.png4k].state, .completed)
-            XCTAssertEqual(task[.derivatives].state, .failed)
+            XCTAssertEqual(Set(task.artifacts.map(\.kind)), [.hd, .png4k])
             let four = try XCTUnwrap(task.artifacts.last { $0.kind == .png4k && $0.state == .completed })
-            let white = try XCTUnwrap(task.artifacts.last { $0.kind == .white1k && $0.state == .completed })
-            let footage = try XCTUnwrap(task.artifacts.last { $0.kind == .footage && $0.state == .completed })
-            XCTAssertEqual(task.artifacts.last { $0.kind == .xianyu }?.state, .failed)
-            XCTAssertEqual(white.sourceFingerprint, four.fileFingerprint)
-            XCTAssertEqual(footage.sourceFingerprint, four.fileFingerprint)
             XCTAssertEqual(try AIFileValidation.hash(four.url.path), four.fileFingerprint)
-            let fourPixels = try WorkflowRaster.read(four.url), whitePixels = try WorkflowRaster.read(white.url)
-            let trimPixels = try WorkflowRaster.read(footage.url)
+            let fourPixels = try WorkflowRaster.read(four.url)
             XCTAssertEqual(fourPixels.size, CGSize(width: 4096, height: 4096))
             XCTAssertEqual(Array(fourPixels.pixels.prefix(4)), [0, 0, 0, 0])
             let fourBounds = try XCTUnwrap(bounds(fourPixels, alpha: true))
             XCTAssertEqual(fourBounds.minX, 256, accuracy: 1)
             XCTAssertEqual(fourBounds.maxX, 3840, accuracy: 1)
-            XCTAssertEqual(whitePixels.size, CGSize(width: 1000, height: 1000))
-            XCTAssertEqual(Array(whitePixels.pixels.prefix(4)), [255, 255, 255, 255])
-            let whiteBounds = try XCTUnwrap(bounds(whitePixels, alpha: false))
-            XCTAssertEqual(whiteBounds.minX, 10, accuracy: 1)
-            XCTAssertEqual(whiteBounds.maxX, 990, accuracy: 1)
-            XCTAssertEqual(trimPixels.size, fourBounds.size)
-            // Every trimmed byte comes from this confirmed 4K, with no resize or alpha cleanup.
-            let sourceWidth = Int(fourPixels.size.width), trimWidth = Int(trimPixels.size.width)
-            for y in 0..<Int(trimPixels.size.height) {
-                let start = ((y + Int(fourBounds.minY))*sourceWidth + Int(fourBounds.minX))*4
-                XCTAssertEqual(Array(trimPixels.pixels[(y*trimWidth*4)..<((y+1)*trimWidth*4)]), Array(fourPixels.pixels[start..<(start+trimWidth*4)]))
-            }
-            XCTAssertEqual(try store.recover(artifact: white), white)
+            XCTAssertEqual(try store.recover(artifact: four), four)
         }
     }
 
-    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil, kinds: [WorkflowAssetKind] = [.white1k, .footage]) async throws -> WorkflowExecutor {
+    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil) async throws -> WorkflowExecutor {
         let e = WorkflowExecutor(services: services ?? f.services, coordinator: PhotoshopExecutionCoordinator())
         try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.configureDerivatives(batchID: f.batch.id, kinds: kinds, watermarkURL: nil)
         try await e.runPending(batchID: f.batch.id)
         return e
     }

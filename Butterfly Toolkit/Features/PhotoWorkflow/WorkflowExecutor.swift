@@ -39,9 +39,7 @@ actor WorkflowExecutor {
                         switch kind {
                         case .hd: guard let roles else { throw WorkflowStateError.invalidTransition }; try renderer.renderHD(roles: roles,destination: destination)
                         case .png4k: guard let roles else { throw WorkflowStateError.invalidTransition }; try renderer.render4K(roles: roles,layout: layout,destination: destination)
-                        case .white1k: guard let source else { throw WorkflowStateError.invalidTransition }; try renderer.renderWhite1K(source4K: source,destination: destination)
-                        case .footage: guard let source else { throw WorkflowStateError.invalidTransition }; try renderer.renderFootage(source4K: source,destination: destination)
-                        case .xianyu: guard let source, let watermark else { throw WorkflowBridgeError.invalidImage("请选择水印文件") }; try renderer.renderXianyu(source4K: source,watermark: watermark,destination: destination)
+                        case .white1k, .footage, .xianyu: throw WorkflowStateError.invalidTransition
                         }
                     }.value
                 },
@@ -93,13 +91,15 @@ actor WorkflowExecutor {
     func register(batch: WorkflowBatch, manifestURL: URL) async throws {
         guard batches[batch.id] == nil else { throw WorkflowStateError.invalidTransition }
         var value = batch
-        if value.selectedDerivativeKinds == nil { value.selectedDerivativeKinds = [.xianyu,.white1k,.footage] }
-        try value.validate(); try value.validateOutputURL(manifestURL)
+        value.selectedDerivativeKinds = []
+        value.watermarkURL = nil
+        try value.validate(); try value.validateStart(); try value.validateOutputURL(manifestURL)
         for task in value.sideTasks {
             if let saved = task.snapshot { try value.validateOutputURL(saved.workingURL) }
         }
         batches[value.id] = value; manifests[value.id] = manifestURL
         try await persist(value.id)
+        for task in value.activeTasks { try await cleanMatteTemporaryFiles(value.id, task.id) }
     }
     func register(manifestURL: URL) async throws -> UUID {
         let value = try await store.load(from: manifestURL)
@@ -115,18 +115,43 @@ actor WorkflowExecutor {
     func update(batchID: UUID, event: WorkflowEvent) async throws {
         try reduce(batchID,event); try await persist(batchID)
     }
-    func configureDerivatives(batchID: UUID, kinds: [WorkflowAssetKind], watermarkURL: URL?) async throws {
-        guard Set(kinds).count == kinds.count, kinds.allSatisfy({ $0.stage == .derivatives }) else { throw WorkflowStateError.invalidTransition }
+    func setExportDirectory(batchID: UUID, kind: WorkflowAssetKind, directory: URL) async throws {
+        guard kind == .hd || kind == .png4k, directory.isFileURL,
+              !running.contains(batchID), !confirming.contains(batchID), manual[batchID] == nil else {
+            throw WorkflowStateError.invalidTransition
+        }
         let value = try batch(batchID: batchID)
-        try edit(batchID) { $0.selectedDerivativeKinds = kinds; $0.watermarkURL = watermarkURL }
-        for task in value.activeTasks {
-            try mutateTask(batchID,task.id) {
-                $0[.derivatives].state = .pending; $0[.derivatives].revision += 1
-                $0[.derivatives].confirmedVersion = nil; $0[.derivatives].outputVersion = nil
+        guard value.exportDirectory(for: kind) != directory else { return }
+        try edit(batchID) { batch in
+            var locations = batch.outputLocations ?? WorkflowOutputLocations(hd: batch.exportDirectory(for: .hd), png4k: batch.exportDirectory(for: .png4k))
+            if kind == .hd { locations.hd = directory } else { locations.png4k = directory }
+            batch.outputLocations = locations
+            for index in batch.specimens.indices {
+                for side in WorkflowSide.allCases {
+                    var task = side == .front ? batch.specimens[index].front : batch.specimens[index].back
+                    // Published files retain their independent ownership receipts in the old folder.
+                    task.artifacts.removeAll { $0.kind == kind }
+                    if !batch.specimens[index].isExcluded {
+                        if task[kind.stage].state == .completed || task[kind.stage].state == .failed {
+                            task[kind.stage].state = .pending; task[kind.stage].error = nil
+                            task[kind.stage].outputVersion = nil; task[kind.stage].confirmedVersion = nil
+                            if kind == .png4k, task[.geometry].state == .completed,
+                               let snapshot = task.snapshot, task.roleImages?.snapshotVersion == snapshot.contentVersion {
+                                task[.png4k].state = .waitingReview
+                                task[.png4k].outputVersion = try Self.fingerprint([snapshot.contentVersion, Self.encoded(task.squareLayout)])
+                            }
+                        }
+                        task[kind.stage].revision += 1
+                        if kind == .hd && task[.geometry].state == .completed { task.exportHD = true }
+                        if kind == .png4k { task.fourKExportRequested = nil }
+                    }
+                    if side == .front { batch.specimens[index].front = task } else { batch.specimens[index].back = task }
+                }
             }
         }
         try await persist(batchID)
     }
+
     func pause(batchID: UUID) async {
         guard let value = batches[batchID] else { return }
         try? reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try? await persist(batchID)
@@ -190,7 +215,7 @@ actor WorkflowExecutor {
                 try Task.checkCancellation()
                 let value = try batch(batchID: batchID)
                 var advanced = false
-                for stage in WorkflowStage.allCases {
+                for stage in WorkflowStage.processingStages {
                     for item in value.activeTasks where item[stage].state == .pending {
                         let current = try task(batchID,item.id)
                         guard eligible(current,stage: stage,batch: try batch(batchID: batchID)) else { continue }
@@ -200,6 +225,7 @@ actor WorkflowExecutor {
                     if try batch(batchID: batchID).isPaused { break }
                 }
                 try await finish4KIntents(batchID)
+                if try await advanceUncheckedReviews(batchID) { advanced = true }
                 if !advanced { return }
             }
         } catch is CancellationError {
@@ -207,6 +233,27 @@ actor WorkflowExecutor {
             try reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try await persist(batchID)
             throw CancellationError()
         }
+    }
+
+    private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {
+        let value = try batch(batchID: batchID)
+        guard !value.isPaused else { return false }
+        var advanced = false
+        for specimen in value.specimens where !specimen.isExcluded {
+            let pair = [specimen.front, specimen.back]
+            if value.checkGeometry == false && pair.allSatisfy({ $0[.geometry].state == .waitingReview }) {
+                guard pair.allSatisfy({ $0.geometrySolution?.isApplicable == true }) else {
+                    throw WorkflowBridgeError.invalidImage("\(specimen.baseName) 的自动构图未通过检查，请手动调整后确认")
+                }
+                try await applyGeometryConfirmation(batchID: batchID, solutions: Dictionary(uniqueKeysWithValues: pair.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
+                advanced = true
+            }
+            if value.check4K == false && value.exportDirectory(for: .png4k) != nil && pair.allSatisfy({ $0[.png4k].state == .waitingReview && $0.fourKExportRequested != true }) {
+                try await prepare4KExport(batchID: batchID, layouts: Dictionary(uniqueKeysWithValues: pair.map { ($0.id, $0.squareLayout) }))
+                advanced = true
+            }
+        }
+        return advanced
     }
 
     func continueAfterReview(batchID: UUID, stage: WorkflowStage, specimenIDs: [UUID]) async throws {
@@ -232,6 +279,11 @@ actor WorkflowExecutor {
     func confirmGeometry(batchID: UUID, solutions: [UUID: GeometrySolution], exportHD: Bool) async throws {
         guard !confirming.contains(batchID), !running.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         confirming.insert(batchID); defer { confirming.remove(batchID) }
+        try await applyGeometryConfirmation(batchID: batchID, solutions: solutions, exportHD: exportHD)
+        try await runStages(batchID: batchID)
+    }
+
+    private func applyGeometryConfirmation(batchID: UUID, solutions: [UUID: GeometrySolution], exportHD: Bool) async throws {
         let ids = try selectedSpecimens(batchID,sideIDs: Set(solutions.keys),stage: .geometry)
         guard manual[batchID] == nil, !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.invalidTransition }
         let presets = try batch(batchID: batchID).presets
@@ -306,12 +358,19 @@ actor WorkflowExecutor {
         expected = try Dictionary(uniqueKeysWithValues: solutions.keys.map { ($0,try task(batchID,$0)) })
         try await persist(batchID)
         try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-        try await runStages(batchID: batchID)
     }
 
     func confirm4K(batchID: UUID, layouts: [UUID: SquareLayout]) async throws {
+        guard try batch(batchID: batchID).exportDirectory(for: .png4k) != nil else {
+            throw WorkflowBridgeError.invalidImage("请先选择 PNG4K 输出文件夹")
+        }
         guard !confirming.contains(batchID), !running.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         confirming.insert(batchID); defer { confirming.remove(batchID) }
+        try await prepare4KExport(batchID: batchID, layouts: layouts)
+        try await runStages(batchID: batchID)
+    }
+
+    private func prepare4KExport(batchID: UUID, layouts: [UUID: SquareLayout]) async throws {
         _ = try selectedSpecimens(batchID,sideIDs: Set(layouts.keys),stage: .png4k)
         guard manual[batchID] == nil, !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.invalidTransition }
         let presets = try batch(batchID: batchID).presets
@@ -345,12 +404,11 @@ actor WorkflowExecutor {
             try await persist(batchID)
             throw error
         }
-        try await runStages(batchID: batchID)
     }
 
     func retry(batchID: UUID, specimenIDs: [UUID], stage: WorkflowStage) async throws {
         let value = try batch(batchID: batchID)
-        guard !specimenIDs.isEmpty, Set(specimenIDs).isSubset(of: Set(value.specimens.filter { !$0.isExcluded }.map(\.id))) else { throw WorkflowStateError.invalidTransition }
+        guard WorkflowStage.processingStages.contains(stage), !specimenIDs.isEmpty, Set(specimenIDs).isSubset(of: Set(value.specimens.filter { !$0.isExcluded }.map(\.id))) else { throw WorkflowStateError.invalidTransition }
         for specimen in value.specimens where specimenIDs.contains(specimen.id) {
             for side in [specimen.front,specimen.back] where side[stage].state == .failed {
                 guard side.geometryApplySourceVersion == nil else { throw WorkflowStateError.invalidTransition }
@@ -372,7 +430,8 @@ actor WorkflowExecutor {
                 let value = try batch(batchID: batchID)
                 let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
                 if before.stackAttemptURL == nil {
-                    let attempt = value.outputDirectory.appendingPathComponent("PSD/\(id)/\(UUID())/\(specimen.baseName)_\(before.side.fileSuffix).psd")
+                    let attempt = value.sourceDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
+                    try value.validateOutputURL(attempt)
                     try mutateTask(batchID,id) { $0.stackAttemptURL = attempt }; try await persist(batchID)
                     before = try task(batchID,id)
                 }
@@ -466,22 +525,14 @@ actor WorkflowExecutor {
                 if before.fourKExportRequested == true { output = try await asset(batchID,id,kind: .png4k).fileFingerprint }
                 else { output = try Self.fingerprint([before.snapshot?.contentVersion ?? "",Self.encoded(before.squareLayout)]) }
             case .derivatives:
-                let selected = try batch(batchID: batchID).selectedDerivativeKinds ?? []
-                var errors: [String] = [], fingerprints: [String] = []
-                for kind in selected {
-                    do { fingerprints.append(try await asset(batchID,id,kind: kind).fileFingerprint) }
-                    catch is CancellationError { throw CancellationError() }
-                    catch WorkflowStateError.staleVersion { throw WorkflowStateError.staleVersion }
-                    catch { errors.append("\(kind.rawValue): \(error.localizedDescription)") }
-                }
-                if !errors.isEmpty { throw WorkflowBridgeError.invalidImage(errors.joined(separator: "\n")) }
-                output = Self.fingerprint(fingerprints + ["derivatives"])
+                throw WorkflowStateError.invalidTransition
             }
             let final = try task(batchID,id)
             guard final[stage].revision == before[stage].revision, final.sourceRevision == before.sourceRevision,
                   !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.staleVersion }
             try reduce(batchID,.stageCompleted(taskID: id,stage: stage,expectedVersion: before[stage].revision,outputVersion: output))
             try await persist(batchID)
+            if stage == .matte { try await cleanMatteTemporaryFiles(batchID, id) }
         } catch is CancellationError { throw CancellationError() }
         catch {
             let current = try task(batchID,id)
@@ -496,25 +547,35 @@ actor WorkflowExecutor {
         }
     }
 
+    private func cleanMatteTemporaryFiles(_ batchID: UUID, _ id: UUID) async throws {
+        let value = try batch(batchID: batchID), task = try task(batchID, id)
+        guard task.snapshot?.roles?.isValid == true,
+              task[.matte].state == .completed || task[.matte].state == .waitingReview else { return }
+        let work = value.outputDirectory.appendingPathComponent(".work")
+        let urls = [task.stackPNG?.pngURL, task.stackPNG?.validBackgroundAlphaURL,
+                    task.matteArtifact?.alphaURL, task.matteArtifact?.cutoutURL].compactMap { $0 }
+        // The saved PSD and completed stage are durable before any temporary image disappears.
+        for url in Set(urls) where url.pathExtension.lowercased() == "png" &&
+            ["data/processed", "AI"].contains(where: { WorkflowBatch.isContained(url, in: work.appendingPathComponent($0)) }) {
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        }
+        try mutateTask(batchID, id) { $0.stackPNG = nil; $0.matteArtifact = nil }
+        try await persist(batchID)
+    }
+
     private func asset(_ batchID: UUID, _ id: UUID, kind: WorkflowAssetKind) async throws -> WorkflowArtifact {
         let before = try task(batchID,id), value = try batch(batchID: batchID)
         let stage = kind.stage
-        let source: String, source4K: URL?
-        if stage == .derivatives {
-            guard before[.png4k].state == .completed, let png = before.artifacts.last(where: { $0.kind == .png4k && $0.state == .completed }),
-                  before[.png4k].confirmedVersion == png.fileFingerprint,
-                  try AIFileValidation.hash(png.url.path) == png.fileFingerprint else { throw WorkflowStateError.staleVersion }
-            source = png.fileFingerprint; source4K = png.url
-        } else {
-            guard let roles = before.roleImages, roles.snapshotVersion == before.snapshot?.contentVersion else { throw WorkflowStateError.staleVersion }
-            source4K = nil
-            source = kind == .hd ? try await services.contentFingerprint(roles) : try Self.fingerprint([roles.snapshotVersion,Self.encoded(before.geometrySolution)])
+        guard kind == .hd || kind == .png4k,
+              let directory = value.exportDirectory(for: kind) else {
+            throw WorkflowBridgeError.invalidImage("请先选择\(kind == .hd ? "堆栈原图" : "PNG4K")输出文件夹")
         }
+        guard let roles = before.roleImages, roles.snapshotVersion == before.snapshot?.contentVersion else { throw WorkflowStateError.staleVersion }
+        let source = kind == .hd ? try await services.contentFingerprint(roles) : try Self.fingerprint([roles.snapshotVersion,Self.encoded(before.geometrySolution)])
         let preset = try presetFingerprint(kind,batch: value,task: before)
-        let folders: [WorkflowAssetKind: String] = [.hd: "高清堆栈",.png4k: "png 4k",.xianyu: "闲鱼产品图",.white1k: "1K 白底",.footage: "png 素材"]
         let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
-        let url = value.outputDirectory.appendingPathComponent(folders[kind]!).appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).\(kind == .hd ? "jpg" : "png")")
-        try value.validateOutputURL(url)
+        let url = directory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).\(kind == .hd ? "jpg" : "png")")
+        try value.validateArtifactURL(url, kind: kind)
         let recipe = WorkflowArtifact(ownerTaskID: id,kind: kind,url: url,sourceFingerprint: source,presetFingerprint: preset,fileFingerprint: "",state: .pending)
         try check(batchID,before,stage: stage)
         if let existing = before.artifacts.last(where: { Self.sameRecipe($0,recipe) && $0.state == .completed }),
@@ -530,15 +591,15 @@ actor WorkflowExecutor {
         let temp = value.outputDirectory.appendingPathComponent(".work/\(id)/\(UUID())/output.\(kind == .hd ? "jpg" : "png")")
         try value.validateOutputURL(temp)
         try FileManager.default.createDirectory(at: temp.deletingLastPathComponent(),withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp.deletingLastPathComponent()) }
         do {
-            try await services.render(kind,before.roleImages,before.squareLayout,source4K,value.watermarkURL,temp)
+            try await services.render(kind,before.roleImages,before.squareLayout,nil,nil,temp)
             try Task.checkCancellation()
             try check(batchID,before,stage: stage)
             let current = try task(batchID,id), latest = try batch(batchID: batchID)
             guard try presetFingerprint(kind,batch: latest,task: current) == preset,
                   current.artifacts.contains(where: { Self.sameRecipe($0,recipe) }) else { throw WorkflowStateError.staleVersion }
-            if let source4K { guard try AIFileValidation.hash(source4K.path) == source else { throw WorkflowStateError.staleVersion } }
-            try latest.validateOutputURL(url); try latest.validateOutputURL(temp)
+            try latest.validateArtifactURL(url, kind: kind); try latest.validateOutputURL(temp)
             // No await between the fence and publication: actor reentrancy cannot publish obsolete bytes.
             let result = try services.publish(temp,recipe)
             try recordArtifact(batchID,id,result); try await persist(batchID); return result
@@ -590,7 +651,8 @@ actor WorkflowExecutor {
         return Set(selected.map(\.id))
     }
     private func eligible(_ task: WorkflowSideTask, stage: WorkflowStage, batch: WorkflowBatch) -> Bool {
-        guard !batch.isPaused, WorkflowStage.allCases.prefix(while: { $0 != stage }).allSatisfy({ task[$0].state == .completed }) else { return false }
+        if stage == .hd && task.exportHD != false && batch.exportDirectory(for: .hd) == nil { return false }
+        guard !batch.isPaused, WorkflowStage.processingStages.prefix(while: { $0 != stage }).allSatisfy({ task[$0].state == .completed }) else { return false }
         if stage != .stack, !batch.activeTasks.allSatisfy({ $0[.stack].state == .completed }) { return false }
         if stage != .stack && stage != .matte, !batch.activeTasks.allSatisfy({ $0[.matte].state == .completed }) { return false }
         return true

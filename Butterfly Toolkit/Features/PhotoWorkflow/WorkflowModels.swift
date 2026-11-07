@@ -1,8 +1,11 @@
 import Foundation
 import CoreGraphics
+import Darwin
 
 nonisolated enum WorkflowStage: String, Codable, CaseIterable, Sendable {
     case stack, matte, geometry, hd, png4k, derivatives
+    // The legacy derivative case remains decodable, but is no longer a workflow step.
+    static let processingStages: [Self] = [.stack, .matte, .geometry, .hd, .png4k]
 }
 
 nonisolated enum WorkflowSide: String, Codable, CaseIterable, Sendable {
@@ -107,13 +110,22 @@ nonisolated struct WorkflowSpecimen: Codable, Equatable, Identifiable, Sendable 
     var isExcluded: Bool { exclusionReason != nil }
 }
 
+nonisolated struct WorkflowOutputLocations: Codable, Equatable, Sendable {
+    var hd: URL?
+    var png4k: URL?
+}
+
 nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var schemaVersion: Int = 1
     var id: UUID = UUID()
     var sourceDirectory: URL
+    /// Internal batch records and resumable working data; not a user-selected export folder.
     var outputDirectory: URL
+    var outputLocations: WorkflowOutputLocations?
     var checkAfterStack: Bool = true
     var checkAfterMatte: Bool = true
+    var checkGeometry: Bool?
+    var check4K: Bool?
     var specimens: [WorkflowSpecimen]
     /// nil is the legacy default; [] explicitly selects no derivatives.
     var selectedDerivativeKinds: [WorkflowAssetKind]?
@@ -126,22 +138,71 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var activeTasks: [WorkflowSideTask] { specimens.filter { !$0.isExcluded }.flatMap { [$0.front, $0.back] } }
     /// Derived from durable per-side records so partially confirmed specimens can advance independently.
     var currentStage: WorkflowStage? {
-        WorkflowStage.allCases.first { stage in activeTasks.contains { $0[stage].state != .completed } }
+        WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
     }
     var allSucceeded: Bool {
         !specimens.isEmpty && !specimens.contains(where: \.isExcluded) &&
-            sideTasks.allSatisfy { task in WorkflowStage.allCases.allSatisfy { task[$0].state == .completed } }
+            sideTasks.allSatisfy { task in WorkflowStage.processingStages.allSatisfy { task[$0].state == .completed } }
     }
     func task(id: UUID) -> WorkflowSideTask? { sideTasks.first { $0.id == id } }
 
-    /// Compare canonical components so nested symlinks cannot escape, while /var aliases remain valid.
-    func validateOutputURL(_ url: URL) throws {
-        let root = outputDirectory.standardizedFileURL.resolvingSymlinksInPath().pathComponents
-        let destination = url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
-        guard url.isFileURL, !url.pathComponents.contains(".."), destination.count > root.count,
-              destination.prefix(root.count).elementsEqual(root) else {
-            throw WorkflowStateError.invalidManifest("Output destination escapes batch directory")
+    var hasCheckpoints: Bool { checkAfterStack || checkAfterMatte || checkGeometry != false || check4K != false }
+    func validateStart() throws {
+        if !hasCheckpoints && (exportDirectory(for: .hd) == nil || exportDirectory(for: .png4k) == nil) {
+            throw WorkflowBridgeError.invalidImage("取消全部检查点时，请先选择堆栈原图和 PNG4K 输出文件夹")
         }
+    }
+
+    func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
+        if let outputLocations {
+            return kind == .hd ? outputLocations.hd : kind == .png4k ? outputLocations.png4k : nil
+        }
+        // Older manifests used subfolders within the batch directory.
+        let folders: [WorkflowAssetKind: String] = [.hd: "高清堆栈", .png4k: "png 4k", .xianyu: "闲鱼产品图", .white1k: "1K 白底", .footage: "png 素材"]
+        return outputDirectory.appendingPathComponent(folders[kind]!)
+    }
+
+    private static func canonicalComponents(_ url: URL) -> [String]? {
+        var ancestor = url.standardizedFileURL
+        var missing: [String] = []
+        let fm = FileManager.default
+        // Foundation does not resolve intermediate symlinks when the destination does not exist yet.
+        while !fm.fileExists(atPath: ancestor.path) {
+            guard ancestor.path != "/", (try? fm.destinationOfSymbolicLink(atPath: ancestor.path)) == nil else { return nil }
+            missing.insert(ancestor.lastPathComponent, at: 0)
+            ancestor.deleteLastPathComponent()
+        }
+        guard let resolved = realpath(ancestor.path, nil) else { return nil }
+        defer { free(resolved) }
+        return URL(fileURLWithPath: String(cString: resolved)).pathComponents + missing
+    }
+
+    static func isContained(_ url: URL, in root: URL) -> Bool {
+        guard url.isFileURL, root.isFileURL, !url.pathComponents.contains(".."),
+              let root = canonicalComponents(root), let destination = canonicalComponents(url) else { return false }
+        return destination.count > root.count && destination.prefix(root.count).elementsEqual(root)
+    }
+
+    func validateArtifactURL(_ url: URL, kind: WorkflowAssetKind) throws {
+        guard let root = exportDirectory(for: kind), Self.isContained(url, in: root),
+              outputLocations != nil || Self.isContained(url, in: outputDirectory) else {
+            throw WorkflowStateError.invalidManifest("Export destination escapes its selected directory")
+        }
+    }
+
+    func validateOutputURL(_ url: URL) throws {
+        if Self.isContained(url, in: outputDirectory) { return }
+        if outputLocations != nil {
+            for kind in [WorkflowAssetKind.hd, .png4k] {
+                if let root = exportDirectory(for: kind), Self.isContained(url, in: root) { return }
+            }
+        }
+        // PSDs beside originals must have exactly the frozen specimen name and side.
+        let allowed = specimens.flatMap { specimen in
+            WorkflowSide.allCases.map { sourceDirectory.appendingPathComponent("\(specimen.baseName)_\($0.fileSuffix).psd") }
+        }
+        if Self.isContained(url, in: sourceDirectory), allowed.contains(url.standardizedFileURL) { return }
+        throw WorkflowStateError.invalidManifest("Output destination is outside the batch's authorized locations")
     }
     private static func isSafeBaseName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -156,6 +217,9 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
         for folder in ["PSD", ".work", "高清堆栈", "png 4k", "闲鱼产品图", "1K 白底", "png 素材"] {
             try validateOutputURL(outputDirectory.appendingPathComponent(folder))
         }
+        for directory in [outputLocations?.hd, outputLocations?.png4k].compactMap({ $0 }) {
+            guard directory.isFileURL else { throw WorkflowStateError.invalidManifest("Invalid export directory") }
+        }
         let identities = specimens.map(\.id) + sideTasks.map(\.id)
         guard Set(identities).count == identities.count else { throw WorkflowStateError.invalidManifest("Duplicate task identity") }
         for specimen in specimens {
@@ -166,7 +230,10 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
             }
             for task in [specimen.front, specimen.back] {
                 if let attempt = task.stackAttemptURL { try validateOutputURL(attempt) }
-                for artifact in task.artifacts { try validateOutputURL(artifact.url) }
+                for artifact in task.artifacts {
+                    if outputLocations != nil && artifact.kind.stage != .derivatives { try validateArtifactURL(artifact.url, kind: artifact.kind) }
+                    else { try validateOutputURL(artifact.url) }
+                }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
                       task.sources.files.allSatisfy({ $0.url.isFileURL && (specimen.isExcluded || !$0.fingerprint.isEmpty) }) else {
                     throw WorkflowStateError.invalidManifest("Incomplete source or stage records")
