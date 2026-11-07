@@ -5,6 +5,60 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class WorkflowAssetRendererTests: XCTestCase {
+    func testRenderDecodesEachRoleOnce() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let probe = WorkflowDecodeProbe(),renderer = WorkflowAssetRenderer(decode: probe.decode)
+        try renderer.renderHD(roles: f.roles,destination: f.url("count-hd.jpg"))
+        XCTAssertEqual(probe.urls,[f.roles.basePNG])
+        probe.reset()
+        try renderer.render4K(roles: f.roles,layout: .png4k,destination: f.url("count-4k.png"))
+        XCTAssertEqual(probe.urls,[f.roles.maskPNG,f.roles.cutoutPNG,f.roles.basePNG])
+    }
+    func testOriginalWideGamutImageAndSoftAlphaMatchDirectDrawing() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        var base = [UInt8](),cutout = [UInt8](),mask = [UInt8]()
+        for y in 0..<100 { for x in 0..<100 {
+            let inside = x >= 20 && x < 80 && y >= 20 && y < 80
+            let alpha: UInt8 = inside ? [UInt8(1),16,64,128,255][x % 5] : 0
+            let rgb: [UInt8] = [UInt8(x*2),UInt8(y*2),221]
+            base += rgb+[255]; cutout += rgb+[alpha]; mask += [alpha,alpha,alpha,255]
+        } }
+        try Self.write(f.roles.basePNG,width: 100,height: 100,pixels: base,colorSpace: p3,alphaInfo: .last)
+        try Self.write(f.roles.cutoutPNG,width: 100,height: 100,pixels: cutout,colorSpace: p3,alphaInfo: .last)
+        try Self.write(f.roles.maskPNG,width: 100,height: 100,pixels: mask)
+        func original(_ url: URL) throws -> CGImage {
+            let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL,nil))
+            return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source,0,[kCGImageSourceShouldCacheImmediately:true] as CFDictionary))
+        }
+        func writeReference(_ image: CGImage,_ url: URL,jpeg: Bool = false) throws {
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL,(jpeg ? UTType.jpeg : .png).identifier as CFString,1,nil))
+            var props: [CFString:Any] = [kCGImagePropertyOrientation:1]
+            if jpeg { props[kCGImageDestinationLossyCompressionQuality] = 0.82 }
+            CGImageDestinationAddImage(destination,image,props as CFDictionary)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+        }
+        let decoded = try WorkflowRaster.decode(f.roles.cutoutPNG)
+        let source = try original(f.roles.cutoutPNG)
+        XCTAssertEqual(decoded.image.colorSpace?.copyICCData() as Data?,source.colorSpace?.copyICCData() as Data?)
+        XCTAssertNotEqual(decoded.image.colorSpace?.copyICCData() as Data?,CGColorSpace(name: CGColorSpace.sRGB)!.copyICCData() as Data?)
+        XCTAssertEqual(decoded.raster.pixels,try WorkflowRaster.read(f.roles.cutoutPNG).pixels)
+        XCTAssertTrue(decoded.raster.pixels.enumerated().contains { $0.offset % 4 == 3 && $0.element == 1 })
+        let cropped = try XCTUnwrap(source.cropping(to: CGRect(x: 20,y: 20,width: 60,height: 60)))
+        let context = try XCTUnwrap(CGContext(data: nil,width: 4096,height: 4096,bitsPerComponent: 8,bytesPerRow: 4096*4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue|CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.interpolationQuality = .high
+        context.draw(cropped,in: CGRect(x: 256,y: 256,width: 3584,height: 3584))
+        try writeReference(try XCTUnwrap(context.makeImage()),f.url("reference.png"))
+        try WorkflowAssetRenderer().render4K(roles: f.roles,layout: .png4k,destination: f.url("actual.png"))
+        XCTAssertEqual(try Data(contentsOf: f.url("actual.png")),try Data(contentsOf: f.url("reference.png")),"Compare full encoded bytes, not only normalized/premultiplied pixels")
+        try writeReference(original(f.roles.basePNG),f.url("reference.jpg"),jpeg: true)
+        try WorkflowAssetRenderer().renderHD(roles: f.roles,destination: f.url("actual.jpg"))
+        XCTAssertEqual(try Data(contentsOf: f.url("actual.jpg")),try Data(contentsOf: f.url("reference.jpg")))
+        if let path = ProcessInfo.processInfo.environment["WORKFLOW_COLOR_EVIDENCE"] {
+            try FileManager.default.copyItem(at: f.root,to: URL(fileURLWithPath: path))
+        }
+    }
     func testSquareSizesMarginsAndPureBackgrounds() throws {
         let f = try Fixture(); defer { f.remove() }
         let renderer = WorkflowAssetRenderer()
@@ -232,6 +286,49 @@ final class WorkflowAssetRendererTests: XCTestCase {
         XCTAssertThrowsError(try store.publish(temp: f.roles.basePNG,artifact: newer))
     }
 
+    func testRealRenderAndPublicationTimingWhenRequested() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let batchPath = env["WORKFLOW_RENDER_BATCH"],let outputPath = env["WORKFLOW_RENDER_EVIDENCE"] else { throw XCTSkip("Real render/publication benchmark is opt-in") }
+        let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: batchPath)))
+        let root = URL(fileURLWithPath: outputPath)
+        guard !FileManager.default.fileExists(atPath: root.path) else { throw WorkflowBridgeError.ownershipConflict }
+        try FileManager.default.createDirectory(at: root,withIntermediateDirectories: true)
+        var rows: [[String:Any]] = []
+        for repetition in 1...3 {
+            for task in batch.activeTasks {
+                try autoreleasepool {
+                    let roles = try XCTUnwrap(task.roleImages)
+                    let name = try XCTUnwrap(task.snapshot).workingURL.deletingPathExtension().lastPathComponent
+                    let directory = root.appendingPathComponent("r\(repetition)/\(name)")
+                    try FileManager.default.createDirectory(at: directory,withIntermediateDirectories: true)
+                    let renderProbe = WorkflowDecodeProbe(),publishProbe = WorkflowDecodeProbe()
+                    let renderer = WorkflowAssetRenderer(decode: renderProbe.decode),store = WorkflowArtifactStore(read: publishProbe.read)
+                    var row: [String:Any] = ["repetition":repetition,"face":name]
+                    for kind in [WorkflowAssetKind.hd,.png4k] {
+                        let ext = kind == .hd ? "jpg" : "png",label = kind == .hd ? "hd" : "4k"
+                        let candidate = directory.appendingPathComponent(label+"-candidate."+ext)
+                        renderProbe.reset(); publishProbe.reset()
+                        var start = Date()
+                        if kind == .hd { try renderer.renderHD(roles: roles,destination: candidate) }
+                        else { try renderer.render4K(roles: roles,layout: task.squareLayout,destination: candidate) }
+                        row[label+"RenderSeconds"] = Date().timeIntervalSince(start)
+                        row[label+"RoleDecodes"] = renderProbe.urls.count
+                        XCTAssertEqual(renderProbe.urls,kind == .hd ? [roles.basePNG] : [roles.maskPNG,roles.cutoutPNG,roles.basePNG])
+                        let artifact = WorkflowArtifact(ownerTaskID: task.id,kind: kind,url: directory.appendingPathComponent(label+"."+ext),sourceFingerprint: roles.snapshotVersion,presetFingerprint: "task6-benchmark",fileFingerprint: "",state: .pending)
+                        start = Date(); let published = try store.publish(temp: candidate,artifact: artifact)
+                        row[label+"PublishSeconds"] = Date().timeIntervalSince(start)
+                        row[label+"PublicationDecodes"] = publishProbe.urls.count
+                        XCTAssertEqual(publishProbe.urls,[candidate])
+                        XCTAssertEqual(published.fileFingerprint,try AIFileValidation.hash(candidate.path))
+                        XCTAssertEqual(try Data(contentsOf: candidate),try Data(contentsOf: published.url))
+                    }
+                    rows.append(row)
+                    try JSONSerialization.data(withJSONObject: rows,options: [.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("timings.json"))
+                }
+            }
+        }
+    }
+
     private func assertBounds(_ actual: CGRect?,_ expected: CGRect,file: StaticString = #filePath,line: UInt = #line) {
         guard let actual else { XCTFail("Missing subject",file: file,line: line); return }
         for (a,e) in [(actual.minX,expected.minX),(actual.minY,expected.minY),(actual.maxX,expected.maxX),(actual.maxY,expected.maxY)] { XCTAssertEqual(a,e,accuracy: 1,file: file,line: line) }
@@ -247,10 +344,10 @@ final class WorkflowAssetRendererTests: XCTestCase {
         } }
         return x1 > x0 ? CGRect(x: x0,y: y0,width: x1-x0,height: y1-y0) : nil
     }
-    nonisolated static func write(_ url: URL,width: Int,height: Int,pixels: [UInt8],orientation: Int = 1) throws {
+    nonisolated static func write(_ url: URL,width: Int,height: Int,pixels: [UInt8],orientation: Int = 1,colorSpace: CGColorSpace = CGColorSpace(name: CGColorSpace.sRGB)!,alphaInfo: CGImageAlphaInfo = .premultipliedLast) throws {
         let data = Data(pixels) as CFData
         let image = CGImage(width: width,height: height,bitsPerComponent: 8,bitsPerPixel: 32,bytesPerRow: width*4,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            space: colorSpace,bitmapInfo: CGBitmapInfo(rawValue: alphaInfo.rawValue),
             provider: CGDataProvider(data: data)!,decode: nil,shouldInterpolate: false,intent: .defaultIntent)!
         let dest = CGImageDestinationCreateWithURL(url as CFURL,UTType.png.identifier as CFString,1,nil)!
         CGImageDestinationAddImage(dest,image,[kCGImagePropertyOrientation:orientation] as CFDictionary); XCTAssertTrue(CGImageDestinationFinalize(dest))
@@ -280,4 +377,16 @@ final class WorkflowAssetRendererTests: XCTestCase {
         }
         func remove() { try? FileManager.default.removeItem(at: root) }
     }
+}
+
+nonisolated final class WorkflowDecodeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls: [URL] = []
+    var urls: [URL] { lock.lock(); defer { lock.unlock() }; return calls }
+    func reset() { lock.lock(); defer { lock.unlock() }; calls.removeAll() }
+    func decode(_ url: URL) throws -> WorkflowDecodedImage {
+        lock.lock(); calls.append(url); lock.unlock()
+        return try WorkflowRaster.decode(url)
+    }
+    func read(_ url: URL) throws -> WorkflowRaster { try decode(url).raster }
 }

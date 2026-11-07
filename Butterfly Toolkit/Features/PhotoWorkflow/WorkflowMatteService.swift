@@ -58,15 +58,21 @@ nonisolated struct WorkflowMatteService: Sendable {
     }
 }
 
+nonisolated struct WorkflowDecodedImage: Sendable {
+    let image: CGImage
+    let raster: WorkflowRaster
+}
+
 /// Decode every pixel, normalizing ICC to sRGB and checking premultiplied RGB/alpha coordinates.
-nonisolated struct WorkflowRaster {
+nonisolated struct WorkflowRaster: Sendable {
     let size: CGSize
     let orientation: Int
     let hasProfile: Bool
     let profileName: String?
     let profileData: Data?
     let pixels: [UInt8]
-    static func read(_ url: URL) throws -> Self {
+    static func read(_ url: URL) throws -> Self { try decode(url).raster }
+    static func decode(_ url: URL) throws -> WorkflowDecodedImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               CGImageSourceGetStatus(source) == .statusComplete,
               let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
@@ -80,8 +86,9 @@ nonisolated struct WorkflowRaster {
             context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height)); return true
         }
         guard success else { throw WorkflowBridgeError.invalidImage("无法完整解码") }
-        return Self(size: CGSize(width: image.width, height: image.height), orientation: info[kCGImagePropertyOrientation] as? Int ?? 1,
+        let raster = Self(size: CGSize(width: image.width, height: image.height), orientation: info[kCGImagePropertyOrientation] as? Int ?? 1,
                     hasProfile: try hasEmbeddedICC(url), profileName: info[kCGImagePropertyProfileName] as? String, profileData: image.colorSpace?.copyICCData() as Data?, pixels: pixels)
+        return WorkflowDecodedImage(image: image,raster: raster)
     }
     private static func hasEmbeddedICC(_ url: URL) throws -> Bool {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)

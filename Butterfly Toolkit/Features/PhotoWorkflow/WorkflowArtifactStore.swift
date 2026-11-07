@@ -11,10 +11,30 @@ nonisolated enum WorkflowArtifactError: Error, Equatable {
 /// The receipt is written before the image, independently of batch.json. Never infer ownership from a name.
 /// Sync operations belong on the workflow's background worker. A process-wide lock serializes publishers.
 nonisolated struct WorkflowArtifactStore: Sendable {
+    typealias Read = @Sendable (URL) throws -> WorkflowRaster
+    typealias Copy = @Sendable (URL,URL) throws -> Void
+    private let read: Read
+    private let copy: Copy
+    init(read: @escaping Read = WorkflowRaster.read,
+         copy: @escaping Copy = { try FileManager.default.copyItem(at: $0,to: $1) }) {
+        self.read = read; self.copy = copy
+    }
     private static let lock = NSLock()
     private struct Receipt: Codable {
         var committed: WorkflowArtifact?
         var pending: WorkflowArtifact?
+    }
+
+    /// Evidence belongs only to this publish call and these exact candidate bytes.
+    private struct ValidatedCandidate {
+        let fingerprint: String
+    }
+    private func validateCandidate(_ url: URL,kind: WorkflowAssetKind) throws -> ValidatedCandidate {
+        try rejectSymlink(url)
+        let before = try AIFileValidation.hash(url.path)
+        try validateImage(url,kind: kind)
+        guard try AIFileValidation.hash(url.path) == before else { throw WorkflowArtifactError.fingerprintMismatch }
+        return ValidatedCandidate(fingerprint: before)
     }
 
     func publish(temp: URL, artifact: WorkflowArtifact) throws -> WorkflowArtifact {
@@ -26,17 +46,17 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         if let existing = original {
             guard existing.ownerTaskID == artifact.ownerTaskID, existing.kind == artifact.kind else { throw WorkflowArtifactError.ownershipConflict }
         }
-        try validateImage(temp,kind: artifact.kind)
-        let hash = try AIFileValidation.hash(temp.path)
+        let validated = try validateCandidate(temp,kind: artifact.kind)
+        let hash = validated.fingerprint
         guard artifact.fileFingerprint.isEmpty || artifact.fileFingerprint == hash else { throw WorkflowArtifactError.fingerprintMismatch }
         var result = artifact; result.fileFingerprint = hash; result.state = .completed
         let fm = FileManager.default
         try fm.createDirectory(at: artifact.url.deletingLastPathComponent(),withIntermediateDirectories: true)
-        // Stage and fully verify on the destination filesystem before touching an older valid output.
+        // Stage identical validated bytes on the destination filesystem before touching an older output.
         let sibling = artifact.url.deletingLastPathComponent().appendingPathComponent(".publish-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: sibling) }
-        try fm.copyItem(at: temp,to: sibling)
-        try validateImage(sibling,kind: result.kind)
+        try copy(temp,sibling)
+        try rejectSymlink(sibling)
         guard try AIFileValidation.hash(sibling.path) == hash else { throw WorkflowArtifactError.fingerprintMismatch }
         let current = try existingArtifact(at: artifact.url,receipt: receipt)
         guard current?.fileFingerprint == original?.fileFingerprint,current?.ownerTaskID == original?.ownerTaskID,
@@ -134,7 +154,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
     }
     private func validateImage(_ url: URL,kind: WorkflowAssetKind) throws {
         try rejectSymlink(url)
-        let raster = try WorkflowRaster.read(url)
+        let raster = try read(url)
         guard raster.orientation == 1,let source = CGImageSourceCreateWithURL(url as CFURL,nil),
               let type = CGImageSourceGetType(source),
               (type as String) == (kind == .hd ? UTType.jpeg.identifier : UTType.png.identifier) else { throw WorkflowArtifactError.invalidImage }

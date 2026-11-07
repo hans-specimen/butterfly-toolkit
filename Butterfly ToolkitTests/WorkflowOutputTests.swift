@@ -3,6 +3,57 @@ import XCTest
 
 @MainActor
 final class WorkflowOutputTests: XCTestCase {
+    func testPublicationDecodesCandidateOnceAndVerifiesCopiedBytes() throws {
+        let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
+        let probe = WorkflowDecodeProbe(),store = WorkflowArtifactStore(read: probe.read)
+        let result = try store.publish(temp: f.roles.cutoutPNG,artifact: f.artifact)
+        XCTAssertEqual(probe.urls,[f.roles.cutoutPNG],"The identical sibling must not be decoded again")
+        XCTAssertEqual(try Data(contentsOf: result.url),try Data(contentsOf: f.roles.cutoutPNG))
+        XCTAssertEqual(result.fileFingerprint,try AIFileValidation.hash(result.url.path))
+    }
+    func testPublicationRejectsCandidateChangedDuringValidation() throws {
+        let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
+        let candidate = f.roles.cutoutPNG,replacement = f.roles.basePNG
+        let store = WorkflowArtifactStore(read: { url in
+            let raster = try WorkflowRaster.read(url)
+            if url == candidate { try Data(contentsOf: replacement).write(to: url) }
+            return raster
+        })
+        XCTAssertThrowsError(try store.publish(temp: candidate,artifact: f.artifact)) { error in
+            XCTAssertEqual(error as? WorkflowArtifactError,.fingerprintMismatch)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.artifact.url.path))
+    }
+    func testPublicationRejectsTamperedCopyAndRetainsPreviousOutput() throws {
+        let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
+        let original = try WorkflowArtifactStore().publish(temp: f.roles.basePNG,artifact: f.artifact)
+        let before = try Data(contentsOf: original.url)
+        let receiptURL = f.root.appendingPathComponent(".published.png.workflow.json"),receipt = try Data(contentsOf: receiptURL)
+        let replacement = f.roles.basePNG
+        let store = WorkflowArtifactStore(copy: { source,destination in
+            try FileManager.default.copyItem(at: source,to: destination)
+            try Data(contentsOf: replacement).write(to: destination)
+        })
+        var next = f.artifact; next.sourceFingerprint = "new-source"
+        XCTAssertThrowsError(try store.publish(temp: f.roles.cutoutPNG,artifact: next)) { error in
+            XCTAssertEqual(error as? WorkflowArtifactError,.fingerprintMismatch)
+        }
+        XCTAssertEqual(try Data(contentsOf: original.url),before)
+        XCTAssertEqual(try Data(contentsOf: receiptURL),receipt)
+        XCTAssertEqual(try WorkflowArtifactStore().recover(artifact: f.artifact),original)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: f.root.path).contains { $0.hasPrefix(".publish-") })
+    }
+    func testPublicationRejectsSymlinkCopyEvenWithIdenticalBytes() throws {
+        let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
+        let store = WorkflowArtifactStore(copy: { source,destination in
+            try FileManager.default.createSymbolicLink(at: destination,withDestinationURL: source)
+        })
+        XCTAssertThrowsError(try store.publish(temp: f.roles.cutoutPNG,artifact: f.artifact)) { error in
+            XCTAssertEqual(error as? WorkflowArtifactError,.ownershipConflict)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.artifact.url.path))
+    }
+
     func testPSDIsCreatedBesideInputPhotos() async throws {
         let f = try ExecutorFixture(checks: false)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }

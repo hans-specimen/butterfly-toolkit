@@ -5,11 +5,14 @@ import UniformTypeIdentifiers
 
 /// Synchronous CPU/file work; call from a detached worker, never a view's MainActor task.
 nonisolated struct WorkflowAssetRenderer: Sendable {
+    typealias Decode = @Sendable (URL) throws -> WorkflowDecodedImage
+    private let decode: Decode
+    init(decode: @escaping Decode = WorkflowRaster.decode) { self.decode = decode }
     func renderHD(roles: RoleImages, destination: URL) throws {
         try validate(roles)
-        let raster = try WorkflowRaster.read(roles.basePNG)
+        let decoded = try decode(roles.basePNG),raster = decoded.raster
         guard raster.size == roles.pixelSize,raster.orientation == 1 else { throw invalid("底图实际尺寸或方向与角色版本不一致") }
-        let base = try image(roles.basePNG)
+        let base = decoded.image
         let rect = roles.cropViewport.offsetBy(dx: -roles.coordinateOrigin.x,dy: -roles.coordinateOrigin.y)
         guard rect == rect.integral, CGRect(origin: .zero,size: roles.pixelSize).contains(rect),
               let crop = base.cropping(to: rect) else { throw invalid("高清视口超出可恢复底图或不是整数像素") }
@@ -25,9 +28,9 @@ nonisolated struct WorkflowAssetRenderer: Sendable {
 
     func render4K(roles: RoleImages, layout: SquareLayout, destination: URL) throws {
         try validate(roles)
-        let mask = try WorkflowRaster.read(roles.maskPNG)
-        let cutout = try WorkflowRaster.read(roles.cutoutPNG)
-        let base = try WorkflowRaster.read(roles.basePNG)
+        let mask = try decode(roles.maskPNG).raster
+        let decodedCutout = try decode(roles.cutoutPNG),cutout = decodedCutout.raster
+        let base = try decode(roles.basePNG).raster
         guard [mask,cutout,base].allSatisfy({ $0.size == roles.pixelSize && $0.orientation == 1 }) else { throw invalid("角色尺寸或方向不一致") }
         var values = [UInt8](repeating: 0,count: mask.pixels.count/4)
         for i in values.indices {
@@ -40,7 +43,7 @@ nonisolated struct WorkflowAssetRenderer: Sendable {
         }
         let support = try MeaningfulMaskSupport(values: values,width: Int(cutout.size.width),height: Int(cutout.size.height),origin: .zero)
         // Support chooses layout only: retain original fine alpha, even weak pixels inside these bounds.
-        let source = try image(roles.cutoutPNG)
+        let source = decodedCutout.image
         guard let crop = source.cropping(to: support.bounds) else { throw invalid("无法裁取完整主体") }
         try write(square(crop,layout: layout,white: false),to: destination)
     }
