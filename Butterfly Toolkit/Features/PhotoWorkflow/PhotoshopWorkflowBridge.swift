@@ -9,8 +9,10 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     private let coordinator: PhotoshopExecutionCoordinator
     private let scriptRunner: ScriptRunner
     private let installCheckpoint: @Sendable (PhotoshopInstallCheckpoint) async throws -> Void
-    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }) {
-        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint
+    @TaskLocal private static var performanceTaskID: UUID?
+    private let performanceObserver: WorkflowPerformanceObserver?
+    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil) {
+        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver
     }
     private struct InstallTransaction: Codable, Sendable {
         var sourceVersion: String
@@ -40,35 +42,41 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var extentWidth: Double?
         var extentHeight: Double?
         var wasOpen: Bool?
+        var performance: [String: Double]?
+        var documentPeak: Int?
     }
     func stack(job: FocusStackJob, owner: UUID) async throws -> PSDSnapshot {
-        try await coordinator.run(owner: owner) {
+        try await withLease("stack", owner: owner, savedRead: false) {
             guard !FileManager.default.fileExists(atPath: job.destinationURL.path),
                   !FileManager.default.fileExists(atPath: ownershipURL(job.destinationURL).path), job.sourceFiles.count == 3 else {
                 throw WorkflowBridgeError.ownershipConflict
             }
             guard let photoshop = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
             let folder = try outputDirectory("stack/\(UUID())", owner: owner)
-            let hashes = try job.sourceFiles.map { try AIFileValidation.hash($0.path) }
+            let hashes = try job.sourceFiles.map { try hash($0.path) }
             var copiedSources: [URL] = []
             for (index, source) in job.sourceFiles.enumerated() {
                 let copy = folder.appendingPathComponent("sources/\(index)/\(source.lastPathComponent)")
                 try FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try FileManager.default.copyItem(at: source, to: copy)
-                guard try AIFileValidation.hash(copy.path) == hashes[index] else { throw WorkflowBridgeError.staleSource }
+                try self.copy(at: source, to: copy)
+                guard try hash(copy.path) == hashes[index] else { throw WorkflowBridgeError.staleSource }
                 copiedSources.append(copy)
             }
             let staged = folder.appendingPathComponent("stack.psd")
             let ownedJob = FocusStackJob(id: job.id, sourceFiles: copiedSources, destinationURL: staged, butterflyName: job.butterflyName, side: job.side)
-            try await Task.detached(priority: .userInitiated) {
-                try FocusStackProcessor.process(ownedJob, photoshopApplicationName: photoshop)
-            }.value
-            guard try job.sourceFiles.map({ try AIFileValidation.hash($0.path) }) == hashes else { throw WorkflowBridgeError.staleSource }
+            let stackStarted = observationStart()
+            do {
+                defer { report("ps.stack-including-open-save-close", since: stackStarted) }
+                try await Task.detached(priority: .userInitiated) {
+                    try FocusStackProcessor.process(ownedJob, photoshopApplicationName: photoshop)
+                }.value
+            }
+            guard try job.sourceFiles.map({ try hash($0.path) }) == hashes else { throw WorkflowBridgeError.staleSource }
             // Move refuses a late same-name collision; the legacy processor's skip behavior cannot adopt an unknown PSD.
             let record = ownershipURL(job.destinationURL)
             try FileManager.default.createDirectory(at: job.destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let sources = zip(job.sourceFiles, hashes).map { WorkflowSourceFile(url: $0.0.resolvingSymlinksInPath(), fingerprint: $0.1) }
-            let ownership = try Ownership(owner: owner, sources: sources, initialStackVersion: AIFileValidation.hash(staged.path))
+            let ownership = try Ownership(owner: owner, sources: sources, initialStackVersion: hash(staged.path))
             try JSONEncoder().encode(ownership).write(to: record, options: .withoutOverwriting)
             do { try FileManager.default.moveItem(at: staged, to: job.destinationURL) }
             catch { try? FileManager.default.removeItem(at: record); throw error }
@@ -76,7 +84,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         }
     }
     func refreshSavedPSD(document: URL, owner: UUID, expectedSources: [WorkflowSourceFile]? = nil) async throws -> PSDSnapshot {
-        try await coordinator.readSaved(owner: owner) {
+        try await withLease("refresh", owner: owner, savedRead: true) {
             if FileManager.default.fileExists(atPath: ownershipURL(document).path) {
                 _ = try await recoverInstall(document: document, owner: owner, allowPublication: false)
             }
@@ -84,9 +92,9 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                 let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(document)))
                 let canonical = expectedSources.map { WorkflowSourceFile(url: $0.url.resolvingSymlinksInPath(), fingerprint: $0.fingerprint) }
                 guard canonical.count == 3, ownership.owner == owner, ownership.sources == canonical, ownership.roles == nil,
-                      try AIFileValidation.hash(document.path) == ownership.initialStackVersion else { throw WorkflowBridgeError.staleSource }
+                      try hash(document.path) == ownership.initialStackVersion else { throw WorkflowBridgeError.staleSource }
                 for source in canonical {
-                    guard try AIFileValidation.hash(source.url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
+                    guard try hash(source.url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
                 }
             }
             let snapshot = try await capture(document: document, owner: owner)
@@ -95,20 +103,20 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         }
     }
     func exportStackPNG(snapshot: PSDSnapshot) async throws -> StackPNG {
-        try await coordinator.run(owner: snapshot.taskID) {
+        try await withLease("exportStack", owner: snapshot.taskID, savedRead: false) {
             try await verify(snapshot)
             let output = try outputDirectory("data/processed", owner: snapshot.taskID).appendingPathComponent("\(snapshot.contentVersion)-\(UUID()).png")
             let metadata = try await invoke(Self.exportScript(document: snapshot.snapshotURL, output: output, roles: snapshot.roles))
-            let raster = try WorkflowRaster.read(output)
+            let raster = try readRaster(output)
             guard raster.size == snapshot.pixelSize, raster.orientation == 1, raster.hasProfile else {
                 throw WorkflowBridgeError.invalidImage("堆栈 PNG 尺寸、方向或 ICC 缺失")
             }
-            return try StackPNG(snapshotVersion: snapshot.contentVersion, pngURL: output, fingerprint: AIFileValidation.hash(output.path),
+            return try StackPNG(snapshotVersion: snapshot.contentVersion, pngURL: output, fingerprint: hash(output.path),
                 pixelSize: raster.size, orientation: raster.orientation, colorProfile: raster.profileName ?? metadata.profile, validBackgroundAlphaURL: output)
         }
     }
     func installMatte(snapshot: PSDSnapshot, matte: MatteArtifact) async throws -> PSDSnapshot {
-        try await coordinator.run(owner: snapshot.taskID) {
+        try await withLease("install", owner: snapshot.taskID, savedRead: false) {
             let record = ownershipURL(snapshot.workingURL)
             var ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
             if let pending = ownership.pendingInstall {
@@ -119,17 +127,19 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             }
             try await verify(snapshot)
             guard snapshot.roles == nil, matte.pixelSize == snapshot.pixelSize, matte.orientation == 1,
-                  try AIFileValidation.hash(matte.alphaURL.path) == matte.alphaFingerprint,
-                  try AIFileValidation.hash(matte.cutoutURL.path) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+                  try hash(matte.alphaURL.path) == matte.alphaFingerprint,
+                  try hash(matte.cutoutURL.path) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
             let inputDirectory = workspace.appendingPathComponent("data/processed/\(snapshot.taskID.uuidString)")
             let inputs = (try? FileManager.default.contentsOfDirectory(at: inputDirectory, includingPropertiesForKeys: nil)) ?? []
-            guard let inputURL = inputs.first(where: { $0.lastPathComponent.hasPrefix(snapshot.contentVersion) && (try? AIFileValidation.hash($0.path)) == matte.inputPNGFingerprint }) else {
+            guard let inputURL = inputs.first(where: { $0.lastPathComponent.hasPrefix(snapshot.contentVersion) && (try? hash($0.path)) == matte.inputPNGFingerprint }) else {
                 throw WorkflowBridgeError.staleSource
             }
-            try WorkflowRaster.validateMatte(original: WorkflowRaster.read(inputURL), alpha: WorkflowRaster.read(matte.alphaURL), cutout: WorkflowRaster.read(matte.cutoutURL))
+            try measure("pixel.validateMatte-including-read") {
+                try WorkflowRaster.validateMatte(original: readRaster(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
+            }
             // Prepare and validate off to the side; a failure here leaves the working PSD and its ownership unchanged.
             let staged = try outputDirectory("install/\(UUID())", owner: snapshot.taskID).appendingPathComponent("result.psd")
-            try FileManager.default.copyItem(at: snapshot.snapshotURL, to: staged)
+            try self.copy(at: snapshot.snapshotURL, to: staged)
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: staged.path)
             try JSONEncoder().encode(ownership).write(to: ownershipURL(staged), options: .withoutOverwriting)
             let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL))
@@ -154,15 +164,15 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         guard let pending = ownership.pendingInstall else { return false }
         guard ownership.roles == nil, pending.result.taskID == owner, pending.result.roles?.isValid == true,
               pending.result.pixelSize == pending.matte.pixelSize,
-              try AIFileValidation.hash(pending.result.snapshotURL.path) == pending.result.contentVersion,
-              (try AIFileValidation.hash(pending.matte.alphaURL.path)) == pending.matte.alphaFingerprint,
-              (try AIFileValidation.hash(pending.matte.cutoutURL.path)) == pending.matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
-        let current = try AIFileValidation.hash(document.path)
+              try hash(pending.result.snapshotURL.path) == pending.result.contentVersion,
+              (try hash(pending.matte.alphaURL.path)) == pending.matte.alphaFingerprint,
+              (try hash(pending.matte.cutoutURL.path)) == pending.matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+        let current = try hash(document.path)
         if current == pending.sourceVersion {
             // Saved readback during manual editing must never publish an automatic PSD write.
             guard allowPublication else { return false }
             let closed = try await invoke(Self.closeForPublicationScript(document: document))
-            guard closed.roles == nil, try AIFileValidation.hash(document.path) == pending.sourceVersion else { throw WorkflowBridgeError.staleSource }
+            guard closed.roles == nil, try hash(document.path) == pending.sourceVersion else { throw WorkflowBridgeError.staleSource }
             do {
                 try Data(contentsOf: pending.result.snapshotURL, options: .mappedIfSafe).write(to: document, options: .atomic)
             } catch {
@@ -175,30 +185,31 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         let metadata = try await invoke(Self.inspectScript(document: document))
         guard metadata.roles == pending.result.roles, metadata.summary == pending.result.structureSummary,
               metadata.width == pending.result.pixelSize.width, metadata.height == pending.result.pixelSize.height,
-              try AIFileValidation.hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.invalidStructure }
+              try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.invalidStructure }
         var published = pending.result; published.workingURL = document
         try await validateInstalledMask(published, matte: pending.matte)
-        guard try AIFileValidation.hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
+        guard try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
         ownership.roles = pending.result.roles; ownership.pendingInstall = nil
         try JSONEncoder().encode(ownership).write(to: record, options: .atomic)
         return true
     }
     private func validateInstalledMask(_ snapshot: PSDSnapshot, matte: MatteArtifact) async throws {
         let extracted = try await extractUnlocked(snapshot)
-        let actual = try WorkflowRaster.read(extracted.maskPNG), expected = try WorkflowRaster.read(matte.alphaURL)
+        let actual = try readRaster(extracted.maskPNG), expected = try readRaster(matte.alphaURL)
         guard actual.size == expected.size else { throw WorkflowBridgeError.invalidImage("回写蒙版尺寸改变") }
+        let started = observationStart(); defer { report("pixel.mask-compare", since: started) }
         for i in stride(from: 0, to: actual.pixels.count, by: 4) where abs(Int(actual.pixels[i]) - Int(expected.pixels[i])) > 1 {
             throw WorkflowBridgeError.invalidImage("PSD 保存后的蒙版与 AI Alpha 不一致")
         }
     }
     func extractRoles(snapshot: PSDSnapshot) async throws -> RoleImages {
-        try await coordinator.readSaved(owner: snapshot.taskID) {
+        try await withLease("extract", owner: snapshot.taskID, savedRead: true) {
             try await verify(snapshot)
             return try await extractUnlocked(snapshot)
         }
     }
     func applyGeometry(snapshot: PSDSnapshot, solution: GeometrySolution) async throws -> PSDSnapshot {
-        try await coordinator.run(owner: snapshot.taskID) {
+        try await withLease("geometry", owner: snapshot.taskID, savedRead: false) {
             try await verify(snapshot)
             guard solution.sourceVersion == snapshot.contentVersion, solution.isApplicable,
                   solution.angleDegrees.isFinite, solution.sourceCropRect.width > 0, solution.sourceCropRect.height > 0,
@@ -229,9 +240,9 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             pixelSize: size, coordinateOrigin: origin, editableExtent: CGRect(origin: origin, size: size),
             cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize))
         let fingerprints = try roleFingerprints(images)
-        let baseRaster = try WorkflowRaster.read(base), cutoutRaster = try WorkflowRaster.read(cutout), maskRaster = try WorkflowRaster.read(mask)
+        let baseRaster = try readRaster(base), cutoutRaster = try readRaster(cutout), maskRaster = try readRaster(mask)
         guard [baseRaster, cutoutRaster, maskRaster].allSatisfy({ $0.size == size }) else { throw WorkflowBridgeError.invalidImage("角色提取范围不一致") }
-        do { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) }
+        do { try measure("pixel.validateMatte") { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) } }
         catch { throw WorkflowBridgeError.invalidStructure }
         guard try roleFingerprints(images) == fingerprints else { throw WorkflowBridgeError.staleSource }
         // Cache publication is optional; a missing or damaged receipt simply triggers extraction.
@@ -248,25 +259,27 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         lhs.roles == rhs.roles && lhs.structureSummary == rhs.structureSummary
     }
     private func roleFingerprints(_ images: RoleImages) throws -> [String] {
-        try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try AIFileValidation.hash($0.path) }
+        try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try hash($0.path) }
     }
     private func capture(document: URL, owner: UUID) async throws -> PSDSnapshot {
+        let started = observationStart()
+        defer { report("capture", since: started) }
         let metadata = try await invoke(Self.inspectScript(document: document))
         let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(document)))
         guard ownership.owner == owner else { throw WorkflowBridgeError.ownershipConflict }
         guard ownership.roles == metadata.roles, metadata.roles == nil || metadata.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
-        let before = try AIFileValidation.hash(document.path)
+        let before = try hash(document.path)
         let folder = try outputDirectory("snapshots", owner: owner)
         let temporary = folder.appendingPathComponent("\(UUID()).psd")
         let immutable = folder.appendingPathComponent("\(before).psd")
         let existing = FileManager.default.fileExists(atPath: immutable.path)
         defer { try? FileManager.default.removeItem(at: temporary) }
-        if !existing { try FileManager.default.copyItem(at: document, to: temporary) }
-        guard try AIFileValidation.hash((existing ? immutable : temporary).path) == before,
-              (try AIFileValidation.hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
+        if !existing { try self.copy(at: document, to: temporary) }
+        guard try hash((existing ? immutable : temporary).path) == before,
+              (try hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
         let second = try await invoke(Self.inspectScript(document: document))
         guard metadata.summary == second.summary, metadata.width == second.width, metadata.height == second.height,
-              try AIFileValidation.hash(document.path) == before else { throw WorkflowBridgeError.staleSource }
+              try hash(document.path) == before else { throw WorkflowBridgeError.staleSource }
         if !existing {
             try FileManager.default.moveItem(at: temporary, to: immutable)
             try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: immutable.path)
@@ -280,18 +293,70 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
               saved.height == snapshot.pixelSize.height, saved.summary == snapshot.structureSummary else { throw WorkflowBridgeError.invalidStructure }
         let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(snapshot.workingURL)))
         guard ownership.owner == snapshot.taskID, ownership.roles == snapshot.roles,
-              try AIFileValidation.hash(snapshot.workingURL.path) == snapshot.contentVersion,
-              (try AIFileValidation.hash(snapshot.snapshotURL.path)) == snapshot.contentVersion else { throw WorkflowBridgeError.staleSource }
+              try hash(snapshot.workingURL.path) == snapshot.contentVersion,
+              (try hash(snapshot.snapshotURL.path)) == snapshot.contentVersion else { throw WorkflowBridgeError.staleSource }
     }
     private func outputDirectory(_ component: String, owner: UUID) throws -> URL {
         let directory = workspace.appendingPathComponent(component).appendingPathComponent(owner.uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); return directory
     }
     private func ownershipURL(_ document: URL) -> URL { document.appendingPathExtension("workflow-owner.json") }
+    // Observation is synchronous and opt-in; it never adds suspension to a publication fence.
+    private func observationStart() -> Double? { performanceObserver == nil ? nil : ProcessInfo.processInfo.systemUptime }
+    private func report(_ operation: String, since start: Double?) {
+        guard let start, let observer = performanceObserver else { return }
+        observer(WorkflowPerformanceSample(taskID: Self.performanceTaskID, operation: operation,
+            seconds: ProcessInfo.processInfo.systemUptime - start))
+    }
+    private func measure<T>(_ operation: String, _ body: () throws -> T) rethrows -> T {
+        let start = observationStart(); defer { report(operation, since: start) }
+        return try body()
+    }
+    private func hash(_ path: String) throws -> String { try measure("hash") { try AIFileValidation.hash(path) } }
+    private func copy(at source: URL, to destination: URL) throws {
+        try measure("copy") { try FileManager.default.copyItem(at: source, to: destination) }
+    }
+    private func readRaster(_ url: URL) throws -> WorkflowRaster { try measure("raster.read") { try WorkflowRaster.read(url) } }
+    private func withLease<T: Sendable>(_ name: String, owner: UUID, savedRead: Bool,
+        operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        let queued = observationStart()
+        let body: @Sendable () async throws -> T = {
+            guard performanceObserver != nil else { return try await operation() }
+            return try await Self.$performanceTaskID.withValue(owner) {
+                report("lease.wait." + name, since: queued)
+                let started = observationStart(); defer { report("service." + name, since: started) }
+                return try await operation()
+            }
+        }
+        if savedRead { return try await coordinator.readSaved(owner: owner, operation: body) }
+        return try await coordinator.run(owner: owner, operation: body)
+    }
     private func invoke(_ body: String) async throws -> Metadata {
-        let result = try await scriptRunner(Self.commonScript + "\n(function(){" + body + "}());")
+        let started = observationStart()
+        defer { report("ps.invoke", since: started) }
+        let script: String
+        if performanceObserver == nil {
+            script = Self.commonScript + "\n(function(){" + body + "}());"
+        } else {
+            // Attach metrics after the inner finally blocks have closed temporary documents.
+            script = Self.commonScript + Self.performanceScript + "\nvar wfResult=(function(){" + body + "}());" +
+                "var wfDecoded=eval('('+wfResult+')');wfDecoded.performance=wfPerformance;wfDecoded.documentPeak=wfPeak;wfJSON(wfDecoded);"
+        }
+        let result = try await scriptRunner(script)
         guard let data = result.data(using: .utf8) else { throw WorkflowBridgeError.photoshop("无法读取脚本结果") }
-        return try JSONDecoder().decode(Metadata.self, from: data)
+        let metadata = try JSONDecoder().decode(Metadata.self, from: data)
+        if let observer = performanceObserver {
+            for (key, seconds) in (metadata.performance ?? [:]).sorted(by: { $0.key.localizedStandardCompare($1.key) == .orderedAscending }) {
+                let pieces = key.split(separator: ":", maxSplits: 1)
+                guard pieces.count == 2, Int(pieces[0]) != nil, seconds.isFinite, seconds >= 0 else { continue }
+                let operation = String(pieces[1])
+                observer(WorkflowPerformanceSample(taskID: Self.performanceTaskID, operation: "ps." + operation, seconds: seconds))
+            }
+            if let peak = metadata.documentPeak {
+                observer(WorkflowPerformanceSample(taskID: Self.performanceTaskID, operation: "ps.documents.peak.\(peak)", seconds: 0))
+            }
+        }
+        return metadata
     }
     static func execute(_ script: String) async throws -> String {
         try await Task.detached(priority: .userInitiated) {
@@ -324,6 +389,22 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
 }
 
 extension PhotoshopWorkflowBridge {
+    private static let performanceScript = #"""
+    var wfPerformance={},wfSequence=0,wfPeak=app.documents.length;
+    function wfWrap(name,body) { return function() {
+        var started=new Date().getTime();
+        try { return body.apply(this,arguments); }
+        finally { wfPerformance[String(wfSequence++)+':'+name]=(new Date().getTime()-started)/1000;wfPeak=Math.max(wfPeak,app.documents.length); }
+    }; }
+    wfOpenFile=wfWrap('open',wfOpenFile);
+    wfDuplicate=wfWrap('duplicate',wfDuplicate);
+    wfMaskDocument=wfWrap('new-mask-document',wfMaskDocument);
+    wfCloseDocument=wfWrap('close',wfCloseDocument);
+    wfSave=wfWrap('save',wfSave);
+    wfMetadata=wfWrap('inspect',wfMetadata);
+    wfRolePNG=wfWrap('role-encode',wfRolePNG);
+    wfStackPNG=wfWrap('stack-encode',wfStackPNG);
+    """#
     private static let commonScript = #"""
     #target photoshop
     function wfJSON(v) {
@@ -334,6 +415,10 @@ extension PhotoshopWorkflowBridge {
         for (k in v) if (v.hasOwnProperty(k)) parts.push(wfJSON(k)+':'+wfJSON(v[k]));
         return '{'+parts.join(',')+'}';
     }
+    function wfOpenFile(file) { return app.open(file); }
+    function wfDuplicate(doc) { return doc.duplicate(); }
+    function wfCloseDocument(doc) { doc.close(SaveOptions.DONOTSAVECHANGES); }
+    function wfMaskDocument(copy) { return app.documents.add(copy.width,copy.height,copy.resolution,'Workflow mask',NewDocumentMode.RGB,DocumentFill.WHITE); }
     function wfOpen(path) {
         var file = new File(path), existingIDs=[];
         for (var i=0;i<app.documents.length;i++) {
@@ -343,12 +428,12 @@ extension PhotoshopWorkflowBridge {
                 app.activeDocument=d; return {doc:d,owned:false};
             }} catch(e) { if (String(e).indexOf('WORKFLOW_UNSAVED')>=0) throw e; }
         }
-        var opened=app.open(file),owned=true;
+        var opened=wfOpenFile(file),owned=true;
         for(var j=0;j<existingIDs.length;j++)if(existingIDs[j]===opened.id)owned=false;
         if(!opened.saved)throw new Error('WORKFLOW_UNSAVED');
         return {doc:opened,owned:owned};
     }
-    function wfClose(opened) { if(opened.owned) opened.doc.close(SaveOptions.DONOTSAVECHANGES); }
+    function wfClose(opened) { if(opened.owned) wfCloseDocument(opened.doc); }
     function wfDescriptor(layer) {
         var r=new ActionReference(); r.putIdentifier(charIDToTypeID('Lyr '),layer.id); return executeActionGet(r);
     }
@@ -427,7 +512,7 @@ extension PhotoshopWorkflowBridge {
     private static func closeForPublicationScript(document: URL) -> String {
         """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),meta=wfMetadata(o.doc);
-        meta.wasOpen=!o.owned;o.doc.close(SaveOptions.DONOTSAVECHANGES);return wfJSON(meta);
+        meta.wasOpen=!o.owned;wfCloseDocument(o.doc);return wfJSON(meta);
         """
     }
     private static func reopenScript(document: URL) -> String {
@@ -438,11 +523,11 @@ extension PhotoshopWorkflowBridge {
     private static func exportScript(document: URL, output: URL, roles: PSDRoleIdentifiers?) -> String {
         """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null;
-        try {copy=o.doc.duplicate();app.activeDocument=copy;var r=wfRoles(copy);
+        try {copy=wfDuplicate(o.doc);app.activeDocument=copy;var r=wfRoles(copy);
             if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;}
             else {for(var i=0;i<copy.layers.length;i++) if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].visible=false;}
             wfStackPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
-        }finally{if(copy)copy.close(SaveOptions.DONOTSAVECHANGES);wfClose(o);}
+        }finally{if(copy)wfCloseDocument(copy);wfClose(o);}
         """
     }
     private static func installScript(document: URL, alpha: URL) -> String {
@@ -451,7 +536,7 @@ extension PhotoshopWorkflowBridge {
         var dialogs=app.displayDialogs;app.displayDialogs=DialogModes.NO;
         try {
             if(wfRoles(doc))throw new Error('WORKFLOW_STRUCTURE');
-            copy=doc.duplicate();app.activeDocument=copy;
+            copy=wfDuplicate(doc);app.activeDocument=copy;
             for(var i=0;i<copy.layers.length;i++)if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].remove();
             copy.mergeVisibleLayers();var merged=copy.activeLayer;
             app.activeDocument=doc;var old=[];for(var j=0;j<doc.layers.length;j++)old.push(doc.layers[j]);
@@ -462,15 +547,15 @@ extension PhotoshopWorkflowBridge {
             app.activeDocument=copy;merged.duplicate(doc,ElementPlacement.PLACEATBEGINNING);
             app.activeDocument=doc;var base=doc.activeLayer;base.name='底图';base.move(adjust,ElementPlacement.INSIDE);
             var cutout=base.duplicate();cutout.name='抠图';base.visible=false;cutout.visible=true;doc.activeLayer=cutout;
-            maskDoc=app.open(new File(\(quote(alpha.path))));var imported=maskDoc.channels[0].duplicate(doc);
-            maskDoc.close(SaveOptions.DONOTSAVECHANGES);maskDoc=null;
+            maskDoc=wfOpenFile(new File(\(quote(alpha.path))));var imported=maskDoc.channels[0].duplicate(doc);
+            wfCloseDocument(maskDoc);maskDoc=null;
             app.activeDocument=doc;doc.activeLayer=cutout;doc.selection.load(imported);
             var make=new ActionDescriptor(),ref=new ActionReference();make.putClass(charIDToTypeID('Nw  '),charIDToTypeID('Chnl'));
             ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));make.putReference(charIDToTypeID('At  '),ref);
             make.putEnumerated(charIDToTypeID('Usng'),charIDToTypeID('UsrM'),charIDToTypeID('RvlS'));executeAction(charIDToTypeID('Mk  '),make,DialogModes.NO);
             doc.selection.deselect();imported.remove();wfSelectRGB();
             wfSave(doc);return wfJSON(wfMetadata(doc));
-        }finally{if(maskDoc)maskDoc.close(SaveOptions.DONOTSAVECHANGES);if(copy)copy.close(SaveOptions.DONOTSAVECHANGES);app.displayDialogs=dialogs;wfClose(o);}
+        }finally{if(maskDoc)wfCloseDocument(maskDoc);if(copy)wfCloseDocument(copy);app.displayDialogs=dialogs;wfClose(o);}
         """
     }
     private static func rolesScript(document: URL, folder: URL) -> String {
@@ -478,7 +563,7 @@ extension PhotoshopWorkflowBridge {
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null,mask=null;
         try {
             var meta=wfMetadata(o.doc);if(!meta.roles)throw new Error('WORKFLOW_STRUCTURE');
-            copy=o.doc.duplicate();app.activeDocument=copy;var r=wfRoles(copy),b=wfBounds(r.base);
+            copy=wfDuplicate(o.doc);app.activeDocument=copy;var r=wfRoles(copy),b=wfBounds(r.base);
             var left=Math.min(0,Math.floor(b[0])),top=Math.min(0,Math.floor(b[1]));
             var right=Math.max(meta.width,Math.ceil(b[2])),bottom=Math.max(meta.height,Math.ceil(b[3]));
             // Reveal hidden pixels only on a disposable duplicate, never crop the task PSD.
@@ -488,7 +573,7 @@ extension PhotoshopWorkflowBridge {
             wfRolePNG(copy,\(quote(folder.appendingPathComponent("base.png").path)));
             r.base.visible=false;r.cutout.visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
             wfMaskToSelection(r.cutout);
-            mask=app.documents.add(copy.width,copy.height,copy.resolution,'Workflow mask',NewDocumentMode.RGB,DocumentFill.WHITE);
+            mask=wfMaskDocument(copy);
             var black=new SolidColor();black.rgb.red=0;black.rgb.green=0;black.rgb.blue=0;mask.selection.selectAll();mask.selection.fill(black);mask.selection.deselect();
             app.activeDocument=copy;copy.selection.store(copy.channels.add());var channel=copy.channels[copy.channels.length-1];
             channel.duplicate(mask);app.activeDocument=mask;mask.selection.load(mask.channels[mask.channels.length-1]);
@@ -496,7 +581,7 @@ extension PhotoshopWorkflowBridge {
             wfSelectRGB();mask.selection.fill(white,ColorBlendMode.NORMAL,100,false);mask.selection.deselect();
             wfRolePNG(mask,\(quote(folder.appendingPathComponent("mask.png").path)));
             meta.originX=left;meta.originY=top;meta.extentWidth=right-left;meta.extentHeight=bottom-top;return wfJSON(meta);
-        }finally{if(mask)mask.close(SaveOptions.DONOTSAVECHANGES);if(copy)copy.close(SaveOptions.DONOTSAVECHANGES);wfClose(o);}
+        }finally{if(mask)wfCloseDocument(mask);if(copy)wfCloseDocument(copy);wfClose(o);}
         """
     }
     private static func geometryScript(document: URL, solution: GeometrySolution) -> String {

@@ -1,10 +1,109 @@
 import XCTest
+import JavaScriptCore
 import ImageIO
 import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 @MainActor
 final class WorkflowBridgeTests: XCTestCase {
+    private nonisolated final class PerformanceLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [WorkflowPerformanceSample] = []
+        func append(_ sample: WorkflowPerformanceSample) { lock.withLock { stored.append(sample) } }
+        func values() -> [WorkflowPerformanceSample] { lock.withLock { stored } }
+    }
+    func testPerformanceObserverIsOptInAndPreservesResults() async throws {
+        let f = try roleCacheFixture(), log = PerformanceLog()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let baseline = PhotoshopWorkflowBridge(workspace: f.directory, coordinator: PhotoshopExecutionCoordinator(), scriptRunner: f.runner)
+        let before = try await baseline.refreshSavedPSD(document: f.document, owner: f.owner)
+        XCTAssertTrue(log.values().isEmpty)
+        let observed = PhotoshopWorkflowBridge(workspace: f.directory, coordinator: PhotoshopExecutionCoordinator(), scriptRunner: f.runner, performanceObserver: { log.append($0) })
+        let after = try await observed.refreshSavedPSD(document: f.document, owner: f.owner)
+        XCTAssertEqual(before, after)
+        let samples = log.values()
+        XCTAssertEqual(samples.first?.operation, "lease.wait.refresh")
+        XCTAssertEqual(samples.last?.operation, "service.refresh")
+        XCTAssertEqual(samples.filter { $0.operation == "ps.invoke" }.count, 2)
+        XCTAssertTrue(samples.contains { $0.operation == "capture" })
+        XCTAssertTrue(samples.contains { $0.operation == "hash" })
+        XCTAssertTrue(samples.allSatisfy { $0.taskID == f.owner && $0.seconds >= 0 && $0.seconds.isFinite })
+        let calls = await f.calls.values(); XCTAssertEqual(calls, [1], "Observation must preserve the validated role cache")
+    }
+    func testLeaseWaitIsSeparateFromOperationTime() async throws {
+        let f = try roleCacheFixture(), log = PerformanceLog(), lease = PhotoshopExecutionCoordinator(), gate = Gate()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let held = Task { try await lease.run(owner: UUID()) { await gate.suspend() } }
+        while await gate.values().isEmpty { await Task.yield() }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory, coordinator: lease, scriptRunner: f.runner, performanceObserver: { log.append($0) })
+        let start = ProcessInfo.processInfo.systemUptime
+        let queued = Task { try await bridge.refreshSavedPSD(document: f.document, owner: f.owner) }
+        // The lease is gated, so this delay is known waiting, never Photoshop execution.
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertTrue(log.values().isEmpty)
+        let released = ProcessInfo.processInfo.systemUptime
+        await gate.finish(); try await held.value; _ = try await queued.value
+        let ended = ProcessInfo.processInfo.systemUptime, samples = log.values()
+        let wait = try XCTUnwrap(samples.first { $0.operation == "lease.wait.refresh" })
+        let execution = try XCTUnwrap(samples.first { $0.operation == "service.refresh" })
+        XCTAssertGreaterThanOrEqual(wait.seconds, 0.12)
+        XCTAssertLessThanOrEqual(execution.seconds, ended - released)
+        XCTAssertLessThanOrEqual(wait.seconds + execution.seconds, ended - start)
+        XCTAssertEqual(samples.first?.operation, wait.operation)
+        XCTAssertEqual(samples.last?.operation, execution.operation)
+    }
+    func testManifestObservationPreservesBytesAndRecovery() async throws {
+        let directory = try temporaryDirectory(), log = PerformanceLog()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("batch.json"), observedURL = directory.appendingPathComponent("observed.json")
+        let original = WorkflowBatch(sourceDirectory: directory, outputDirectory: directory, specimens: [])
+        try await WorkflowBatchStore().save(original, to: url)
+        let store = WorkflowBatchStore(performanceObserver: { log.append($0) })
+        try await store.save(original, to: observedURL)
+        XCTAssertEqual(try Data(contentsOf: url), try Data(contentsOf: observedURL))
+        var revised = original; revised.revision += 1
+        try await store.save(revised, to: observedURL)
+        try Data("broken".utf8).write(to: observedURL)
+        let recovered = try await store.load(from: observedURL)
+        XCTAssertEqual(recovered, original)
+        XCTAssertEqual(log.values().map(\.operation), ["manifest.save", "manifest.save"])
+    }
+    func testScriptObservationIncludesFinallyCloseAndPreservesErrors() async throws {
+        let directory = try temporaryDirectory(), document = directory.appendingPathComponent("plain.psd"), owner = UUID(), log = PerformanceLog()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("plain-psd".utf8).write(to: document)
+        try JSONSerialization.data(withJSONObject: ["owner": owner.uuidString]).write(to: document.appendingPathExtension("workflow-owner.json"))
+        let runner: PhotoshopWorkflowBridge.ScriptRunner = { script in
+            let context = JSContext()!
+            context.evaluateScript("""
+                var events=[],SaveOptions={DONOTSAVECHANGES:0};
+                function File(path){this.fsName=path;}
+                var app={documents:[],open:function(file){
+                    events.push('open');
+                    var doc={id:1,saved:true,fullName:file,layers:[],colorProfileName:'sRGB',
+                        width:{as:function(){return 2;}},height:{as:function(){return 2;}},
+                        close:function(){events.push('close');app.documents=[];}};
+                    app.documents.push(doc);return doc;
+                }};
+                """)
+            let result = context.evaluateScript(script.replacingOccurrences(of: "#target photoshop", with: ""))
+            if let exception = context.exception { throw WorkflowBridgeError.photoshop(exception.toString()) }
+            XCTAssertEqual(context.evaluateScript("events.join(',')")?.toString(), "open,close")
+            return try XCTUnwrap(result?.toString())
+        }
+        let plain = PhotoshopWorkflowBridge(workspace: directory, coordinator: PhotoshopExecutionCoordinator(), scriptRunner: runner)
+        let first = try await plain.refreshSavedPSD(document: document, owner: owner)
+        let observed = PhotoshopWorkflowBridge(workspace: directory, coordinator: PhotoshopExecutionCoordinator(), scriptRunner: runner, performanceObserver: { log.append($0) })
+        let second = try await observed.refreshSavedPSD(document: document, owner: owner)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(log.values().filter { $0.operation == "ps.open" }.count, 2)
+        XCTAssertEqual(log.values().filter { $0.operation == "ps.close" }.count, 2)
+        XCTAssertEqual(log.values().filter { $0.operation == "ps.documents.peak.1" }.count, 2)
+        let failing = PhotoshopWorkflowBridge(workspace: directory, coordinator: PhotoshopExecutionCoordinator(), scriptRunner: { _ in throw WorkflowBridgeError.unsavedDocument }, performanceObserver: { log.append($0) })
+        do { _ = try await failing.refreshSavedPSD(document: document, owner: owner); XCTFail("Script errors must propagate") }
+        catch WorkflowBridgeError.unsavedDocument {}
+        XCTAssertEqual(log.values().last?.operation, "service.refresh")
+    }
     actor Gate {
         var entered: [Int] = []
         var release: CheckedContinuation<Void, Never>?

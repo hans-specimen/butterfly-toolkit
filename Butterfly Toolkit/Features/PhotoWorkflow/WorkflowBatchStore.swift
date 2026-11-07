@@ -1,6 +1,9 @@
 import Foundation
 
 actor WorkflowBatchStore {
+    private let performanceObserver: WorkflowPerformanceObserver?
+    init(performanceObserver: WorkflowPerformanceObserver? = nil) { self.performanceObserver = performanceObserver }
+
     func load(from url: URL) throws -> WorkflowBatch {
         if let batch = try? readValidBatch(from: url) { return try recoverInterruptedWork(batch) }
         if let batch = try? readValidBatch(from: url.appendingPathExtension("previous")) { return try recoverInterruptedWork(batch) }
@@ -8,6 +11,10 @@ actor WorkflowBatchStore {
     }
 
     func save(_ batch: WorkflowBatch, to url: URL) throws {
+        let started = performanceObserver == nil ? nil : ProcessInfo.processInfo.systemUptime
+        defer {
+            if let started { performanceObserver?(WorkflowPerformanceSample(taskID: nil, operation: "manifest.save", seconds: ProcessInfo.processInfo.systemUptime - started)) }
+        }
         try batch.validate()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
