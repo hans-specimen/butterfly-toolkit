@@ -235,7 +235,7 @@ nonisolated struct PreparedMaskGeometry: Sendable {
         }
         func crop(_ step: Int) throws -> CGRect? {
             let (w,h) = size(step)
-            return try background.findCrop(width: w,height: h,containing: bounds,center: center,angle: angle,pivot: pivot)
+            return try background.findCrop(width: w,height: h,containing: bounds,center: center,angle: angle,pivot: pivot,allowRepositioning: request.centerOverride != nil)
         }
         if let target = try crop(high) { return solution(crop: target,applicable: true,reason: review) }
         guard var best = try crop(low) else {
@@ -355,8 +355,14 @@ private nonisolated struct GeometryBackground: Sendable {
         }
         invalid = sums
     }
-    func findCrop(width cw: Int,height ch: Int,containing b: CGRect,center: CGPoint,angle: Double,pivot: CGPoint) throws -> CGRect? {
+    func findCrop(width cw: Int,height ch: Int,containing b: CGRect,center: CGPoint,angle: Double,pivot: CGPoint,allowRepositioning: Bool) throws -> CGRect? {
         let rotation = GeometryRotation(degrees: angle,pivot: pivot)
+        if !allowRepositioning {
+            // Automatic framing keeps the subject centered; the caller reduces padding to fit.
+            let x = (center.x-Double(cw)/2).rounded(),y = (center.y-Double(ch)/2).rounded()
+            let rect = CGRect(x: x,y: y,width: Double(cw),height: Double(ch))
+            return rect.contains(b) && isValid(rect,rotation: rotation) ? rect : nil
+        }
         let domain = [CGPoint(x: origin.x,y: origin.y),CGPoint(x: origin.x+Double(width),y: origin.y),
                       CGPoint(x: origin.x+Double(width),y: origin.y+Double(height)),CGPoint(x: origin.x,y: origin.y+Double(height))].map { rotation.apply($0) }
         let x0 = max(Int(ceil(b.maxX-Double(cw)-1e-8)),Int(ceil(domain.map(\.x).min()!-1e-8)))

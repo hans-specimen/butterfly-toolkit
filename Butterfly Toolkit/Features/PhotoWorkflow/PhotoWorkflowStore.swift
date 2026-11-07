@@ -261,7 +261,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     private func makeExecutor(output: URL,engine: URL? = nil) -> WorkflowExecutor {
         let workspace = output.appendingPathComponent(".work")
-        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace.appendingPathComponent("AI"))))
+        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace)))
     }
     private func launch(_ action: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil

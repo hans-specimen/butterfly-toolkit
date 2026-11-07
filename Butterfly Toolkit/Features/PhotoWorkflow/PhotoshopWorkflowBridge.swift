@@ -24,6 +24,11 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var initialStackVersion: String?
         var pendingInstall: InstallTransaction?
     }
+    private struct RoleCache: Codable {
+        var snapshot: PSDSnapshot
+        var images: RoleImages
+        var fingerprints: [String]
+    }
     private struct Metadata: Decodable, Sendable {
         var width: Double
         var height: Double
@@ -207,19 +212,37 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
     private func extractUnlocked(_ snapshot: PSDSnapshot) async throws -> RoleImages {
         guard snapshot.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
+        // Callers have already checked the saved PSD. Reuse only the exact validated pixels.
+        let receipt = workspace.appendingPathComponent("role-cache/\(snapshot.taskID)/\(snapshot.contentVersion).json")
+        if let cache = try? JSONDecoder().decode(RoleCache.self, from: Data(contentsOf: receipt)),
+           cache.snapshot == snapshot, cache.images.snapshotVersion == snapshot.contentVersion,
+           (try? roleFingerprints(cache.images)) == cache.fingerprints {
+            return cache.images
+        }
         let folder = try outputDirectory("roles/\(snapshot.contentVersion)/\(UUID())", owner: snapshot.taskID)
         let metadata = try await invoke(Self.rolesScript(document: snapshot.snapshotURL, folder: folder))
         let base = folder.appendingPathComponent("base.png"), cutout = folder.appendingPathComponent("cutout.png"), mask = folder.appendingPathComponent("mask.png")
         let size = CGSize(width: metadata.extentWidth ?? 0, height: metadata.extentHeight ?? 0)
         guard size.width > 0, size.height > 0 else { throw WorkflowBridgeError.invalidStructure }
+        let origin = CGPoint(x: metadata.originX ?? 0, y: metadata.originY ?? 0)
+        let images = RoleImages(snapshotVersion: snapshot.contentVersion, basePNG: base, cutoutPNG: cutout, maskPNG: mask,
+            pixelSize: size, coordinateOrigin: origin, editableExtent: CGRect(origin: origin, size: size),
+            cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize))
+        let fingerprints = try roleFingerprints(images)
         let baseRaster = try WorkflowRaster.read(base), cutoutRaster = try WorkflowRaster.read(cutout), maskRaster = try WorkflowRaster.read(mask)
         guard [baseRaster, cutoutRaster, maskRaster].allSatisfy({ $0.size == size }) else { throw WorkflowBridgeError.invalidImage("角色提取范围不一致") }
         do { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) }
         catch { throw WorkflowBridgeError.invalidStructure }
-        let origin = CGPoint(x: metadata.originX ?? 0, y: metadata.originY ?? 0)
-        return RoleImages(snapshotVersion: snapshot.contentVersion, basePNG: base, cutoutPNG: cutout, maskPNG: mask,
-            pixelSize: size, coordinateOrigin: origin, editableExtent: CGRect(origin: origin, size: size),
-            cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize))
+        guard try roleFingerprints(images) == fingerprints else { throw WorkflowBridgeError.staleSource }
+        // Cache publication is optional; a missing or damaged receipt simply triggers extraction.
+        if let data = try? JSONEncoder().encode(RoleCache(snapshot: snapshot, images: images, fingerprints: fingerprints)) {
+            try? FileManager.default.createDirectory(at: receipt.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: receipt, options: .atomic)
+        }
+        return images
+    }
+    private func roleFingerprints(_ images: RoleImages) throws -> [String] {
+        try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try AIFileValidation.hash($0.path) }
     }
     private func capture(document: URL, owner: UUID) async throws -> PSDSnapshot {
         let metadata = try await invoke(Self.inspectScript(document: document))
@@ -229,16 +252,16 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         let before = try AIFileValidation.hash(document.path)
         let folder = try outputDirectory("snapshots", owner: owner)
         let temporary = folder.appendingPathComponent("\(UUID()).psd")
+        let immutable = folder.appendingPathComponent("\(before).psd")
+        let existing = FileManager.default.fileExists(atPath: immutable.path)
         defer { try? FileManager.default.removeItem(at: temporary) }
-        try FileManager.default.copyItem(at: document, to: temporary)
-        guard try AIFileValidation.hash(temporary.path) == before, (try AIFileValidation.hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
+        if !existing { try FileManager.default.copyItem(at: document, to: temporary) }
+        guard try AIFileValidation.hash((existing ? immutable : temporary).path) == before,
+              (try AIFileValidation.hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
         let second = try await invoke(Self.inspectScript(document: document))
         guard metadata.summary == second.summary, metadata.width == second.width, metadata.height == second.height,
               try AIFileValidation.hash(document.path) == before else { throw WorkflowBridgeError.staleSource }
-        let immutable = folder.appendingPathComponent("\(before).psd")
-        if FileManager.default.fileExists(atPath: immutable.path) {
-            guard try AIFileValidation.hash(immutable.path) == before else { throw WorkflowBridgeError.staleSource }
-        } else {
+        if !existing {
             try FileManager.default.moveItem(at: temporary, to: immutable)
             try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: immutable.path)
         }
@@ -355,6 +378,18 @@ extension PhotoshopWorkflowBridge {
         return {width:doc.width.as('px'),height:doc.height.as('px'),profile:doc.colorProfileName,roles:roles?roles.ids:null,summary:summary};
     }
     function wfPNG(doc,path) { var p=new ExportOptionsSaveForWeb();p.format=SaveDocumentType.PNG;p.PNG8=false;p.transparency=true;p.interlaced=false;p.includeProfile=true;doc.exportDocument(new File(path),ExportType.SAVEFORWEB,p); }
+    // Role PNGs need fast lossless encoding and ICC; PNGSaveOptions omits the profile.
+    function wfRolePNG(doc,path) {
+        if(doc.bitsPerChannel!==BitsPerChannelType.EIGHT || doc.mode!==DocumentMode.RGB){wfPNG(doc,path);return;}
+        app.activeDocument=doc;var s=stringIDToTypeID,p=new ActionDescriptor(),d=new ActionDescriptor();
+        p.putEnumerated(s('method'),s('PNGMethod'),s('quick'));p.putInteger(s('compression'),1);
+        p.putEnumerated(s('PNGInterlaceType'),s('PNGInterlaceType'),s('PNGInterlaceNone'));
+        p.putEnumerated(s('PNGFilter'),s('PNGFilter'),s('PNGFilterAdaptive'));
+        p.putEnumerated(s('embedIccProfileLastState'),s('embedOff'),s('embedOn'));
+        d.putObject(s('as'),s('PNGFormat'),p);d.putPath(s('in'),new File(path));
+        d.putBoolean(s('copy'),true);d.putBoolean(s('lowerCase'),true);d.putBoolean(s('embedProfiles'),true);
+        executeAction(s('save'),d,DialogModes.NO);
+    }
     function wfSave(doc) { var p=new PhotoshopSaveOptions();p.layers=true;p.embedColorProfile=true;p.maximizeCompatibility=true;doc.saveAs(doc.fullName,p,false,Extension.LOWERCASE); }
     function wfSelectMask(layer) {
         app.activeDocument.activeLayer=layer;
@@ -434,8 +469,8 @@ extension PhotoshopWorkflowBridge {
             copy.resizeCanvas(UnitValue(right-left,'px'),UnitValue(bottom-top,'px'),AnchorPosition.TOPLEFT);
             r.adjust.translate(UnitValue(-left,'px'),UnitValue(-top,'px'));
             wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;
-            wfPNG(copy,\(quote(folder.appendingPathComponent("base.png").path)));
-            r.base.visible=false;r.cutout.visible=true;wfPNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
+            wfRolePNG(copy,\(quote(folder.appendingPathComponent("base.png").path)));
+            r.base.visible=false;r.cutout.visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
             wfMaskToSelection(r.cutout);
             mask=app.documents.add(copy.width,copy.height,copy.resolution,'Workflow mask',NewDocumentMode.RGB,DocumentFill.WHITE);
             var black=new SolidColor();black.rgb.red=0;black.rgb.green=0;black.rgb.blue=0;mask.selection.selectAll();mask.selection.fill(black);mask.selection.deselect();
@@ -443,7 +478,7 @@ extension PhotoshopWorkflowBridge {
             channel.duplicate(mask);app.activeDocument=mask;mask.selection.load(mask.channels[mask.channels.length-1]);
             var white=new SolidColor();white.rgb.red=255;white.rgb.green=255;white.rgb.blue=255;
             wfSelectRGB();mask.selection.fill(white,ColorBlendMode.NORMAL,100,false);mask.selection.deselect();
-            wfPNG(mask,\(quote(folder.appendingPathComponent("mask.png").path)));
+            wfRolePNG(mask,\(quote(folder.appendingPathComponent("mask.png").path)));
             meta.originX=left;meta.originY=top;meta.extentWidth=right-left;meta.extentHeight=bottom-top;return wfJSON(meta);
         }finally{if(mask)mask.close(SaveOptions.DONOTSAVECHANGES);if(copy)copy.close(SaveOptions.DONOTSAVECHANGES);wfClose(o);}
         """

@@ -119,7 +119,11 @@ final class WorkflowBridgeTests: XCTestCase {
         let record = directory.appendingPathComponent("result.json")
         try JSONSerialization.data(withJSONObject: ["inputSha256": input.fingerprint]).write(to: record)
         let event = AIEvent(event: "completed", input: inputURL.path, prediction: cutout.path, predictionAlpha: alpha.path)
-        let service = WorkflowMatteService(engine: directory, workspace: directory, device: "cpu", run: { _, _ in event })
+        let service = WorkflowMatteService(engine: directory, workspace: directory, device: "cpu", run: { engine, arguments in
+            XCTAssertEqual(engine, directory)
+            XCTAssertEqual(arguments, ["--workspace", directory.path, "infer", "--input", inputURL.path, "--device", "cpu"])
+            return event
+        })
         _ = try await service.infer(input: input)
         let wrongInputEvent = AIEvent(event: "completed",input: "/other-source.png",prediction: cutout.path,predictionAlpha: alpha.path)
         let wrongInput = WorkflowMatteService(engine: directory,workspace: directory,run: { _,_ in wrongInputEvent })
@@ -232,7 +236,7 @@ final class WorkflowBridgeTests: XCTestCase {
         let lease = PhotoshopExecutionCoordinator()
         let bridge = PhotoshopWorkflowBridge(workspace:directory,coordinator:lease,scriptRunner:{ script in
             if script.contains("base.png") {
-                let regex = try NSRegularExpression(pattern:#"wfPNG\(copy,("[^"]*/base\.png")\)"#)
+                let regex = try NSRegularExpression(pattern:#"wfRolePNG\(copy,("[^"]*/base\.png")\)"#)
                 guard let match=regex.firstMatch(in:script,range:NSRange(script.startIndex...,in:script)),let range=Range(match.range(at:1),in:script) else { throw WorkflowBridgeError.invalidStructure }
                 let destination = try JSONDecoder().decode(String.self,from:Data(script[range].utf8))
                 let folder=URL(fileURLWithPath:destination).deletingLastPathComponent()
@@ -278,6 +282,158 @@ final class WorkflowBridgeTests: XCTestCase {
         var missing = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
         missing.removeValue(forKey: "rotationPivot")
         XCTAssertThrowsError(try JSONDecoder().decode(GeometrySolution.self, from: JSONSerialization.data(withJSONObject: missing)))
+    }
+    func testSavedRefreshAndRepeatedExtractionReuseVerifiedRolesAcrossBridgeInstances() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let saved = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        let first = try await bridge.extractRoles(snapshot: saved)
+        let reopened = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let refreshed = try await reopened.refreshSavedPSD(document: f.document,owner: f.owner)
+        let second = try await reopened.extractRoles(snapshot: refreshed)
+        XCTAssertEqual(first,second)
+        let extractions = await f.calls.values()
+        XCTAssertEqual(extractions.count,1,"Refreshing and exporting an unchanged PSD must not re-export intermediate PNGs")
+        XCTAssertEqual(try Data(contentsOf: f.document),Data("saved-role-psd".utf8))
+    }
+    func testMissingOrChangedRoleCacheIsReextracted() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let saved = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        let first = try await bridge.extractRoles(snapshot: saved)
+        let expectedMask = try Data(contentsOf: first.maskPNG)
+        try Data("damaged-mask".utf8).write(to: first.maskPNG)
+        let repaired = try await bridge.extractRoles(snapshot: saved)
+        XCTAssertEqual(try Data(contentsOf: repaired.maskPNG),expectedMask)
+        try FileManager.default.removeItem(at: repaired.cutoutPNG)
+        let recovered = try await bridge.extractRoles(snapshot: saved)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: recovered.cutoutPNG.path))
+        let receipt = f.directory.appendingPathComponent("role-cache/\(f.owner)/\(saved.contentVersion).json")
+        try Data("incomplete-receipt".utf8).write(to: receipt)
+        _ = try await bridge.extractRoles(snapshot: saved)
+        let extractions = await f.calls.values()
+        XCTAssertEqual(extractions.count,4,"One initial extraction plus one per damaged image or receipt")
+    }
+    func testRoleCacheCannotBypassOwnershipOrSnapshotIntegrity() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let saved = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        let record = f.document.appendingPathExtension("workflow-owner.json"),original = try Data(contentsOf: record)
+        var ownership = try XCTUnwrap(JSONSerialization.jsonObject(with: original) as? [String:Any])
+        ownership["owner"] = UUID().uuidString
+        try JSONSerialization.data(withJSONObject: ownership).write(to: record)
+        await rejects { _ = try await bridge.extractRoles(snapshot: saved) }
+        try original.write(to: record)
+        try FileManager.default.setAttributes([.posixPermissions:0o644],ofItemAtPath: saved.snapshotURL.path)
+        try Data("changed-immutable-copy".utf8).write(to: saved.snapshotURL)
+        await rejects { _ = try await bridge.extractRoles(snapshot: saved) }
+        await rejects { _ = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner) }
+        XCTAssertEqual(try Data(contentsOf: f.document),Data("saved-role-psd".utf8))
+        let extractions = await f.calls.values(); XCTAssertEqual(extractions.count,1)
+    }
+    func testRoleReuseStillRejectsUnsavedAndChangedPSD() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let saved = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        _ = try await bridge.extractRoles(snapshot: saved)
+        let unsaved = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { _ in throw WorkflowBridgeError.unsavedDocument })
+        do { _ = try await unsaved.extractRoles(snapshot: saved); XCTFail("Unsaved PSD accepted") }
+        catch { XCTAssertEqual(error as? WorkflowBridgeError,.unsavedDocument) }
+        try Data("new-saved-role-psd".utf8).write(to: f.document)
+        do { _ = try await bridge.extractRoles(snapshot: saved); XCTFail("Stale snapshot accepted") }
+        catch { XCTAssertEqual(error as? WorkflowBridgeError,.staleSource) }
+        let changed = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        let images = try await bridge.extractRoles(snapshot: changed)
+        XCTAssertEqual(images.snapshotVersion,changed.contentVersion)
+        XCTAssertNotEqual(changed.contentVersion,saved.contentVersion)
+        let extractions = await f.calls.values(); XCTAssertEqual(extractions.count,2)
+    }
+    // Opt-in Photoshop verification. All outputs go to a new evidence directory; source PSDs are read only.
+    func testReal4KExportReuseAndPixelsWhenRequested() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let batchPath = environment["WORKFLOW_EXPORT_BATCH"],let evidencePath = environment["WORKFLOW_EXPORT_EVIDENCE"] else {
+            throw XCTSkip("Real Photoshop export verification is opt-in")
+        }
+        let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: batchPath)))
+        let evidence = URL(fileURLWithPath: evidencePath)
+        try FileManager.default.createDirectory(at: evidence,withIntermediateDirectories: true)
+        for (index,task) in batch.activeTasks.enumerated() {
+            let source = try XCTUnwrap(task.snapshot),reference = try XCTUnwrap(task.roleImages)
+            let folder = evidence.appendingPathComponent(source.workingURL.deletingPathExtension().lastPathComponent)
+            let calls = Gate()
+            let runner: PhotoshopWorkflowBridge.ScriptRunner = { script in
+                if script.contains("base.png") { await calls.append(1) }
+                return try await PhotoshopWorkflowBridge.execute(script)
+            }
+            let bridge = PhotoshopWorkflowBridge(workspace: folder,scriptRunner: runner)
+            let before = try AIFileValidation.hash(source.workingURL.path)
+            let started = Date()
+            let saved = try await bridge.refreshSavedPSD(document: source.workingURL,owner: source.taskID)
+            let images = try await bridge.extractRoles(snapshot: saved)
+            let coldSeconds = Date().timeIntervalSince(started)
+            try JSONEncoder().encode(images).write(to: folder.appendingPathComponent("roles.json"))
+            try JSONEncoder().encode(reference).write(to: folder.appendingPathComponent("reference-roles.json"))
+            let warmStart = Date()
+            let reopened = PhotoshopWorkflowBridge(workspace: folder,scriptRunner: runner)
+            let refreshed = try await reopened.refreshSavedPSD(document: source.workingURL,owner: source.taskID)
+            let cached = try await reopened.extractRoles(snapshot: refreshed)
+            let warmSeconds = Date().timeIntervalSince(warmStart)
+            XCTAssertEqual(cached,images)
+            let extractions = await calls.values(); XCTAssertEqual(extractions.count,1)
+            XCTAssertEqual(images.pixelSize,reference.pixelSize)
+            XCTAssertEqual(images.coordinateOrigin,reference.coordinateOrigin)
+            for (actualURL,expectedURL) in zip([images.basePNG,images.cutoutPNG,images.maskPNG],[reference.basePNG,reference.cutoutPNG,reference.maskPNG]) {
+                let actual = try WorkflowRaster.read(actualURL),expected = try WorkflowRaster.read(expectedURL)
+                XCTAssertEqual(actual.size,expected.size)
+                XCTAssertEqual(actual.profileName,expected.profileName)
+                XCTAssertEqual(actual.profileData,expected.profileData)
+                XCTAssertTrue(actual.pixels == expected.pixels,"Changed pixels: \(actualURL.lastPathComponent)")
+            }
+            let output = folder.appendingPathComponent("4k.png"),renderStart = Date()
+            try WorkflowAssetRenderer().render4K(roles: images,layout: task.squareLayout,destination: output)
+            let renderSeconds = Date().timeIntervalSince(renderStart)
+            let published = try XCTUnwrap(task.artifacts.last { $0.kind == .png4k && $0.state == .completed })
+            XCTAssertTrue(try WorkflowRaster.read(output).pixels == WorkflowRaster.read(published.url).pixels,"Final 4K pixels changed")
+            XCTAssertEqual(try AIFileValidation.hash(source.workingURL.path),before)
+            var summary: [String:Any] = ["coldRefreshAndExtractSeconds":coldSeconds,"cachedRefreshAndExtractSeconds":warmSeconds,
+                "render4KSeconds":renderSeconds,"roleExtractions":extractions.count,"publishedReference":published.url.path]
+            if index == 0 {
+                let legacy = PhotoshopWorkflowBridge(workspace: folder.appendingPathComponent("legacy"),scriptRunner: { script in
+                    let old = script.replacingOccurrences(of: "wfRolePNG(copy,",with: "wfPNG(copy,")
+                        .replacingOccurrences(of: "wfRolePNG(mask,",with: "wfPNG(mask,")
+                    return try await PhotoshopWorkflowBridge.execute(old)
+                })
+                let baselineStart = Date()
+                let baseline = try await legacy.refreshSavedPSD(document: source.workingURL,owner: source.taskID)
+                let legacyImages = try await legacy.extractRoles(snapshot: baseline)
+                summary["saveForWebRefreshAndExtractSeconds"] = Date().timeIntervalSince(baselineStart)
+                try JSONEncoder().encode(legacyImages).write(to: folder.appendingPathComponent("legacy-roles.json"))
+            }
+            try JSONSerialization.data(withJSONObject: summary,options: [.prettyPrinted,.sortedKeys]).write(to: folder.appendingPathComponent("timings.json"))
+        }
+    }
+    private func roleCacheFixture() throws -> (directory: URL,document: URL,owner: UUID,runner: PhotoshopWorkflowBridge.ScriptRunner,calls: Gate) {
+        let directory = try temporaryDirectory(),document = directory.appendingPathComponent("owned.psd"),owner = UUID(),calls = Gate()
+        try Data("saved-role-psd".utf8).write(to: document)
+        let roles = PSDRoleIdentifiers(originalStackGroup: "1",adjustmentGroup: "2",baseLayer: "3",cutoutLayer: "4",mask: "4:userMask")
+        let encodedRoles = try JSONSerialization.jsonObject(with: JSONEncoder().encode(roles))
+        try JSONSerialization.data(withJSONObject: ["owner":owner.uuidString,"roles":encodedRoles]).write(to: document.appendingPathExtension("workflow-owner.json"))
+        let metadata = String(decoding:try JSONSerialization.data(withJSONObject: ["width":2,"height":2,"profile":"AdobeRGB","summary":"roles","roles":encodedRoles,"originX":0,"originY":0,"extentWidth":2,"extentHeight":2]),as:UTF8.self)
+        let fixtures = directory.appendingPathComponent("fixtures"); try FileManager.default.createDirectory(at: fixtures,withIntermediateDirectories: true)
+        try png(fixtures.appendingPathComponent("base.png"),width:2,height:2,pixels:[255,0,0,255,0,255,0,255,0,0,255,255,255,255,0,255])
+        try png(fixtures.appendingPathComponent("mask.png"),width:2,height:2,pixels:[255,255,255,255,0,0,0,255,255,255,255,255,0,0,0,255])
+        try png(fixtures.appendingPathComponent("cutout.png"),width:2,height:2,pixels:[255,0,0,255,0,0,0,0,0,0,255,255,0,0,0,0])
+        let runner: PhotoshopWorkflowBridge.ScriptRunner = { script in
+            let regex = try NSRegularExpression(pattern:#"wfRolePNG\(copy,("[^"]*/base\.png")\)"#)
+            if let match = regex.firstMatch(in:script,range:NSRange(script.startIndex...,in:script)),let range = Range(match.range(at:1),in:script) {
+                let destination = try JSONDecoder().decode(String.self,from:Data(script[range].utf8))
+                let folder = URL(fileURLWithPath:destination).deletingLastPathComponent()
+                for name in ["base.png","mask.png","cutout.png"] { try FileManager.default.copyItem(at:fixtures.appendingPathComponent(name),to:folder.appendingPathComponent(name)) }
+                await calls.append(1)
+            }
+            return metadata
+        }
+        return (directory,document,owner,runner,calls)
     }
     private func rejects(_ operation: () async throws -> Void) async {
         do { try await operation(); XCTFail("Invalid output accepted") } catch {}

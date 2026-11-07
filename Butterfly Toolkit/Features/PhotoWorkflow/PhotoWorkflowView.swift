@@ -440,7 +440,7 @@ struct PhotoWorkflowView: View {
             Text("显示图层").font(.caption).foregroundStyle(.secondary)
             Picker("图像",selection: $store.previewMode) { ForEach(["底图","抠图","蒙版"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
             Text("预览底色").font(.caption).foregroundStyle(.secondary)
-            Picker("预览底色",selection: $store.previewBackground) { ForEach(["白","黑","棋盘"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
+            Picker("预览底色",selection: $store.previewBackground) { ForEach(["白","黑","棋盘","天蓝"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
         }
     }
     private var geometryControls: some View {
@@ -480,12 +480,12 @@ struct PhotoWorkflowView: View {
             Text("4096 × 4096 · 透明 PNG").font(.headline)
             Text("独立安全框，继承已确认姿态；不会再次旋转。").font(.caption).foregroundStyle(.secondary)
             Text("预览底色").font(.caption).foregroundStyle(.secondary)
-            Picker("预览底色",selection: $store.previewBackground) { ForEach(["白","黑","棋盘"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
+            Picker("预览底色",selection: $store.previewBackground) { ForEach(["白","黑","棋盘","天蓝"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
             Toggle("显示安全框",isOn: $store.showSafeFrame)
             HStack { Text("安全边距 px"); TextField("256",value: Binding(get: { store.currentLayout.safeMargin },set: { value in var l = store.currentLayout; l.safeMargin = min(512,max(0,value)); store.editLayout(l) }),format: .number).frame(width: 70) }
-            Slider(value: Binding(get: { Double(store.currentLayout.safeMargin) },set: { value in var l = store.currentLayout; l.safeMargin = Int(value); store.editLayout(l) }),in: 0...512,step: 1)
+            Slider(value: Binding(get: { Double(store.currentLayout.safeMargin) },set: { value in var l = store.currentLayout; l.safeMargin = Int(value.rounded()); store.editLayout(l) }),in: 0...512)
             Button("恢复居中") { var l = store.currentLayout; l.center = CGPoint(x: 2048,y: 2048); store.editLayout(l) }
-            Text("拖动预览移动主体。白／黑／棋盘仅为看图背景，输出保留透明。").font(.caption).foregroundStyle(.secondary)
+            Text("拖动预览移动主体。预览底色仅用于看图，输出保留透明。").font(.caption).foregroundStyle(.secondary)
         }
     }
     private var psdControls: some View {

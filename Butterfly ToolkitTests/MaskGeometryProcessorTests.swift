@@ -201,12 +201,45 @@ final class MaskGeometryProcessorTests: XCTestCase {
         XCTAssertFalse(s.isApplicable); XCTAssertNotNil(s.reason)
         XCTAssertEqual(s.sourceCropRect,CGRect(x: 0,y: 0,width: 400,height: 200))
     }
-    func testInsufficientMarginCanShiftInsideValidBackground() throws {
+    func testInsufficientMarginShrinksSymmetricallyWithoutShiftingSubject() throws {
         let f = try Fixture(width: 400,height: 400,subject: CGRect(x: 0,y: 100,width: 200,height: 200)); defer { f.remove() }
         let s = try MaskGeometryProcessor().analyze(input: f.input,request: GeometryRequest(angleStrategy: .manual(degrees: 0)))
         XCTAssertTrue(s.isApplicable); XCTAssertNotNil(s.reason)
-        XCTAssertEqual(s.sourceCropRect.minX,0); XCTAssertGreaterThanOrEqual(s.sourceCropRect.maxX,200)
-        XCTAssertGreaterThanOrEqual(s.actualMargins.left,0)
+        XCTAssertEqual(s.sourceCropRect,CGRect(x: 0,y: 100,width: 200,height: 200))
+        XCTAssertEqual(s.actualMargins.left,s.actualMargins.right)
+        XCTAssertEqual(s.actualMargins.top,s.actualMargins.bottom)
+    }
+    func testRotatedCropReducesPaddingWhileKeepingSubjectCentered() throws {
+        let f = try Fixture(width: 520,height: 348,subject: CGRect(x: 70,y: 26,width: 350,height: 288)); defer { f.remove() }
+        let prepared = try MaskGeometryProcessor().prepare(input: f.input)
+        let s = try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 1)))
+        XCTAssertTrue(s.isApplicable); XCTAssertTrue(s.reason?.contains("留白不足") ?? false)
+        XCTAssertEqual(s.sourceCropRect.midX,s.subjectBounds.midX,accuracy: 0.5)
+        XCTAssertEqual(s.sourceCropRect.midY,s.subjectBounds.midY,accuracy: 0.5)
+        XCTAssertEqual(s.actualMargins.left,s.actualMargins.right,accuracy: 1/s.outputSize.width)
+        XCTAssertEqual(s.actualMargins.top,s.actualMargins.bottom,accuracy: 1/s.outputSize.height)
+        XCTAssertLessThan(s.actualMargins.top,0.1)
+        try prepared.validate(solution: s)
+    }
+    func testBackgroundHoleReducesCenteredPaddingButAllowsExplicitPosition() throws {
+        let f = try Fixture(width: 400,height: 400,subject: CGRect(x: 100,y: 100,width: 200,height: 200),background: { a in a[200*400+305] = 0 }); defer { f.remove() }
+        let prepared = try MaskGeometryProcessor().prepare(input: f.input)
+        let centered = try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0)))
+        XCTAssertTrue(centered.isApplicable)
+        XCTAssertEqual(centered.sourceCropRect.midX,200,accuracy: 0.5)
+        XCTAssertEqual(centered.sourceCropRect.midY,200,accuracy: 0.5)
+        XCTAssertLessThanOrEqual(centered.sourceCropRect.maxX,305)
+        try prepared.validate(solution: centered)
+        let manual = try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0),centerOverride: CGPoint(x: 180,y: 200)))
+        XCTAssertTrue(manual.isApplicable)
+        XCTAssertEqual(manual.sourceCropRect,CGRect(x: 55,y: 75,width: 250,height: 250))
+        try prepared.validate(solution: manual)
+    }
+    func testFixedRatioCannotShiftAnOtherwiseImpossibleCenteredCrop() throws {
+        let f = try Fixture(width: 400,height: 200,subject: CGRect(x: 0,y: 50,width: 80,height: 100)); defer { f.remove() }
+        let s = try MaskGeometryProcessor().analyze(input: f.input,request: GeometryRequest(ratio: .square,angleStrategy: .manual(degrees: 0)))
+        XCTAssertFalse(s.isApplicable)
+        XCTAssertTrue(s.reason?.contains("比例无法容纳主体") ?? false)
     }
     func testClockwiseRotationPivotAndNegativeCoordinateOrigin() throws {
         let f = try Fixture(width: 400,height: 300,subject: CGRect(x: 100,y: 100,width: 200,height: 100),origin: CGPoint(x: -250,y: -200)); defer { f.remove() }

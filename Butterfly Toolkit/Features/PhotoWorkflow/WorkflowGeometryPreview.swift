@@ -124,7 +124,8 @@ struct WorkflowGeometryPreview: View {
                     }
                     #endif
                 }
-                ctx.fill(Path(CGRect(origin: .zero,size: size)),with: .color(background == "黑" ? .black : .white))
+                let previewColor: Color = background == "天蓝" ? Color(red: 116/255.0,green: 191/255.0,blue: 1) : (background == "黑" ? .black : .white)
+                ctx.fill(Path(CGRect(origin: .zero,size: size)),with: .color(previewColor))
                 if background == "棋盘" {
                     for y in stride(from: 0,to: Int(size.height),by: 20) { for x in stride(from: 0,to: Int(size.width),by: 20) where (x/20+y/20)%2 == 0 {
                         ctx.fill(Path(CGRect(x: x,y: y,width: 20,height: 20)),with: .color(.gray.opacity(0.2)))
@@ -140,7 +141,8 @@ struct WorkflowGeometryPreview: View {
                     pixels.clip(to: Path(map.viewRect(subject.intersection(canvas))))
                     pixels.draw(Image(decorative: image,scale: 1),in: map.viewRect(target))
                     ctx.stroke(Path(map.viewRect(canvas)),with: .color(canvas.contains(subject) ? .gray : .red),lineWidth: 2)
-                    if showSafeFrame { ctx.stroke(Path(map.viewRect(CGRect(x: square.safeMargin,y: square.safeMargin,width: square.canvasSide-2*square.safeMargin,height: square.canvasSide-2*square.safeMargin))),with: .color(.orange),style: StrokeStyle(lineWidth: 1,dash: [6,4])) }
+                    if showSafeFrame { ctx.stroke(Path(map.viewRect(CGRect(x: square.safeMargin,y: square.safeMargin,width: square.canvasSide-2*square.safeMargin,height: square.canvasSide-2*square.safeMargin))),with: .color(.orange),lineWidth: 2) }
+                    ctx.stroke(Path(map.viewRect(subject)),with: .color(.green),style: StrokeStyle(lineWidth: 1.5,dash: [6,4]))
                 } else {
                     // Empty transformed source/background remains visibly red rather than being filled as valid photo.
                     if let solution,!solution.isApplicable { ctx.fill(Path(map.viewRect(solution.sourceCropRect)),with: .color(.red.opacity(0.25))) }
