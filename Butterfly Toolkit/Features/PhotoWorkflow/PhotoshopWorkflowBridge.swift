@@ -11,6 +11,13 @@ nonisolated enum PhotoshopInstallCheckpoint: Sendable { case prepared, published
 nonisolated struct PhotoshopWorkflowBridge: Sendable {
     typealias ScriptRunner = @Sendable (String) async throws -> String
     typealias StackProcessor = @Sendable (FocusStackJob, String?) async throws -> Void
+    private struct OpenedWorkflowDocument: Sendable {
+        let documentID: Int
+        let url: URL
+        let token: String
+    }
+    @TaskLocal private static var openedDocument: OpenedWorkflowDocument?
+    private let reuseDocumentsWithinOperation: Bool
     private let stackProcessor: StackProcessor
     let workspace: URL
     private let coordinator: PhotoshopExecutionCoordinator
@@ -18,13 +25,13 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     private let installCheckpoint: @Sendable (PhotoshopInstallCheckpoint) async throws -> Void
     @TaskLocal private static var performanceTaskID: UUID?
     private let performanceObserver: WorkflowPerformanceObserver?
-    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil, stackProcessor: @escaping StackProcessor = { job, hook in
+    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil, reuseDocumentsWithinOperation: Bool = false, stackProcessor: @escaping StackProcessor = { job, hook in
         guard let application = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
         try await Task.detached(priority: .userInitiated) {
             try FocusStackProcessor.process(job, photoshopApplicationName: application, workflowPNGExportScript: hook)
         }.value
     }) {
-        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver; self.stackProcessor = stackProcessor
+        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver; self.stackProcessor = stackProcessor; self.reuseDocumentsWithinOperation = reuseDocumentsWithinOperation
     }
     private struct InstallTransaction: Codable, Sendable {
         var sourceVersion: String
@@ -53,6 +60,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var originY: Double?
         var extentWidth: Double?
         var extentHeight: Double?
+        var documentID: Int?
         var wasOpen: Bool?
         var performance: [String: Double]?
         var documentPeak: Int?
@@ -173,8 +181,8 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             if let pending = ownership.pendingInstall {
                 guard ownership.owner == snapshot.taskID, pending.sourceVersion == snapshot.contentVersion,
                       pending.matte == matte else { throw WorkflowBridgeError.staleSource }
-                _ = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true)
-                return try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
+                guard let saved = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true, captureResult: true) else { throw WorkflowBridgeError.invalidStructure }
+                return saved
             }
             try await verify(snapshot)
             guard snapshot.roles == nil, matte.pixelSize == snapshot.pixelSize, matte.orientation == 1,
@@ -193,26 +201,29 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try self.copy(at: snapshot.snapshotURL, to: staged)
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: staged.path)
             try JSONEncoder().encode(ownership).write(to: ownershipURL(staged), options: .withoutOverwriting)
-            let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL))
-            guard let roles = metadata.roles, roles.isValid else { throw WorkflowBridgeError.invalidStructure }
-            var stagedOwnership = ownership; stagedOwnership.roles = roles
-            try JSONEncoder().encode(stagedOwnership).write(to: ownershipURL(staged), options: .atomic)
-            let prepared = try await capture(document: staged, owner: snapshot.taskID)
+            let originalOwnership = ownership
+            let prepared = try await withOpenDocument(at: staged) {
+                let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL))
+                guard let roles = metadata.roles, roles.isValid else { throw WorkflowBridgeError.invalidStructure }
+                var stagedOwnership = originalOwnership; stagedOwnership.roles = roles
+                try JSONEncoder().encode(stagedOwnership).write(to: ownershipURL(staged), options: .atomic)
+                return try await capture(document: staged, owner: snapshot.taskID)
+            }
             try await validateInstalledMask(prepared, matte: matte)
             try await verify(snapshot)
             ownership.pendingInstall = InstallTransaction(sourceVersion: snapshot.contentVersion, result: prepared, matte: matte)
             try JSONEncoder().encode(ownership).write(to: record, options: .atomic)
             try await installCheckpoint(.prepared)
-            _ = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true)
-            return try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
+            guard let saved = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true, captureResult: true) else { throw WorkflowBridgeError.invalidStructure }
+            return saved
         }
     }
     /// Only a persisted, fully validated result may bridge the PSD/ownership publication boundary.
-    private func recoverInstall(document: URL, owner: UUID, allowPublication: Bool) async throws -> Bool {
+    private func recoverInstall(document: URL, owner: UUID, allowPublication: Bool, captureResult: Bool = false) async throws -> PSDSnapshot? {
         let record = ownershipURL(document)
-        var ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
+        let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
         guard ownership.owner == owner else { throw WorkflowBridgeError.ownershipConflict }
-        guard let pending = ownership.pendingInstall else { return false }
+        guard let pending = ownership.pendingInstall else { return nil }
         guard ownership.roles == nil, pending.result.taskID == owner, pending.result.roles?.isValid == true,
               pending.result.pixelSize == pending.matte.pixelSize,
               try hash(pending.result.snapshotURL.path) == pending.result.contentVersion,
@@ -221,7 +232,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         let current = try hash(document.path)
         if current == pending.sourceVersion {
             // Saved readback during manual editing must never publish an automatic PSD write.
-            guard allowPublication else { return false }
+            guard allowPublication else { return nil }
             let closed = try await invoke(Self.closeForPublicationScript(document: document))
             guard closed.roles == nil, try hash(document.path) == pending.sourceVersion else { throw WorkflowBridgeError.staleSource }
             do {
@@ -233,17 +244,23 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             if closed.wasOpen == true { _ = try await invoke(Self.reopenScript(document: document)) }
             try await installCheckpoint(.published)
         } else if current != pending.result.contentVersion { throw WorkflowBridgeError.staleSource }
-        let metadata = try await invoke(Self.inspectScript(document: document))
-        guard metadata.roles == pending.result.roles, metadata.summary == pending.result.structureSummary,
-              metadata.width == pending.result.pixelSize.width, metadata.height == pending.result.pixelSize.height,
-              try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.invalidStructure }
-        var published = pending.result; published.workingURL = document
-        try await validateInstalledMask(published, matte: pending.matte)
-        guard try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
-        ownership.roles = pending.result.roles; ownership.pendingInstall = nil
-        try JSONEncoder().encode(ownership).write(to: record, options: .atomic)
-        return true
+        // Publication has closed the old handle; acquire the new disk version only now.
+        let previousOwnership = ownership
+        return try await withOpenDocument(at: document) {
+            let metadata = try await invoke(Self.inspectScript(document: document))
+            guard metadata.roles == pending.result.roles, metadata.summary == pending.result.structureSummary,
+                  metadata.width == pending.result.pixelSize.width, metadata.height == pending.result.pixelSize.height,
+                  try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.invalidStructure }
+            var published = pending.result; published.workingURL = document
+            try await validateInstalledMask(published, matte: pending.matte)
+            guard try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
+            var completedOwnership = previousOwnership
+            completedOwnership.roles = pending.result.roles; completedOwnership.pendingInstall = nil
+            try JSONEncoder().encode(completedOwnership).write(to: record, options: .atomic)
+            return captureResult ? try await capture(document: document, owner: owner) : nil
+        }
     }
+
     private func validateInstalledMask(_ snapshot: PSDSnapshot, matte: MatteArtifact) async throws {
         let extracted = try await extractUnlocked(snapshot)
         let actual = try readRaster(extracted.maskPNG), expected = try readRaster(matte.alphaURL)
@@ -261,15 +278,17 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
     func applyGeometry(snapshot: PSDSnapshot, solution: GeometrySolution) async throws -> PSDSnapshot {
         try await withLease("geometry", owner: snapshot.taskID, savedRead: false) {
-            try await verify(snapshot)
-            guard solution.sourceVersion == snapshot.contentVersion, solution.isApplicable,
-                  solution.angleDegrees.isFinite, solution.sourceCropRect.width > 0, solution.sourceCropRect.height > 0,
-                  solution.sourceCropRect.size == solution.outputSize, snapshot.roles != nil else { throw WorkflowBridgeError.staleSource }
-            _ = try await invoke(Self.geometryScript(document: snapshot.workingURL, solution: solution))
-            let saved = try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
-            guard saved.pixelSize == solution.outputSize else { throw WorkflowBridgeError.invalidImage("裁切读回尺寸不一致") }
-            _ = try await extractUnlocked(saved)
-            return saved
+            try await withOpenDocument(at: snapshot.workingURL) {
+                try await verify(snapshot)
+                guard solution.sourceVersion == snapshot.contentVersion, solution.isApplicable,
+                      solution.angleDegrees.isFinite, solution.sourceCropRect.width > 0, solution.sourceCropRect.height > 0,
+                      solution.sourceCropRect.size == solution.outputSize, snapshot.roles != nil else { throw WorkflowBridgeError.staleSource }
+                _ = try await invoke(Self.geometryScript(document: snapshot.workingURL, solution: solution))
+                let saved = try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
+                guard saved.pixelSize == solution.outputSize else { throw WorkflowBridgeError.invalidImage("裁切读回尺寸不一致") }
+                _ = try await extractUnlocked(saved)
+                return saved
+            }
         }
     }
     private func extractUnlocked(_ snapshot: PSDSnapshot) async throws -> RoleImages {
@@ -328,7 +347,10 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         if !existing { try self.copy(at: document, to: temporary) }
         guard try hash((existing ? immutable : temporary).path) == before,
               (try hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
-        let second = try await invoke(Self.inspectScript(document: document))
+        // A retained working document is not disk readback. Inspect the hashed copy independently.
+        let held = Self.openedDocument?.url == document.resolvingSymlinksInPath()
+        let readback = held ? (existing ? immutable : temporary) : document
+        let second = try await invoke(Self.inspectScript(document: readback))
         guard metadata.summary == second.summary, metadata.width == second.width, metadata.height == second.height,
               try hash(document.path) == before else { throw WorkflowBridgeError.staleSource }
         if !existing {
@@ -382,15 +404,46 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         if savedRead { return try await coordinator.readSaved(owner: owner, operation: body) }
         return try await coordinator.run(owner: owner, operation: body)
     }
+    /// Called only inside an existing coordinator lease. No handles survive this service scope.
+    private func withOpenDocument<T: Sendable>(at url: URL, operation: @Sendable () async throws -> T) async throws -> T {
+        guard reuseDocumentsWithinOperation else { return try await operation() }
+        let path = url.resolvingSymlinksInPath(), token = "workflowDocument_" + UUID().uuidString
+        let performanceTaskID = Self.performanceTaskID
+        let opened: Metadata
+        do {
+            opened = try await invoke(Self.acquireDocumentScript(path, token: token))
+            guard opened.documentID != nil, opened.wasOpen != nil else { throw WorkflowBridgeError.invalidStructure }
+        } catch {
+            // Even a lost/invalid response may have opened a document; the nonce proves ownership.
+            _ = try? await Task.detached {
+                try await Self.$performanceTaskID.withValue(performanceTaskID) {
+                    try await invoke(Self.releaseDocumentScript(path, token: token, documentID: nil))
+                }
+            }.value
+            throw error
+        }
+        let handle = OpenedWorkflowDocument(documentID: opened.documentID!, url: path, token: token)
+        let result: Result<T, Error>
+        do { result = .success(try await Self.$openedDocument.withValue(handle) { try await operation() }) }
+        catch { result = .failure(error) }
+        // Cancellation must not release the coordinator lease before Photoshop cleanup finishes.
+        _ = try await Task.detached {
+            try await Self.$performanceTaskID.withValue(performanceTaskID) {
+                try await invoke(Self.releaseDocumentScript(path, token: token, documentID: handle.documentID))
+            }
+        }.value
+        return try result.get()
+    }
     private func invoke(_ body: String) async throws -> Metadata {
         let started = observationStart()
         defer { report("ps.invoke", since: started) }
+        let scope = Self.openedDocument.map { Self.documentScopeScript($0) } ?? ""
         let script: String
         if performanceObserver == nil {
-            script = Self.commonScript + "\n(function(){" + body + "}());"
+            script = Self.commonScript + scope + "\n(function(){" + body + "}());"
         } else {
             // Attach metrics after the inner finally blocks have closed temporary documents.
-            script = Self.commonScript + Self.performanceScript + "\nvar wfResult=(function(){" + body + "}());" +
+            script = Self.commonScript + Self.performanceScript + scope + "\nvar wfResult=(function(){" + body + "}());" +
                 "var wfDecoded=eval('('+wfResult+')');wfDecoded.performance=wfPerformance;wfDecoded.documentPeak=wfPeak;wfJSON(wfDecoded);"
         }
         let result = try await scriptRunner(script)
@@ -427,6 +480,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             guard process.terminationStatus == 0 else {
                 let message = String(decoding: diagnostic, as: UTF8.self)
                 if message.contains("WORKFLOW_UNSAVED") { throw WorkflowBridgeError.unsavedDocument }
+                if message.contains("WORKFLOW_STALE_DOCUMENT") { throw WorkflowBridgeError.staleSource }
                 if message.contains("WORKFLOW_STRUCTURE") { throw WorkflowBridgeError.invalidStructure }
                 throw WorkflowBridgeError.photoshop(message)
             }
@@ -440,6 +494,56 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
 }
 
 extension PhotoshopWorkflowBridge {
+    private static func acquireDocumentScript(_ url: URL, token: String) -> String {
+        """
+        var o=wfOpen(\(quote(url.path)));
+        try {
+            var state=new ActionDescriptor();
+            state.putInteger(stringIDToTypeID('documentID'),o.doc.id);
+            state.putString(stringIDToTypeID('path'),\(quote(url.path)));
+            state.putString(stringIDToTypeID('nativePath'),o.doc.fullName.fsName);
+            state.putBoolean(stringIDToTypeID('owned'),o.owned);
+            app.putCustomOptions(\(quote(token)),state,false);
+        } catch(e) {if(o.owned && o.doc.saved)wfCloseDocument(o.doc);throw e;}
+        return wfJSON({width:0,height:0,profile:'',summary:'',documentID:o.doc.id,wasOpen:!o.owned});
+        """
+    }
+    private static func heldDocumentScript(_ url: URL, token: String, documentID: Int?) -> String {
+        """
+        function wfHeldState(){
+            try {var state=app.getCustomOptions(\(quote(token)));
+                return {id:state.getInteger(stringIDToTypeID('documentID')),path:state.getString(stringIDToTypeID('path')),nativePath:state.getString(stringIDToTypeID('nativePath')),owned:state.getBoolean(stringIDToTypeID('owned'))};
+            } catch(e) {throw new Error('WORKFLOW_STALE_DOCUMENT');}
+        }
+        function wfHeldDocument(){
+            var h=wfHeldState(),doc=null;
+            if(h.path!==\(quote(url.path)) \(documentID.map { "|| h.id!==" + String($0) } ?? ""))throw new Error('WORKFLOW_STALE_DOCUMENT');
+            for(var i=0;i<app.documents.length;i++)if(app.documents[i].id===h.id)doc=app.documents[i];
+            try{if(!doc || doc.fullName.fsName!==h.nativePath)throw new Error('WORKFLOW_STALE_DOCUMENT');}
+            catch(e){throw new Error('WORKFLOW_STALE_DOCUMENT');}
+            if(!doc.saved)throw new Error('WORKFLOW_UNSAVED');
+            return doc;
+        }
+        """
+    }
+    private static func documentScopeScript(_ handle: OpenedWorkflowDocument) -> String {
+        heldDocumentScript(handle.url, token: handle.token, documentID: handle.documentID) + """
+        wfHeldDocument();
+        var wfUnboundOpen=wfOpen;
+        wfOpen=function(path){
+            if(new File(path).fsName===new File(\(quote(handle.url.path))).fsName){var doc=wfHeldDocument();app.activeDocument=doc;return {doc:doc,owned:false};}
+            return wfUnboundOpen(path);
+        };
+        """
+    }
+    private static func releaseDocumentScript(_ url: URL, token: String, documentID: Int?) -> String {
+        heldDocumentScript(url, token: token, documentID: documentID) + """
+        var state=wfHeldState();
+        try {var doc=wfHeldDocument();if(state.owned)wfCloseDocument(doc);}
+        finally{app.eraseCustomOptions(\(quote(token)));}
+        return wfJSON({width:0,height:0,profile:'',summary:''});
+        """
+    }
     private static let performanceScript = #"""
     var wfPerformance={},wfSequence=0,wfPeak=app.documents.length;
     function wfWrap(name,body) { return function() {

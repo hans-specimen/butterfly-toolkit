@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 import JavaScriptCore
 import ImageIO
 import UniformTypeIdentifiers
@@ -6,6 +7,331 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class WorkflowBridgeTests: XCTestCase {
+    private final class DocumentRuntime {
+        let context = JSContext()!
+        let metadata: String
+        init(metadata: String, nativePathPrefix: String = "") {
+            self.metadata = metadata
+            context.evaluateScript("""
+            var $={global:{}},events=[],nextID=1,customOptions={},app={documents:[]},SaveOptions={DONOTSAVECHANGES:0};
+            function File(path){this.fsName=path;}
+            function openFile(path){var d={id:nextID++,fullName:new File("\(nativePathPrefix)"+path),saved:true};
+                d.close=function(){events.push('close:'+d.id);app.documents=app.documents.filter(function(x){return x!==d;});};
+                app.documents.push(d);app.activeDocument=d;events.push('open:'+d.id);return d;}
+            app.open=function(file){return openFile(file.fsName);};
+            function ActionDescriptor(){this.values={};};['putUnitDouble','putObject'].forEach(function(k){ActionDescriptor.prototype[k]=function(){};});
+            ['Integer','String','Boolean'].forEach(function(type){ActionDescriptor.prototype['put'+type]=function(k,v){this.values[k]=v;};ActionDescriptor.prototype['get'+type]=function(k){return this.values[k];};});
+            function stringIDToTypeID(x){return x;}
+            app.putCustomOptions=function(k,v,persistent){if(persistent)throw new Error('must not persist');customOptions[k]=v;};
+            app.getCustomOptions=function(k){if(!customOptions[k])throw new Error('missing');return customOptions[k];};
+            app.eraseCustomOptions=function(k){delete customOptions[k];};
+            function charIDToTypeID(x){return x;}function executeAction(){};
+            var DialogModes={NO:0};function UnitValue(x){return x;}
+            """)
+        }
+        func run(_ script: String) throws -> String {
+            context.exception = nil
+            context.evaluateScript("$.global={};") // Photoshop resets globals between do-javascript-file calls.
+            let anchor = "function wfHideAll(doc) {for(var i=0;i<doc.layers.length;i++)doc.layers[i].visible=false;}"
+            let overrides = """
+            wfMetadata=function(doc){events.push('inspect:'+doc.fullName.fsName);return \(metadata);};
+            wfRoles=function(doc){return {base:{},adjust:{rotate:function(){},translate:function(){}}};};
+            wfBounds=function(){return [0,0,2,2];};
+            wfSave=function(doc){events.push('save:'+doc.id);};
+            """
+            let result = context.evaluateScript(script.replacingOccurrences(of: "#target photoshop", with: "").replacingOccurrences(of: anchor, with: anchor + overrides))
+            if let error = context.exception?.toString() {
+                if error.contains("WORKFLOW_UNSAVED") { throw WorkflowBridgeError.unsavedDocument }
+                throw WorkflowBridgeError.staleSource
+            }
+            return result?.toString() ?? ""
+        }
+        func events() -> [String] { context.objectForKeyedSubscript("events")?.toArray() as? [String] ?? [] }
+    }
+    func testApplyKeepsDocumentOpenThroughSaveAndCapture() async throws {
+        for (reuse,nativePrefix) in [(false,""),(true,""),(true,"/native")] {
+            let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+            let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+            let runtime = DocumentRuntime(metadata: try await f.runner("metadata"),nativePathPrefix: nativePrefix)
+            let bridge = PhotoshopWorkflowBridge(workspace: f.directory,coordinator: PhotoshopExecutionCoordinator(),scriptRunner: { try await runtime.run($0) },reuseDocumentsWithinOperation: reuse)
+            var solution = ExecutorFixture.solution(saved.contentVersion)
+            solution.angleDegrees = 0; solution.sourceCropRect = CGRect(x: 0,y: 0,width: 2,height: 2); solution.outputSize = CGSize(width: 2,height: 2)
+            let result = try await bridge.applyGeometry(snapshot: saved,solution: solution)
+            XCTAssertEqual(result,saved)
+            let events = runtime.events()
+            XCTAssertEqual(events.filter { $0.hasPrefix("open:") }.count,reuse ? 2 : 4)
+            XCTAssertEqual(events.filter { $0.hasPrefix("close:") }.count,reuse ? 2 : 4)
+            XCTAssertEqual(events.filter { $0.hasPrefix("inspect:") }.count,4,"Keep verify, save metadata and both capture inspections")
+            if reuse { XCTAssertTrue(events.contains("inspect:" + nativePrefix + saved.snapshotURL.path),"Capture must independently inspect saved disk content") }
+            XCTAssertEqual(runtime.context.objectForKeyedSubscript("app")?.forProperty("documents")?.toArray()?.count,0)
+        }
+    }
+    func testDirtyBorrowedDocumentIsNotSavedOrClosed() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata"))
+        let path = String(decoding:try JSONEncoder().encode(f.document.path),as:UTF8.self)
+        runtime.context.evaluateScript("var userDoc=openFile(\(path));userDoc.saved=false;events=[];")
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { try await runtime.run($0) },reuseDocumentsWithinOperation: true)
+        do { _ = try await bridge.applyGeometry(snapshot: saved,solution: ExecutorFixture.solution(saved.contentVersion)); XCTFail("Dirty borrowed document accepted") }
+        catch WorkflowBridgeError.unsavedDocument {}
+        XCTAssertTrue(runtime.events().isEmpty)
+    }
+    func testPhotoshopRestartDoesNotReuseOldDocumentID() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata"))
+        let path = String(decoding:try JSONEncoder().encode(f.document.path),as:UTF8.self)
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            let result = try await runtime.run(script)
+            if script.contains("app.putCustomOptions(") {
+                await MainActor.run { _ = runtime.context.evaluateScript("$.global={};customOptions={};app.documents=[];nextID=1;openFile(\(path));events=[];") }
+            }
+            return result
+        },reuseDocumentsWithinOperation: true)
+        do { _ = try await bridge.applyGeometry(snapshot: saved,solution: ExecutorFixture.solution(saved.contentVersion)); XCTFail("Restarted Photoshop reused old ID") }
+        catch WorkflowBridgeError.staleSource {}
+        XCTAssertTrue(runtime.events().isEmpty,"Never save/close the replacement document")
+        XCTAssertEqual(runtime.context.objectForKeyedSubscript("app")?.forProperty("documents")?.toArray()?.count,1)
+    }
+    func testOwnedDocumentBecomingDirtyIsNotDiscardedDuringCleanup() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata"))
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            let result = try await runtime.run(script)
+            if script.contains("wfSave(doc);return") {
+                await MainActor.run { _ = runtime.context.evaluateScript("app.activeDocument.saved=false;") }
+            }
+            return result
+        },reuseDocumentsWithinOperation: true)
+        var solution = ExecutorFixture.solution(saved.contentVersion)
+        solution.sourceCropRect = CGRect(x:0,y:0,width:2,height:2); solution.outputSize = CGSize(width:2,height:2)
+        do { _ = try await bridge.applyGeometry(snapshot: saved,solution: solution); XCTFail("Dirty document discarded") }
+        catch WorkflowBridgeError.unsavedDocument {}
+        XCTAssertFalse(runtime.events().contains { $0.hasPrefix("close:") })
+    }
+    func testPauseWaitsForDocumentCleanupBeforeManualLease() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata")), gate = Gate(), lease = PhotoshopExecutionCoordinator()
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,coordinator: lease,scriptRunner: { script in
+            if script.contains("finally{app.eraseCustomOptions(") { await gate.suspend() }
+            return try await runtime.run(script)
+        },reuseDocumentsWithinOperation: true)
+        var solution = ExecutorFixture.solution(saved.contentVersion)
+        solution.sourceCropRect = CGRect(x:0,y:0,width:2,height:2); solution.outputSize = CGSize(width:2,height:2)
+        let work = Task { try await bridge.applyGeometry(snapshot: saved,solution: solution) }
+        while await gate.values().isEmpty { await Task.yield() }
+        work.cancel()
+        let manual = Task { try await lease.beginManualEditing(owner: f.owner); await gate.append(2) }
+        for _ in 0..<100 { await Task.yield() }
+        let waiting = await gate.values(); XCTAssertEqual(waiting,[1])
+        await gate.finish(); _ = try await work.value; try await manual.value
+        await lease.endManualEditing(owner: f.owner)
+        let done = await gate.values(); XCTAssertEqual(done,[1,2])
+        XCTAssertEqual(runtime.context.objectForKeyedSubscript("app")?.forProperty("documents")?.toArray()?.count,0)
+    }
+    func testCleanBorrowedDocumentRemainsOpenAfterGeometry() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata")), log = PerformanceLog()
+        let path = String(decoding:try JSONEncoder().encode(f.document.path),as:UTF8.self)
+        runtime.context.evaluateScript("var userDoc=openFile(\(path));events=[];")
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { try await runtime.run($0) },performanceObserver: { log.append($0) },reuseDocumentsWithinOperation: true)
+        var solution = ExecutorFixture.solution(saved.contentVersion)
+        solution.sourceCropRect = CGRect(x:0,y:0,width:2,height:2); solution.outputSize = CGSize(width:2,height:2)
+        _ = try await bridge.applyGeometry(snapshot: saved,solution: solution)
+        XCTAssertFalse(runtime.events().contains("close:1"))
+        XCTAssertEqual(runtime.context.objectForKeyedSubscript("app")?.forProperty("documents")?.toArray()?.count,1)
+        XCTAssertTrue(log.values().allSatisfy { $0.taskID == f.owner },"Detached cleanup retains observation attribution")
+    }
+    func testInvalidAcquisitionResponseStillClosesOwnedDocument() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let saved = try await PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner).refreshSavedPSD(document: f.document,owner: f.owner)
+        let runtime = DocumentRuntime(metadata: try await f.runner("metadata"))
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            let result = try await runtime.run(script)
+            return script.contains("app.putCustomOptions(") ? "invalid response" : result
+        },reuseDocumentsWithinOperation: true)
+        do { _ = try await bridge.applyGeometry(snapshot: saved,solution: ExecutorFixture.solution(saved.contentVersion)); XCTFail("Invalid acquisition response accepted") }
+        catch is DecodingError {}
+        XCTAssertEqual(runtime.events(),["open:1","close:1"])
+        XCTAssertEqual(runtime.context.objectForKeyedSubscript("app")?.forProperty("documents")?.toArray()?.count,0)
+    }
+    private actor ReuseFaults {
+        var checkpoints: [String] = []
+        var geometrySaved = false
+        var geometryInterrupted = false
+        func checkpoint(_ point: PhotoshopInstallCheckpoint, enabled: Bool) throws {
+            let name = point == .prepared ? "prepared" : "published"
+            let first = !checkpoints.contains(name); checkpoints.append(name)
+            if enabled && first { throw WorkflowBridgeError.photoshop("injected after " + name) }
+        }
+        func afterScript(_ script: String) throws {
+            if script.contains("d.putBoolean(charIDToTypeID('Dlt '),false)") { geometrySaved = true }
+            if geometrySaved && !geometryInterrupted && script.contains("finally{app.eraseCustomOptions(") {
+                geometryInterrupted = true
+                throw WorkflowBridgeError.photoshop("injected after geometry cleanup")
+            }
+        }
+    }
+    func testInstallReusesOnlyLeaseOwnedDocumentsAndPublicationReplacesHandleWhenRequested() async throws {
+        let env = ProcessInfo.processInfo.environment
+        if let retained = env["WORKFLOW_REUSE_COMPARE"] {
+            try verifyReusePixels(in: WorkflowPipelinePerformanceTests.isolatedEvidenceRoot(retained),python: XCTUnwrap(env["WORKFLOW_PNG_PYTHON"]))
+            return
+        }
+        guard let destination = env["WORKFLOW_REUSE_EVIDENCE"] else { throw XCTSkip("Real document reuse comparison is opt-in") }
+        let root = try WorkflowPipelinePerformanceTests.isolatedEvidenceRoot(destination), fm = FileManager.default
+        guard !fm.fileExists(atPath: root.path) else { throw WorkflowBridgeError.ownershipConflict }
+        let fixture = try JSONDecoder().decode([String:String].self,from: Data(contentsOf: URL(fileURLWithPath: XCTUnwrap(env["WORKFLOW_REUSE_FIXTURE"]))))
+        try fm.createDirectory(at: root,withIntermediateDirectories: true)
+        func quote(_ url: URL) throws -> String {
+            // Foundation can preserve /tmp while PS fullName uses /private/tmp.
+            let path = try XCTUnwrap(realpath(url.path,nil)); defer { free(path) }
+            return String(decoding:try JSONEncoder().encode(String(cString:path)),as:UTF8.self)
+        }
+        func cleanup() async {
+            _ = try? await PhotoshopWorkflowBridge.execute("""
+            (function(){for(var i=app.documents.length-1;i>=0;i--){var d=app.documents[i];try{
+                if(d.fullName.fsName.indexOf(\(try quote(root))+'/')===0 && d.saved)d.close(SaveOptions.DONOTSAVECHANGES);
+            }catch(e){}}return 'cleaned';}());
+            """)
+        }
+        var variants: [(String,RoleImages,URL,URL,URL)] = []
+        var firstSolution: GeometrySolution?
+        do {
+            for reuse in [false,true] {
+                if !reuse, let previous = env["WORKFLOW_REUSE_BASELINE"] {
+                    let folder = try WorkflowPipelinePerformanceTests.isolatedEvidenceRoot(previous)
+                    let snapshot = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: folder.appendingPathComponent("final-snapshot.json")))
+                    struct CachedRoles: Decodable { let snapshot: PSDSnapshot; let images: RoleImages }
+                    let cache = folder.appendingPathComponent("role-cache/\(snapshot.taskID)")
+                    let entries = try fm.contentsOfDirectory(at: cache,includingPropertiesForKeys: nil).map {
+                        try JSONDecoder().decode(CachedRoles.self,from: Data(contentsOf: $0))
+                    }
+                    let finalRoles = try XCTUnwrap(entries.first { $0.snapshot.contentVersion == snapshot.contentVersion }).images
+                    let installedRoles = try XCTUnwrap(entries.first { $0.snapshot.contentVersion != snapshot.contentVersion }).images
+                    firstSolution = try await WorkflowGeometryCache().geometry(source: installedRoles,request: GeometryRequest())
+                    let inputs = folder.appendingPathComponent("data/processed/\(snapshot.taskID)")
+                    let input = try XCTUnwrap(fm.contentsOfDirectory(at: inputs,includingPropertiesForKeys: nil).first { $0.pathExtension == "png" })
+                    variants.append(("original",finalRoles,input,folder.appendingPathComponent("final.jpg"),folder.appendingPathComponent("final.png")))
+                    continue
+                }
+                let label = reuse ? "reuse" : "original", folder = root.appendingPathComponent(label), owner = UUID()
+                try fm.createDirectory(at: folder,withIntermediateDirectories: true)
+                let document = folder.appendingPathComponent("stack.psd"), alpha = folder.appendingPathComponent("alpha.png"), cutout = folder.appendingPathComponent("cutout.png")
+                for (key, target) in [("stack",document),("alpha",alpha),("cutout",cutout)] {
+                    try WorkflowPipelinePerformanceTests.copyFixture(URL(fileURLWithPath: XCTUnwrap(fixture[key])),to: target,in: root)
+                }
+                try fm.setAttributes([.posixPermissions:0o644],ofItemAtPath: document.path)
+                try JSONSerialization.data(withJSONObject:["owner":owner.uuidString]).write(to: document.appendingPathExtension("workflow-owner.json"))
+                let samples = PerformanceLog(), faults = ReuseFaults()
+                defer { try? JSONEncoder().encode(samples.values()).write(to: folder.appendingPathComponent("operations.json")) }
+                let bridge = PhotoshopWorkflowBridge(workspace: folder,coordinator: PhotoshopExecutionCoordinator(),scriptRunner: { script in
+                    let result: String
+                    do { result = try await PhotoshopWorkflowBridge.execute(script) }
+                    catch {
+                        try? script.write(to: folder.appendingPathComponent("failed-script.jsx"),atomically: true,encoding: .utf8)
+                        throw error
+                    }
+                    if reuse { try await faults.afterScript(script) }
+                    return result
+                },installCheckpoint: { try await faults.checkpoint($0,enabled: reuse) },performanceObserver: { samples.append($0) },reuseDocumentsWithinOperation: reuse)
+                let snapshot = try await bridge.refreshSavedPSD(document: document,owner: owner)
+                let input = try await bridge.exportStackPNG(snapshot: snapshot)
+                let matte = try MatteArtifact(inputPNGFingerprint: input.fingerprint,alphaURL: alpha,alphaFingerprint: AIFileValidation.hash(alpha.path),cutoutURL: cutout,cutoutFingerprint: AIFileValidation.hash(cutout.path),orientation: 1,pixelSize: snapshot.pixelSize)
+                var borrowedID: Int?
+                if reuse {
+                    let result = try await PhotoshopWorkflowBridge.execute("var task3Borrowed=app.open(new File(\(try quote(document))));String(task3Borrowed.id);")
+                    borrowedID = try XCTUnwrap(Int(result))
+                    try result.write(to: folder.appendingPathComponent("borrowed-before-id.txt"),atomically: true,encoding: .utf8)
+                }
+                let start = ProcessInfo.processInfo.systemUptime
+                if reuse {
+                    for checkpoint in ["prepared","published"] {
+                        do { _ = try await bridge.installMatte(snapshot: snapshot,matte: matte); XCTFail("Expected interruption at \(checkpoint)") }
+                        catch WorkflowBridgeError.photoshop(let message) { XCTAssertTrue(message.contains("injected after " + checkpoint)) }
+                    }
+                }
+                let installed = try await bridge.installMatte(snapshot: snapshot,matte: matte)
+                let installSeconds = ProcessInfo.processInfo.systemUptime - start
+                if let borrowedID {
+                    let result = try await PhotoshopWorkflowBridge.execute("""
+                    (function(){for(var i=0;i<app.documents.length;i++){var d=app.documents[i];try{
+                        if(d.fullName.fsName===\(try quote(document))){var id=d.id;if(!d.saved)throw new Error('dirty fixture');d.close(SaveOptions.DONOTSAVECHANGES);return String(id);}
+                    }catch(e){throw e;}}return 'missing';}());
+                    """)
+                    let newID = try XCTUnwrap(Int(result),"The borrowed published document must remain open after service cleanup")
+                    XCTAssertNotEqual(newID,borrowedID,"Publication must replace the old document handle")
+                    try result.write(to: folder.appendingPathComponent("borrowed-after-id.txt"),atomically: true,encoding: .utf8)
+                }
+                let roles = try await bridge.extractRoles(snapshot: installed)
+                let solution = try await WorkflowGeometryCache().geometry(source: roles,request: GeometryRequest())
+                XCTAssertTrue(solution.isApplicable)
+                if var expected = firstSolution { expected.sourceVersion = solution.sourceVersion; XCTAssertEqual(solution,expected) }
+                else { firstSolution = solution }
+                let geometryStart = ProcessInfo.processInfo.systemUptime
+                let transformed: PSDSnapshot
+                if reuse {
+                    do { _ = try await bridge.applyGeometry(snapshot: installed,solution: solution); XCTFail("Geometry interruption missing") }
+                    catch WorkflowBridgeError.photoshop(let message) { XCTAssertTrue(message.contains("injected after geometry cleanup")) }
+                    do { _ = try await bridge.applyGeometry(snapshot: installed,solution: solution); XCTFail("Old snapshot rotated twice") }
+                    catch WorkflowBridgeError.staleSource {} catch WorkflowBridgeError.invalidStructure {}
+                    transformed = try await bridge.refreshSavedPSD(document: document,owner: owner)
+                } else { transformed = try await bridge.applyGeometry(snapshot: installed,solution: solution) }
+                let geometrySeconds = ProcessInfo.processInfo.systemUptime - geometryStart
+                let resultRoles = try await bridge.extractRoles(snapshot: transformed)
+                let hd = folder.appendingPathComponent("final.jpg"), png4k = folder.appendingPathComponent("final.png")
+                let renderStart = ProcessInfo.processInfo.systemUptime
+                let renderer = WorkflowAssetRenderer()
+                try renderer.renderHD(roles: resultRoles,destination: hd)
+                try renderer.render4K(roles: resultRoles,layout: .png4k,destination: png4k)
+                let record: [String:Any] = ["installIncludingInjectedRecoverySeconds":installSeconds,"geometryIncludingInjectedRecoverySeconds":geometrySeconds,"renderSeconds":ProcessInfo.processInfo.systemUptime-renderStart,"injectedRecovery":reuse]
+                try JSONSerialization.data(withJSONObject:record,options:[.prettyPrinted,.sortedKeys]).write(to: folder.appendingPathComponent("timing.json"))
+                try JSONEncoder().encode(samples.values()).write(to: folder.appendingPathComponent("operations.json"))
+                try JSONEncoder().encode(transformed).write(to: folder.appendingPathComponent("final-snapshot.json"))
+                variants.append((label,resultRoles,input.pngURL,hd,png4k))
+            }
+            let a = variants[0], b = variants[1]
+            for (name,left,right) in [("input",a.2,b.2),("base",a.1.basePNG,b.1.basePNG),("mask",a.1.maskPNG,b.1.maskPNG),("cutout",a.1.cutoutPNG,b.1.cutoutPNG),("4k",a.4,b.4)] {
+                let folder = root.appendingPathComponent(name); try fm.createDirectory(at: folder,withIntermediateDirectories: true)
+                try JSONSerialization.data(withJSONObject:["legacy":["png":left.path],"fast":["png":right.path]]).write(to: folder.appendingPathComponent("run-1.json"))
+            }
+            let left = try WorkflowRaster.read(a.3), right = try WorkflowRaster.read(b.3)
+            XCTAssertEqual(left.pixels,right.pixels); XCTAssertEqual(left.profileData,right.profileData); XCTAssertEqual(left.size,right.size)
+            try verifyReusePixels(in: root,python: XCTUnwrap(env["WORKFLOW_PNG_PYTHON"]))
+            await cleanup()
+        } catch { await cleanup(); throw error }
+    }
+    private func verifyReusePixels(in root: URL, python: String) throws {
+        let verifier = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("scripts/verify_workflow_png_pairs.py")
+        let process = Process(), output = Pipe(); process.executableURL = URL(fileURLWithPath: python)
+        // Inputs/roles require ICC. Existing final 4K output uses the PNG sRGB chunk;
+        // both paths must still match every raw pixel, color tag, orientation and bit depth.
+        let comparison = """
+        import json,runpy,sys
+        from pathlib import Path
+        read=runpy.run_path(sys.argv[1])['read_png']
+        checks=[]
+        for record in sorted(Path(sys.argv[2]).glob('*/run-*.json')):
+            pair=json.loads(record.read_text())
+            before,after=(read(pair[k]['png']) for k in ('legacy','fast'))
+            differences=[k for k in before if before[k]!=after[k]]
+            if record.parent.name=='4k':
+                if not after['icc'] and after['srgb'] is None: differences.append('missingColorSpace')
+            elif not after['icc']: differences.append('missingICC')
+            checks.append({'record':str(record),'differences':differences})
+        passed=len(checks)==5 and all(not c['differences'] for c in checks)
+        print(json.dumps({'passed':passed,'checks':checks},indent=2))
+        sys.exit(0 if passed else 1)
+        """
+        process.arguments = ["-c",comparison,verifier.path,root.path]; process.standardOutput = output; process.standardError = output
+        try process.run(); let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        try data.write(to: root.appendingPathComponent("raw-pixel-final-comparison.json"))
+        XCTAssertEqual(process.terminationStatus,0,String(decoding:data,as:UTF8.self))
+    }
     private nonisolated final class PerformanceLog: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: [WorkflowPerformanceSample] = []
