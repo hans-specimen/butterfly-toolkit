@@ -6,17 +6,17 @@ struct AboutView: View {
     // ==========================
     // 自动读取 App 版本号
     // ==========================
-    // 对应 Xcode -> TARGET -> General -> Version
+    // 由 Config/Version.xcconfig 写入构建产物
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "未知"
     }
 
     // ==========================
     // 自动读取 Build 号
     // ==========================
-    // 对应 Xcode -> TARGET -> General -> Build
+    // 与应用版本共用同一份配置
     private var buildNumber: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "未知"
     }
 
     var body: some View {

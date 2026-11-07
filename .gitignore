@@ -32,6 +32,8 @@ Pods/
 Carthage/Build/
 
 # Temporary and local working files
+__pycache__/
+*.pyc
 staging/
 *.tmp
 *.temp
