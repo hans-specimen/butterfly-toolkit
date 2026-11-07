@@ -629,14 +629,9 @@ actor WorkflowExecutor {
 
     private func readCurrentRoles(_ batchID: UUID, _ before: WorkflowSideTask, stage: WorkflowStage) async throws -> RoleImages {
         guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
-        let saved = try await services.refresh(snapshot.workingURL,before.id,nil)
+        let roles = try await services.extract(snapshot)
         try check(batchID,before,stage: stage)
-        guard saved.taskID == snapshot.taskID, saved.workingURL == snapshot.workingURL,
-              saved.contentVersion == snapshot.contentVersion, saved.roles == snapshot.roles,
-              saved.pixelSize == snapshot.pixelSize, saved.structureSummary == snapshot.structureSummary else { throw WorkflowStateError.staleVersion }
-        let roles = try await services.extract(saved)
-        try check(batchID,before,stage: stage)
-        guard roles.snapshotVersion == saved.contentVersion else { throw WorkflowStateError.staleVersion }
+        guard roles.snapshotVersion == snapshot.contentVersion else { throw WorkflowStateError.staleVersion }
         try mutateTask(batchID,before.id) { $0.roleImages = roles }
         return roles
     }

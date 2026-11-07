@@ -307,6 +307,37 @@ final class WorkflowBridgeTests: XCTestCase {
         XCTAssertEqual(extractions.count,1,"Refreshing and exporting an unchanged PSD must not re-export intermediate PNGs")
         XCTAssertEqual(try Data(contentsOf: f.document),Data("saved-role-psd".utf8))
     }
+    func testCachedExtractionInspectsOnceAndRejectsDeletedRolesOrSavingSource() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
+        let saved = try await bridge.refreshSavedPSD(document: f.document,owner: f.owner)
+        let expected = try await bridge.extractRoles(snapshot: saved), calls = Gate()
+        let reopened = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            await calls.append(1)
+            return try await f.runner(script)
+        })
+        let actual = try await reopened.extractRoles(snapshot: saved)
+        XCTAssertEqual(actual,expected)
+        let inspections = await calls.values(), exports = await f.calls.values()
+        XCTAssertEqual(inspections,[1],"A warm confirmation read needs exactly one Photoshop inspection")
+        XCTAssertEqual(exports,[1],"The initial cache population is the only role export")
+        let deleted = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            let result = try await f.runner(script)
+            var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String:Any])
+            metadata.removeValue(forKey: "roles")
+            return String(decoding: try JSONSerialization.data(withJSONObject: metadata),as: UTF8.self)
+        })
+        do { _ = try await deleted.extractRoles(snapshot: saved); XCTFail("Deleted role accepted on cache hit") }
+        catch { XCTAssertEqual(error as? WorkflowBridgeError,.invalidStructure) }
+        let saving = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: { script in
+            let result = try await f.runner(script)
+            try Data("save-in-progress".utf8).write(to: f.document)
+            return result
+        })
+        do { _ = try await saving.extractRoles(snapshot: saved); XCTFail("Concurrent save accepted on cache hit") }
+        catch { XCTAssertEqual(error as? WorkflowBridgeError,.staleSource) }
+        let finalExports = await f.calls.values(); XCTAssertEqual(finalExports,[1])
+    }
     func testPublishedCopyReusesRoleExtractionWithoutTrustingWorkingPath() async throws {
         let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
         let bridge = PhotoshopWorkflowBridge(workspace: f.directory,scriptRunner: f.runner)
@@ -525,6 +556,72 @@ final class WorkflowBridgeTests: XCTestCase {
                 XCTAssertEqual(try AIFileValidation.hash(source.snapshotURL.path),source.contentVersion)
                 XCTAssertEqual(try AIFileValidation.hash(publishedURL.path),source.contentVersion)
             }
+        }
+    }
+    // Measure the confirmation read separately from the older refresh + extract benchmark.
+    func testRealConfirmationRoleReadWhenRequested() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let batchPath = environment["WORKFLOW_CONFIRMATION_BATCH"],let evidencePath = environment["WORKFLOW_CONFIRMATION_EVIDENCE"] else {
+            throw XCTSkip("Real Photoshop confirmation read verification is opt-in")
+        }
+        let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: batchPath)))
+        let evidence = URL(fileURLWithPath: evidencePath)
+        guard !FileManager.default.fileExists(atPath: evidence.path) else { throw WorkflowBridgeError.ownershipConflict }
+        try FileManager.default.createDirectory(at: evidence,withIntermediateDirectories: true)
+        for task in batch.activeTasks {
+            let source = try XCTUnwrap(task.snapshot)
+            let folder = evidence.appendingPathComponent(source.workingURL.deletingPathExtension().lastPathComponent)
+            try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
+            let document = folder.appendingPathComponent("fixture.psd")
+            XCTAssertEqual(try AIFileValidation.hash(source.snapshotURL.path),source.contentVersion)
+            try FileManager.default.copyItem(at: source.snapshotURL,to: document)
+            let ownership: [String:Any] = ["owner":source.taskID.uuidString,
+                "roles":try JSONSerialization.jsonObject(with: JSONEncoder().encode(XCTUnwrap(source.roles)))]
+            try JSONSerialization.data(withJSONObject: ownership).write(to: document.appendingPathExtension("workflow-owner.json"),options: .withoutOverwriting)
+            let calls = Gate()
+            let runner: PhotoshopWorkflowBridge.ScriptRunner = { script in
+                await calls.append(script.contains("wfRolePNG(copy,") ? 2 : 1)
+                return try await PhotoshopWorkflowBridge.execute(script)
+            }
+            let bridge = PhotoshopWorkflowBridge(workspace: folder,scriptRunner: runner)
+            let coldStart = Date()
+            let saved = try await bridge.refreshSavedPSD(document: document,owner: source.taskID)
+            let initial = try await bridge.extractRoles(snapshot: saved)
+            let coldSeconds = Date().timeIntervalSince(coldStart)
+            let urls = [initial.basePNG,initial.cutoutPNG,initial.maskPNG]
+            let hashes = try urls.map { try AIFileValidation.hash($0.path) }
+            try JSONEncoder().encode(initial).write(to: folder.appendingPathComponent("roles.json"))
+            try JSONEncoder().encode(XCTUnwrap(task.roleImages)).write(to: folder.appendingPathComponent("reference-roles.json"))
+            var runs: [[String:Any]] = []
+            for repetition in 1...3 {
+                var row: [String:Any] = ["repetition":repetition]
+                for legacy in (repetition % 2 == 1 ? [true,false] : [false,true]) {
+                    let startCalls = await calls.values().count, start = Date()
+                    let reopened = PhotoshopWorkflowBridge(workspace: folder,scriptRunner: runner)
+                    let current: RoleImages
+                    if legacy {
+                        let refreshed = try await reopened.refreshSavedPSD(document: document,owner: source.taskID)
+                        XCTAssertEqual(refreshed,saved)
+                        current = try await reopened.extractRoles(snapshot: refreshed)
+                    } else {
+                        current = try await reopened.extractRoles(snapshot: saved)
+                    }
+                    let seconds = Date().timeIntervalSince(start)
+                    let operations = Array((await calls.values()).dropFirst(startCalls))
+                    let key = legacy ? "cachedRefreshAndExtract" : "confirmationSingleExtract"
+                    row[key + "Seconds"] = seconds
+                    row[key + "Inspections"] = operations.filter { $0 == 1 }.count
+                    row[key + "RoleExports"] = operations.filter { $0 == 2 }.count
+                    XCTAssertEqual(operations,Array(repeating: 1,count: legacy ? 3 : 1))
+                    XCTAssertEqual(current,initial)
+                    XCTAssertEqual(try urls.map { try AIFileValidation.hash($0.path) },hashes,"Raw PNG bytes, including ICC and transparent RGB, must remain identical")
+                }
+                runs.append(row)
+            }
+            let summary: [String:Any] = ["coldRefreshAndExtractSeconds":coldSeconds,"runs":runs,"roleHashes":hashes,"sourceVersion":source.contentVersion]
+            try JSONSerialization.data(withJSONObject: summary,options: [.prettyPrinted,.sortedKeys]).write(to: folder.appendingPathComponent("timings.json"))
+            XCTAssertEqual(try AIFileValidation.hash(document.path),source.contentVersion)
+            XCTAssertEqual(try AIFileValidation.hash(source.snapshotURL.path),source.contentVersion)
         }
     }
     // Opt-in: un-matted stacks, including a soft-alpha foreground over a blue preview-only layer.

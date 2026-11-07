@@ -442,13 +442,59 @@ extension WorkflowExecutorTests {
 }
 
 extension WorkflowExecutorTests {
+    func testConfirmationUsesSingleVerifiedExtraction() async throws {
+        for phase in ["initialGeometry", "geometryAgain", "png4k"] {
+            let (f,initial) = try await ready(count: 2)
+            if phase != "initialGeometry" { try await geometry(f,initial,exportHD: false,count: 1) }
+            let before = try await initial.batch(batchID: f.batch.id)
+            let selected = [before.specimens[0].front,before.specimens[0].back]
+            let reads = ExecutorProbe()
+            var services = f.services
+            let refresh = services.refresh
+            services.refresh = { url,owner,sources in
+                await reads.record("refresh")
+                return try await refresh(url,owner,sources)
+            }
+            services.extract = { snapshot in
+                await reads.record("\(snapshot.taskID)/\(snapshot.contentVersion)")
+                var roles = ExecutorFixture.roles(snapshot)
+                roles.basePNG = snapshot.workingURL.appendingPathExtension("verified.png")
+                return roles
+            }
+            let e = WorkflowExecutor(services: services)
+            _ = try await e.register(manifestURL: f.manifest)
+            if phase != "png4k" {
+                try await e.confirmGeometry(batchID: before.id,solutions: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,$0.geometrySolution!) }),exportHD: false)
+            } else {
+                try await e.confirm4K(batchID: before.id,layouts: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,$0.squareLayout) }))
+            }
+            let calls = await reads.values(), after = try await e.batch(batchID: before.id)
+            XCTAssertEqual(calls.filter { $0 == "refresh" }.count,0)
+            for task in selected {
+                XCTAssertEqual(calls.filter { $0 == "\(task.id)/\(task.snapshot!.contentVersion)" }.count,1)
+                // First confirmation must still read the new saved version after applying geometry.
+                XCTAssertEqual(calls.filter { $0.hasPrefix("\(task.id)/") }.count,phase == "initialGeometry" ? 2 : 1)
+                XCTAssertEqual(after.task(id: task.id)?.roleImages?.basePNG,task.snapshot!.workingURL.appendingPathExtension("verified.png"))
+            }
+            XCTAssertEqual(after.specimens[1],before.specimens[1],"Confirmation must not approve or replace roles for an unselected specimen")
+        }
+    }
     func testSavedPSDChangedOutsideExecutorRejectsGeometryConfirmation() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let (f,initial) = try await ready()
+        let before = try await initial.batch(batchID: f.batch.id)
+        var changed = before.activeTasks[0].snapshot!
+        changed.contentVersion = "unrefreshed-manual-edit"
+        try JSONEncoder().encode(changed).write(to: changed.workingURL)
         var services = f.services
-        services.refresh = { url,owner,_ in ExecutorFixture.snapshot(owner,url,"unrefreshed-manual-edit",roles: true) }
+        services.extract = { snapshot in
+            let saved = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: snapshot.workingURL))
+            guard saved == snapshot else { throw WorkflowBridgeError.staleSource }
+            return ExecutorFixture.roles(snapshot)
+        }
         let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-        do { try await geometry(f,e); XCTFail("stale saved PSD accepted") } catch WorkflowStateError.staleVersion {}
+        _ = try await e.register(manifestURL: f.manifest)
+        do { try await geometry(f,e); XCTFail("stale saved PSD accepted") }
+        catch WorkflowBridgeError.staleSource {} catch WorkflowStateError.staleVersion {}
         let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
     }
 }
@@ -525,19 +571,19 @@ extension WorkflowExecutorTests {
         for presetChange in [false,true] {
             let (f,initial) = try await ready(); try await geometry(f,initial)
             let b = try await initial.batch(batchID: f.batch.id), barrier = ExecutorBarrier(), count = ExecutorInterruption()
-            var services = f.services; let refresh = services.refresh
-            services.refresh = { url,owner,sources in
+            var services = f.services; let extract = services.extract
+            services.extract = { snapshot in
                 let index = count.next()
-                if index == 1 { await f.probe.record("read-owner-\(owner.uuidString)") }
+                if index == 1 { await f.probe.record("read-owner-\(snapshot.taskID.uuidString)") }
                 if index == 2 { await barrier.wait() }
-                return try await refresh(url,owner,sources)
+                return try await extract(snapshot)
             }
             let e = WorkflowExecutor(services: services)
             _ = try await e.register(manifestURL: f.manifest)
             let work = Task { try await self.square(f,e) }
             while !(await barrier.entered) { await Task.yield() }
-            // Exactly the first-read side must change; the probe records refresh ordering deterministically.
-            let firstOwner = await servicesOwnerFromRefreshOrder(f: f, batch: b)
+            // Exactly the first-read side must change; the probe records extraction ordering deterministically.
+            let firstOwner = await servicesOwnerFromExtractOrder(f: f, batch: b)
             if presetChange {
                 let current = try await e.batch(batchID: b.id)
                 try await e.update(batchID: b.id,event: .presetChanged(scope: .png4k,preset: WorkflowPreset(version: 2,fingerprint: "during-read"),expectedRevision: current.revision))
@@ -554,7 +600,7 @@ extension WorkflowExecutorTests {
             XCTAssertFalse(after.activeTasks.flatMap(\.artifacts).contains { $0.kind == .png4k && $0.state == .completed })
         }
     }
-    private func servicesOwnerFromRefreshOrder(f: ExecutorFixture, batch: WorkflowBatch) async -> UUID {
+    private func servicesOwnerFromExtractOrder(f: ExecutorFixture, batch: WorkflowBatch) async -> UUID {
         let values = await f.probe.values()
         let owner = values.last { $0.hasPrefix("read-owner-") }.map { String($0.dropFirst("read-owner-".count)) }
         return owner.flatMap(UUID.init(uuidString:)) ?? batch.activeTasks[0].id
