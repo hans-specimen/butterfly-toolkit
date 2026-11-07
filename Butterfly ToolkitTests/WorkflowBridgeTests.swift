@@ -527,6 +527,120 @@ final class WorkflowBridgeTests: XCTestCase {
             }
         }
     }
+    // Opt-in: un-matted stacks, including a soft-alpha foreground over a blue preview-only layer.
+    func testRealStackInputFastPNGPreservesPixelsWhenRequested() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let evidencePath = environment["WORKFLOW_PNG_EVIDENCE"] else {
+            throw XCTSkip("Real Photoshop stack PNG verification is opt-in")
+        }
+        let evidence = URL(fileURLWithPath: evidencePath)
+        let python = try XCTUnwrap(environment["WORKFLOW_PNG_PYTHON"],"Set WORKFLOW_PNG_PYTHON to the AI project's Python with Pillow")
+        try FileManager.default.createDirectory(at: evidence,withIntermediateDirectories: true)
+        func quoted(_ url: URL) throws -> String { String(decoding: try JSONEncoder().encode(url.path),as: UTF8.self) }
+        let foreground = evidence.appendingPathComponent("soft-alpha.png")
+        try png(foreground,width:5,height:1,pixels:[12,34,56,0,23,45,67,1,99,88,77,64,90,80,70,128,255,128,1,255])
+        var fixtures: [(String,URL)] = []
+        for (label,bits,srgb) in [("srgb-8",8,true),("adobe-8",8,false),("srgb-16",16,true)] {
+            let document = evidence.appendingPathComponent("soft-alpha-\(label).psd")
+            _ = try await PhotoshopWorkflowBridge.execute("""
+                (function(){
+                    var doc=app.open(new File(\(try quoted(foreground))));
+                    try {
+                        if(\(srgb ? "true" : "false"))doc.convertProfile('sRGB IEC61966-2.1',Intent.RELATIVECOLORIMETRIC,true,false);
+                        if(\(bits)===16)doc.bitsPerChannel=BitsPerChannelType.SIXTEEN;
+                        var subject=doc.activeLayer,blue=doc.artLayers.add();blue.name='Background #74BFFF';
+                        var color=new SolidColor();color.rgb.red=116;color.rgb.green=191;color.rgb.blue=255;
+                        doc.selection.selectAll();doc.selection.fill(color);doc.selection.deselect();
+                        blue.move(subject,ElementPlacement.PLACEAFTER);blue.visible=true;
+                        var options=new PhotoshopSaveOptions();options.layers=true;options.embedColorProfile=true;
+                        doc.saveAs(new File(\(try quoted(document))),options,true,Extension.LOWERCASE);
+                        return 'created';
+                    }finally{doc.close(SaveOptions.DONOTSAVECHANGES);}
+                }());
+                """)
+            fixtures.append(("soft-alpha-\(label)",document))
+        }
+        if let fixturePath = environment["WORKFLOW_STACK_FIXTURES"] {
+            let records = try JSONDecoder().decode([[String:String]].self,from: Data(contentsOf: URL(fileURLWithPath: fixturePath)))
+            for record in records {
+                fixtures.append((try XCTUnwrap(record["name"]),URL(fileURLWithPath: try XCTUnwrap(record["source"]))))
+            }
+        }
+        for (name,source) in fixtures {
+            let sourceHash = try AIFileValidation.hash(source.path)
+            let folder = evidence.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
+            let document = folder.appendingPathComponent("stack.psd"),owner = UUID()
+            try FileManager.default.copyItem(at: source,to: document)
+            try JSONSerialization.data(withJSONObject: ["owner":owner.uuidString]).write(to: document.appendingPathExtension("workflow-owner.json"),options: .withoutOverwriting)
+            let bridge = PhotoshopWorkflowBridge(workspace: folder,coordinator: PhotoshopExecutionCoordinator())
+            let snapshot = try await bridge.refreshSavedPSD(document: document,owner: owner)
+            XCTAssertNil(snapshot.roles,"This fixture must be an un-matted stack, not extracted roles")
+            for repetition in 1...3 {
+                var results: [String:Any] = [:]
+                // Alternate order to reduce warm-cache bias; both exports read the same immutable PSD.
+                for mode in repetition.isMultiple(of:2) ? ["fast","legacy"] : ["legacy","fast"] {
+                    let calls = Gate()
+                    let runner: PhotoshopWorkflowBridge.ScriptRunner = { script in
+                        var actual = script
+                        if mode == "legacy" {
+                            actual = actual.replacingOccurrences(of:"wfStackPNG(copy,",with:"wfPNG(copy,")
+                        }
+                        // Count executed encoders, including the fast helper's mode/bit-depth fallback.
+                        actual = "var wfQuickSaves=0,wfLegacySaves=0;\n" + actual
+                            .replacingOccurrences(of:"function wfPNG(doc,path) {",with:"function wfPNG(doc,path) {wfLegacySaves++;")
+                            .replacingOccurrences(of:"executeAction(s('save'),d,DialogModes.NO);",with:"wfQuickSaves++;executeAction(s('save'),d,DialogModes.NO);")
+                            .replacingOccurrences(of:"\n(function(){",with:"\nvar wfEncodedResult=(function(){")
+                        actual += "\nvar wfMeasured=eval('('+wfEncodedResult+')');wfMeasured.quickSaves=wfQuickSaves;wfMeasured.legacySaves=wfLegacySaves;wfJSON(wfMeasured);"
+                        try actual.write(to:folder.appendingPathComponent("\(mode)-script.jsx"),atomically:true,encoding:.utf8)
+                        let result: String
+                        do { result = try await PhotoshopWorkflowBridge.execute(actual) }
+                        catch { XCTFail("Photoshop \(name) \(mode): \(error)"); throw error }
+                        try result.write(to:folder.appendingPathComponent("\(mode)-metadata.json"),atomically:true,encoding:.utf8)
+                        let measured = try JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String:Any]
+                        for _ in 0..<(measured?["quickSaves"] as? Int ?? 0) { await calls.append(1) }
+                        for _ in 0..<(measured?["legacySaves"] as? Int ?? 0) { await calls.append(2) }
+                        return result
+                    }
+                    let exporter = PhotoshopWorkflowBridge(workspace: folder,scriptRunner: runner)
+                    let started = Date()
+                    let exported = try await exporter.exportStackPNG(snapshot: snapshot)
+                    let elapsed = Date().timeIntervalSince(started)
+                    let encoders = await calls.values()
+                    let usesQuick = mode == "fast" && name != "soft-alpha-adobe-8" && name != "soft-alpha-srgb-16"
+                    XCTAssertEqual(encoders,[usesQuick ? 1 : 2],"sRGB/8-bit uses quick PNG; non-sRGB and 16-bit retain Save for Web")
+                    let bytes = try Data(contentsOf: exported.pngURL).count
+                    results[mode] = ["png":exported.pngURL.path,"seconds":elapsed,"bytes":bytes,
+                                     "orientation":exported.orientation,"encoders":encoders]
+                }
+                let legacy = try XCTUnwrap(results["legacy"] as? [String:Any])
+                let fast = try XCTUnwrap(results["fast"] as? [String:Any])
+                let expected = try WorkflowRaster.read(URL(fileURLWithPath: XCTUnwrap(legacy["png"] as? String)))
+                let actual = try WorkflowRaster.read(URL(fileURLWithPath: XCTUnwrap(fast["png"] as? String)))
+                XCTAssertEqual(actual.size,expected.size)
+                XCTAssertEqual(actual.orientation,expected.orientation)
+                XCTAssertEqual(actual.profileData,expected.profileData)
+                XCTAssertTrue(actual.pixels == expected.pixels)
+                if name.hasPrefix("soft-alpha-") {
+                    XCTAssertEqual(stride(from:3,to:actual.pixels.count,by:4).map { actual.pixels[$0] },[0,1,64,128,255],"Preview blue must be hidden; soft alpha must survive")
+                }
+                // Raw, unpremultiplied RGBA and all color chunks are additionally compared from these files.
+                try JSONSerialization.data(withJSONObject: results,options: [.prettyPrinted,.sortedKeys]).write(to: folder.appendingPathComponent("run-\(repetition).json"))
+            }
+            XCTAssertEqual(try AIFileValidation.hash(source.path),sourceHash)
+            XCTAssertEqual(try AIFileValidation.hash(document.path),sourceHash)
+        }
+        let verifier = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("scripts/verify_workflow_png_pairs.py")
+        let process = Process(),output = Pipe()
+        process.executableURL = URL(fileURLWithPath:python)
+        process.arguments = ["-B",verifier.path,evidence.path]
+        process.standardOutput = output
+        try process.run()
+        let rawComparison = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        try rawComparison.write(to:evidence.appendingPathComponent("raw-pixel-comparison.json"))
+        XCTAssertEqual(process.terminationStatus,0,"Raw RGBA / ICC / color chunks differ: \(String(decoding:rawComparison,as:UTF8.self))")
+    }
     private func roleCacheFixture() throws -> (directory: URL,document: URL,owner: UUID,runner: PhotoshopWorkflowBridge.ScriptRunner,calls: Gate) {
         let directory = try temporaryDirectory(),document = directory.appendingPathComponent("owned.psd"),owner = UUID(),calls = Gate()
         try Data("saved-role-psd".utf8).write(to: document)

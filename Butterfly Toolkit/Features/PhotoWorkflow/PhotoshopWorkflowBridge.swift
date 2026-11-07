@@ -396,6 +396,16 @@ extension PhotoshopWorkflowBridge {
         d.putBoolean(s('copy'),true);d.putBoolean(s('lowerCase'),true);d.putBoolean(s('embedProfiles'),true);
         executeAction(s('save'),d,DialogModes.NO);
     }
+    function wfStackPNG(doc,path) {
+        if(doc.mode!==DocumentMode.RGB || doc.bitsPerChannel!==BitsPerChannelType.EIGHT || doc.colorProfileName!=='sRGB IEC61966-2.1'){wfPNG(doc,path);return;}
+        // Match Save for Web's canonical sRGB ICC without transforming the already-sRGB pixels.
+        app.activeDocument=doc;var profile=new ActionDescriptor();
+        var target=new ActionReference();target.putEnumerated(charIDToTypeID('Dcmn'),charIDToTypeID('Ordn'),charIDToTypeID('Trgt'));
+        profile.putReference(charIDToTypeID('null'),target);
+        profile.putString(stringIDToTypeID('profile'),'sRGB IEC61966-2.1');
+        executeAction(stringIDToTypeID('assignProfile'),profile,DialogModes.NO);
+        wfRolePNG(doc,path);
+    }
     function wfSave(doc) { var p=new PhotoshopSaveOptions();p.layers=true;p.embedColorProfile=true;p.maximizeCompatibility=true;doc.saveAs(doc.fullName,p,false,Extension.LOWERCASE); }
     function wfSelectMask(layer) {
         app.activeDocument.activeLayer=layer;
@@ -431,7 +441,7 @@ extension PhotoshopWorkflowBridge {
         try {copy=o.doc.duplicate();app.activeDocument=copy;var r=wfRoles(copy);
             if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;}
             else {for(var i=0;i<copy.layers.length;i++) if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].visible=false;}
-            wfPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
+            wfStackPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
         }finally{if(copy)copy.close(SaveOptions.DONOTSAVECHANGES);wfClose(o);}
         """
     }
