@@ -1,18 +1,30 @@
 import Foundation
 import CoreGraphics
 
+nonisolated struct WorkflowStackPreparation: Sendable {
+    let snapshot: PSDSnapshot
+    let input: StackPNG?
+}
+
 nonisolated enum PhotoshopInstallCheckpoint: Sendable { case prepared, published }
 
 nonisolated struct PhotoshopWorkflowBridge: Sendable {
     typealias ScriptRunner = @Sendable (String) async throws -> String
+    typealias StackProcessor = @Sendable (FocusStackJob, String?) async throws -> Void
+    private let stackProcessor: StackProcessor
     let workspace: URL
     private let coordinator: PhotoshopExecutionCoordinator
     private let scriptRunner: ScriptRunner
     private let installCheckpoint: @Sendable (PhotoshopInstallCheckpoint) async throws -> Void
     @TaskLocal private static var performanceTaskID: UUID?
     private let performanceObserver: WorkflowPerformanceObserver?
-    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil) {
-        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver
+    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil, stackProcessor: @escaping StackProcessor = { job, hook in
+        guard let application = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
+        try await Task.detached(priority: .userInitiated) {
+            try FocusStackProcessor.process(job, photoshopApplicationName: application, workflowPNGExportScript: hook)
+        }.value
+    }) {
+        self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver; self.stackProcessor = stackProcessor
     }
     private struct InstallTransaction: Codable, Sendable {
         var sourceVersion: String
@@ -45,13 +57,18 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var performance: [String: Double]?
         var documentPeak: Int?
     }
+    func stackWithInput(job: FocusStackJob, owner: UUID) async throws -> WorkflowStackPreparation {
+        try await prepareStack(job: job, owner: owner, prepareInput: true)
+    }
     func stack(job: FocusStackJob, owner: UUID) async throws -> PSDSnapshot {
+        try await prepareStack(job: job, owner: owner, prepareInput: false).snapshot
+    }
+    private func prepareStack(job: FocusStackJob, owner: UUID, prepareInput: Bool) async throws -> WorkflowStackPreparation {
         try await withLease("stack", owner: owner, savedRead: false) {
             guard !FileManager.default.fileExists(atPath: job.destinationURL.path),
                   !FileManager.default.fileExists(atPath: ownershipURL(job.destinationURL).path), job.sourceFiles.count == 3 else {
                 throw WorkflowBridgeError.ownershipConflict
             }
-            guard let photoshop = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
             let folder = try outputDirectory("stack/\(UUID())", owner: owner)
             let hashes = try job.sourceFiles.map { try hash($0.path) }
             var copiedSources: [URL] = []
@@ -62,14 +79,15 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                 guard try hash(copy.path) == hashes[index] else { throw WorkflowBridgeError.staleSource }
                 copiedSources.append(copy)
             }
+            let candidate = folder.appendingPathComponent("input.png")
+            defer { try? FileManager.default.removeItem(at: candidate) }
+            let hook = prepareInput ? Self.stackInputExportScript(output: candidate) : nil
             let staged = folder.appendingPathComponent("stack.psd")
             let ownedJob = FocusStackJob(id: job.id, sourceFiles: copiedSources, destinationURL: staged, butterflyName: job.butterflyName, side: job.side)
             let stackStarted = observationStart()
             do {
                 defer { report("ps.stack-including-open-save-close", since: stackStarted) }
-                try await Task.detached(priority: .userInitiated) {
-                    try FocusStackProcessor.process(ownedJob, photoshopApplicationName: photoshop)
-                }.value
+                try await stackProcessor(ownedJob, hook)
             }
             guard try job.sourceFiles.map({ try hash($0.path) }) == hashes else { throw WorkflowBridgeError.staleSource }
             // Move refuses a late same-name collision; the legacy processor's skip behavior cannot adopt an unknown PSD.
@@ -80,8 +98,30 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try JSONEncoder().encode(ownership).write(to: record, options: .withoutOverwriting)
             do { try FileManager.default.moveItem(at: staged, to: job.destinationURL) }
             catch { try? FileManager.default.removeItem(at: record); throw error }
-            return try await capture(document: job.destinationURL, owner: owner)
+            let snapshot = try await capture(document: job.destinationURL, owner: owner)
+            // Optional input failure must never invalidate an already published, recoverable PSD.
+            var input: StackPNG?
+            if prepareInput, snapshot.contentVersion == ownership.initialStackVersion {
+                input = try? preparedInput(candidate, snapshot: snapshot)
+            }
+            return WorkflowStackPreparation(snapshot: snapshot, input: input)
         }
+    }
+    private func preparedInput(_ candidate: URL, snapshot: PSDSnapshot) throws -> StackPNG {
+        let raster = try readRaster(candidate)
+        guard raster.size == snapshot.pixelSize, raster.orientation == 1, raster.hasProfile else {
+            throw WorkflowBridgeError.invalidImage("预备 PNG 尺寸、方向或 ICC 缺失")
+        }
+        // PSD serialization can change hidden RGB at alpha=0. Keep transparent inputs on the reopened path.
+        guard stride(from: 3, to: raster.pixels.count, by: 4).allSatisfy({ raster.pixels[$0] == 255 }) else {
+            throw WorkflowBridgeError.invalidImage("透明输入保留重新打开 PSD 导出路径")
+        }
+        let fingerprint = try hash(candidate.path)
+        let output = try outputDirectory("data/processed", owner: snapshot.taskID)
+            .appendingPathComponent("\(snapshot.contentVersion)-\(UUID()).png")
+        try FileManager.default.moveItem(at: candidate, to: output)
+        return StackPNG(snapshotVersion: snapshot.contentVersion, pngURL: output, fingerprint: fingerprint,
+            pixelSize: raster.size, orientation: 1, colorProfile: raster.profileName ?? "", validBackgroundAlphaURL: output)
     }
     func refreshSavedPSD(document: URL, owner: UUID, expectedSources: [WorkflowSourceFile]? = nil) async throws -> PSDSnapshot {
         try await withLease("refresh", owner: owner, savedRead: true) {
@@ -100,6 +140,17 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             let snapshot = try await capture(document: document, owner: owner)
             if snapshot.roles != nil { _ = try await extractUnlocked(snapshot) }
             return snapshot
+        }
+    }
+    func validateStackInput(snapshot: PSDSnapshot, input: StackPNG) async throws -> Bool {
+        try await withLease("validateStackInput", owner: snapshot.taskID, savedRead: true) {
+            // Keep the source-version fence that reopening/exporting the input would have performed.
+            try await verify(snapshot)
+            guard input.snapshotVersion == snapshot.contentVersion, input.pixelSize == snapshot.pixelSize,
+                  input.orientation == 1, !input.colorProfile.isEmpty,
+                  (try? hash(input.pngURL.path)) == input.fingerprint,
+                  let raster = try? readRaster(input.pngURL) else { return false }
+            return raster.size == input.pixelSize && raster.orientation == 1 && raster.hasProfile
         }
     }
     func exportStackPNG(snapshot: PSDSnapshot) async throws -> StackPNG {
@@ -520,15 +571,24 @@ extension PhotoshopWorkflowBridge {
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path)));return wfJSON(wfMetadata(o.doc));
         """
     }
-    private static func exportScript(document: URL, output: URL, roles: PSDRoleIdentifiers?) -> String {
+    static func stackInputExportScript(output: URL) -> String {
+        commonScript.replacingOccurrences(of: "#target photoshop", with: "") + "\n" +
+        "try{(function(){" + stackPNGBody(document: "stackDocument", output: output) +
+        "}());}catch(e){try{new File(" + quote(output.path) + ").remove();}catch(_){}throw e;}"
+    }
+    private static func stackPNGBody(document: String, output: URL) -> String {
         """
-        var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null;
-        try {copy=wfDuplicate(o.doc);app.activeDocument=copy;var r=wfRoles(copy);
+        var copy=null;
+        try {copy=wfDuplicate(\(document));app.activeDocument=copy;var r=wfRoles(copy);
             if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;}
             else {for(var i=0;i<copy.layers.length;i++) if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].visible=false;}
             wfStackPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
-        }finally{if(copy)wfCloseDocument(copy);wfClose(o);}
+        }finally{if(copy)wfCloseDocument(copy);}
         """
+    }
+    private static func exportScript(document: URL, output: URL, roles: PSDRoleIdentifiers?) -> String {
+        "var o=wfOpen(" + quote(document.resolvingSymlinksInPath().path) + ");try{" +
+        stackPNGBody(document: "o.doc", output: output) + "}finally{wfClose(o);}"
     }
     private static func installScript(document: URL, alpha: URL) -> String {
         """

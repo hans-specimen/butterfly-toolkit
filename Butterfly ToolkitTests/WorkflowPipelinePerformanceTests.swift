@@ -223,7 +223,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
         else { XCTAssertTrue(after.allSucceeded,"Inspect the retained manifest for failed stages") }
         XCTAssertEqual(after.sideTasks.count,max(2,count))
     }
-    private static func copyFixture(_ source: URL, to destination: URL, in root: URL) throws {
+    static func copyFixture(_ source: URL, to destination: URL, in root: URL) throws {
         let resolved = source.resolvingSymlinksInPath()
         guard try resolved.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true,
               try isolatedEvidenceRoot(destination.path).path.hasPrefix(root.resolvingSymlinksInPath().path + "/") else {
@@ -249,7 +249,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
         XCTAssertEqual(try Data(contentsOf: original), Data("source".utf8))
         XCTAssertThrowsError(try Self.copyFixture(original, to: base.appendingPathComponent("outside.psd"), in: root))
     }
-    private static func isolatedEvidenceRoot(_ path: String) throws -> URL {
+    static func isolatedEvidenceRoot(_ path: String) throws -> URL {
         // Resolve the existing ancestor first: Foundation may leave a nonexistent leaf's symlink parents unresolved.
         var ancestor = URL(fileURLWithPath: path).standardizedFileURL
         var suffix: [String] = []

@@ -21,11 +21,13 @@ actor WorkflowExecutor {
         var contentFingerprint: @Sendable (RoleImages) async throws -> String
         var validateInstalledMatte: @Sendable (RoleImages, StackPNG, MatteArtifact) async throws -> Void
 
+        var validateStackInput: (@Sendable (PSDSnapshot, StackPNG) async throws -> Bool)? = nil
+        var stackWithInput: (@Sendable (FocusStackJob, UUID) async throws -> WorkflowStackPreparation)? = nil
         var endInferenceSession: @Sendable () async -> Void = {}
 
-        static func live(bridge: PhotoshopWorkflowBridge, matte: WorkflowMatteService, geometry: WorkflowGeometryCache = WorkflowGeometryCache()) -> Self {
+        static func live(bridge: PhotoshopWorkflowBridge, matte: WorkflowMatteService, geometry: WorkflowGeometryCache = WorkflowGeometryCache(), prepareStackInput: Bool = false) -> Self {
             let renderer = WorkflowAssetRenderer(), artifacts = WorkflowArtifactStore()
-            return Self(stack: { try await bridge.stack(job: $0,owner: $1) },
+            var services = Self(stack: { try await bridge.stack(job: $0,owner: $1) },
                 refresh: { try await bridge.refreshSavedPSD(document: $0,owner: $1,expectedSources: $2) },
                 exportStack: { try await bridge.exportStackPNG(snapshot: $0) },
                 infer: { try await matte.infer(input: $0) },
@@ -67,6 +69,11 @@ actor WorkflowExecutor {
                           zip(expectedCutout.pixels,cutout.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 4 }) else { throw WorkflowBridgeError.staleSource }
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
                 }.value },endInferenceSession: { await matte.shutdown() })
+            if prepareStackInput {
+                services.stackWithInput = { try await bridge.stackWithInput(job: $0, owner: $1) }
+                services.validateStackInput = { try await bridge.validateStackInput(snapshot: $0, input: $1) }
+            }
+            return services
         }
 
     }
@@ -484,6 +491,7 @@ actor WorkflowExecutor {
                 let url = before.stackAttemptURL!
                 try value.validateOutputURL(url)
                 let saved: PSDSnapshot
+                var prepared: StackPNG?
                 if FileManager.default.fileExists(atPath: url.path) {
                     saved = try await services.refresh(url,id,before.sources.files)
                 } else {
@@ -491,11 +499,18 @@ actor WorkflowExecutor {
                         guard try AIFileValidation.hash(source.url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
                     }
                     let job = FocusStackJob(id: 0,sourceFiles: before.sources.files.map(\.url),destinationURL: url,butterflyName: specimen.baseName,side: before.side.fileSuffix)
-                    saved = try await services.stack(job,id)
+                    if let prepare = services.stackWithInput {
+                        let result = try await prepare(job,id)
+                        saved = result.snapshot; prepared = result.input
+                    } else { saved = try await services.stack(job,id) }
                 }
                 try check(batchID,before,stage: stage)
                 guard saved.taskID == id, saved.workingURL == url else { throw WorkflowBridgeError.ownershipConflict }
-                try mutateTask(batchID,id) { $0.snapshot = saved }; output = saved.contentVersion
+                if let prepared {
+                    guard prepared.snapshotVersion == saved.contentVersion, prepared.pixelSize == saved.pixelSize,
+                          prepared.orientation == 1 else { throw WorkflowBridgeError.staleSource }
+                }
+                try mutateTask(batchID,id) { $0.snapshot = saved; $0.stackPNG = prepared }; output = saved.contentVersion
             case .matte:
                 guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
                 let saved: PSDSnapshot
@@ -503,7 +518,15 @@ actor WorkflowExecutor {
                     _ = try await services.extract(snapshot); saved = snapshot
                 } else {
                     let input: StackPNG
-                    if let cached = before.stackPNG, cached.snapshotVersion == snapshot.contentVersion { input = cached }
+                    var cached = before.stackPNG
+                    // A durable AI result may need the existing published-install recovery below.
+                    if let candidate = cached, before.matteArtifact?.inputPNGFingerprint != candidate.fingerprint,
+                       let validate = services.validateStackInput {
+                        let valid = try await validate(snapshot, candidate)
+                        try check(batchID,before,stage: stage)
+                        if !valid { cached = nil }
+                    }
+                    if let cached, cached.snapshotVersion == snapshot.contentVersion { input = cached }
                     else {
                         input = try await services.exportStack(snapshot)
                         try check(batchID,before,stage: stage)

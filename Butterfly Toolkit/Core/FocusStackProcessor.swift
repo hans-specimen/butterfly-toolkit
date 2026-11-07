@@ -168,7 +168,8 @@ struct FocusStackProcessor {
 
     nonisolated static func process(
         _ job: FocusStackJob,
-        photoshopApplicationName: String
+        photoshopApplicationName: String,
+        workflowPNGExportScript: String? = nil
     ) throws {
         guard !FileManager.default.fileExists(atPath: job.destinationURL.path) else { return }
 
@@ -179,7 +180,7 @@ struct FocusStackProcessor {
 
         do {
             try FileManager.default.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
-            try jsx(for: job).write(to: jsxURL, atomically: true, encoding: .utf8)
+            try jsx(for: job, workflowPNGExportScript: workflowPNGExportScript).write(to: jsxURL, atomically: true, encoding: .utf8)
         } catch {
             throw FocusStackError.scriptFailed("无法创建临时处理脚本。")
         }
@@ -236,7 +237,7 @@ struct FocusStackProcessor {
         return names
     }
 
-    nonisolated private static func jsx(for job: FocusStackJob) -> String {
+    nonisolated static func jsx(for job: FocusStackJob, workflowPNGExportScript: String? = nil) -> String {
         let sources = job.sourceFiles
             .map { "\"\(jsxEscaped($0.path))\"" }
             .joined(separator: ", ")
@@ -364,6 +365,7 @@ struct FocusStackProcessor {
                 } catch (saveError) {
                     throw new Error("保存 PSD 失败：" + saveError.message);
                 }
+                \(workflowPNGExportScript.map { "try { (function(){" + $0 + "}()); } catch (pngError) {}" } ?? "")
                 stackDocument.close(SaveOptions.DONOTSAVECHANGES);
             } catch (error) {
                 if (stackDocument) {
