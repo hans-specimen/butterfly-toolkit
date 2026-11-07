@@ -61,30 +61,21 @@ import UniformTypeIdentifiers
         draft.groups[0].files[0] = nil
         XCTAssertThrowsError(try draft.freeze(names: "first\nsecond",output: root.appendingPathComponent("output"),checkStack: true,checkMatte: true))
     }
-    func testRenderedPreviewUsesFullSourceOriginAndCurrentCrop() async throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: root,withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("base.png")
-        var pixels = [UInt8]()
-        for y in 0..<100 { for x in 0..<100 { pixels += [UInt8(x*2),UInt8(y*2),220,255] } }
-        let provider = CGDataProvider(data: Data(pixels) as CFData)!
-        let image = CGImage(width: 100,height: 100,bitsPerComponent: 8,bitsPerPixel: 32,bytesPerRow: 400,space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),provider: provider,decode: nil,shouldInterpolate: false,intent: .defaultIntent)!
-        let dest = CGImageDestinationCreateWithURL(url as CFURL,UTType.png.identifier as CFString,1,nil)!
-        CGImageDestinationAddImage(dest,image,nil); XCTAssertTrue(CGImageDestinationFinalize(dest))
+    func testCanvasCoordinatesUseFullNegativeOriginAndCurrentCrop() {
+        let url = URL(fileURLWithPath: "/tmp/role.png")
         let roles = RoleImages(snapshotVersion: "v1",basePNG: url,cutoutPNG: url,maskPNG: url,pixelSize: CGSize(width: 100,height: 100),coordinateOrigin: CGPoint(x: -20,y: -30),editableExtent: CGRect(x: -20,y: -30,width: 100,height: 100),cropViewport: CGRect(x: 0,y: 0,width: 35,height: 21))
         var solution = GeometrySolution(sourceVersion: "v1",angleDegrees: 0,rotationPivot: CGPoint(x: 30,y: 20),subjectBounds: CGRect(x: 5,y: 5,width: 20,height: 10),sourceCropRect: roles.cropViewport,outputSize: roles.cropViewport.size,actualMargins: WorkflowMargins(left: 0,top: 0,right: 0,bottom: 0),isApplicable: true)
-        let service = WorkflowPreviewService()
-        let output = try await service.preview(source: roles,solution: solution,maximumPixelSize: 2048)
-        XCTAssertEqual(output.width,35); XCTAssertEqual(output.height,21)
-        var rgba = [UInt8](repeating: 0,count: 35*21*4)
-        rgba.withUnsafeMutableBytes { bytes in
-            let context = CGContext(data: bytes.baseAddress,width: 35,height: 21,bitsPerComponent: 8,bytesPerRow: 35*4,space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-            context.draw(output,in: CGRect(x: 0,y: 0,width: 35,height: 21))
-        }
-        XCTAssertEqual(Int(rgba[0]),40,accuracy: 2); XCTAssertEqual(Int(rgba[1]),60,accuracy: 2)
-        solution.sourceVersion = "old"
-        do { _ = try await service.preview(source: roles,solution: solution); XCTFail("stale preview accepted") } catch { XCTAssertEqual(error as? WorkflowBridgeError,.staleSource) }
+        var canvas = WorkflowGeometryPreview(image: nil,source: roles,solution: solution,zoom: 1,background: "棋盘")
+        XCTAssertEqual(canvas.displayRect,CGRect(x: -100,y: -110,width: 260,height: 260))
+        var map = WorkflowPreviewCoordinates(sourceRect: canvas.displayRect,viewSize: CGSize(width: 260,height: 260))
+        XCTAssertEqual(map.viewRect(CGRect(origin: roles.coordinateOrigin,size: roles.pixelSize)),CGRect(x: 80,y: 80,width: 100,height: 100))
+        XCTAssertEqual(map.viewRect(solution.sourceCropRect),CGRect(x: 100,y: 110,width: 35,height: 21))
+        solution.sourceCropRect = CGRect(x: -40,y: -50,width: 35,height: 21)
+        canvas.solution = solution
+        XCTAssertEqual(canvas.displayRect,CGRect(x: -120,y: -130,width: 280,height: 280),"Canvas must include the current crop outside the saved viewport")
+        map = WorkflowPreviewCoordinates(sourceRect: canvas.displayRect,viewSize: CGSize(width: 280,height: 280))
+        XCTAssertEqual(map.viewRect(solution.sourceCropRect),CGRect(x: 80,y: 80,width: 35,height: 21))
+        XCTAssertEqual(map.viewRect(CGRect(origin: roles.coordinateOrigin,size: roles.pixelSize)),CGRect(x: 100,y: 100,width: 100,height: 100))
     }
     func testSavedGeometryStartsAtIncrementalZeroInsteadOfReestimating() {
         let file = WorkflowSourceFile(url: URL(fileURLWithPath: "/tmp/input.jpg"),fingerprint: "hash")
@@ -116,6 +107,122 @@ import UniformTypeIdentifiers
 }
 
 @MainActor extension WorkflowPreviewTests {
+    private actor PreviewProbe: WorkflowPreviewServing {
+        let service = WorkflowPreviewService()
+        var calls: [String] = []
+        var holdFirstGeometry = false
+        var staleGeometry = false
+        var held: CheckedContinuation<Void,Never>?
+        var entered: XCTestExpectation?
+        func hold(_ expectation: XCTestExpectation) { holdFirstGeometry = true; entered = expectation }
+        func returnStaleGeometry() { staleGeometry = true }
+        func release() { held?.resume(); held = nil }
+        func values() -> [String] { calls }
+        func image(url: URL,version: String,maximumPixelSize: Int) async throws -> CGImage {
+            calls.append("image")
+            return try await service.image(url: url,version: version,maximumPixelSize: maximumPixelSize)
+        }
+        func geometry(source: RoleImages,request: GeometryRequest,savedCandidate: GeometrySolution?) async throws -> GeometrySolution {
+            calls.append("geometry")
+            var solution = try await service.geometry(source: source,request: request,savedCandidate: savedCandidate)
+            if staleGeometry { solution.sourceVersion = "stale-result" }
+            if holdFirstGeometry {
+                holdFirstGeometry = false
+                await withCheckedContinuation { held = $0; entered?.fulfill() }
+            }
+            return solution
+        }
+
+    }
+    func testStorePreviewUsesRoleThumbnailAndValidationWithoutDiscardedBitmap() async throws {
+        let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
+        store.stage = .geometry; store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]
+        store.prepareSelected()
+        try await waitUntil { store.canConfirm }
+        let calls = await probe.values()
+        XCTAssertEqual(calls.filter { $0 == "image" }.count,2)
+        XCTAssertEqual(calls.filter { $0 == "geometry" }.count,2)
+        XCTAssertEqual(calls.filter { $0 == "discarded-bitmap" }.count,0)
+        for task in batch.sideTasks {
+            let expected = try await probe.service.image(url: task.roleImages!.basePNG,version: task.snapshot!.contentVersion,maximumPixelSize: 2048)
+            XCTAssertTrue(store.displayImage(for: task) === expected)
+            XCTAssertEqual(store.displayImage(for: task)?.width,100,"Canvas receives the full role thumbnail, not a cropped bitmap")
+            XCTAssertEqual(store.solutions[task.id]?.sourceVersion,task.snapshot?.contentVersion)
+        }
+        XCTAssertTrue(store.loading.isEmpty)
+    }
+    func testDelayedGeometryCannotReplaceNewSavedVersionOrEnableConfirmationEarly() async throws {
+        var batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
+        let entered = expectation(description: "Old geometry result held"),finished = expectation(description: "Store consumed the old completion")
+        await probe.hold(entered)
+        store.stage = .geometry; store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]
+        store.refreshVisibleImage()
+        let id = batch.specimens[0].front.id
+        let oldTask = try XCTUnwrap(store.previewTasks[id])
+        await fulfillment(of: [entered],timeout: 2)
+        XCTAssertNotNil(store.displayImage(for: batch.specimens[0].front))
+        XCTAssertTrue(store.loading.contains(id)); XCTAssertFalse(store.canConfirm)
+        batch.specimens[0].front.snapshot?.contentVersion = "new-saved-version"
+        batch.specimens[0].front.roleImages?.snapshotVersion = "new-saved-version"
+        batch.specimens[0].front.geometrySolution?.sourceVersion = "new-saved-version"
+        store.batch = batch; store.prepareSelected()
+        try await waitUntil { store.canConfirm }
+        let latest = store.solutions[id]
+        await probe.release()
+        Task { await oldTask.value; finished.fulfill() }
+        await fulfillment(of: [finished],timeout: 2)
+        XCTAssertEqual(store.solutions[id],latest)
+        XCTAssertEqual(store.solutions[id]?.sourceVersion,"new-saved-version")
+        XCTAssertTrue(store.canConfirm); XCTAssertTrue(store.loading.isEmpty)
+    }
+    func testStoreRejectsWrongVersionGeometryEvenWhenThumbnailIsVisible() async throws {
+        let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
+        await probe.returnStaleGeometry()
+        store.stage = .geometry; store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]
+        store.prepareSelected(); try await waitUntil { store.loading.isEmpty }
+        XCTAssertNotNil(store.displayImage(for: batch.specimens[0].front))
+        XCTAssertFalse(store.canConfirm); XCTAssertTrue(store.solutions.isEmpty)
+        XCTAssertNotNil(store.error)
+    }
+    func testRealStorePreviewTimingWhenRequested() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let batchPath = env["WORKFLOW_PREVIEW_BATCH"],let evidencePath = env["WORKFLOW_PREVIEW_EVIDENCE"] else { throw XCTSkip("Real store preview benchmark is opt-in") }
+        let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: batchPath)))
+        let evidence = URL(fileURLWithPath: evidencePath)
+        guard !FileManager.default.fileExists(atPath: evidence.path) else { throw WorkflowBridgeError.ownershipConflict }
+        try FileManager.default.createDirectory(at: evidence,withIntermediateDirectories: true)
+        var rows: [[String:Any]] = []
+        for specimen in batch.specimens where !specimen.isExcluded {
+            for task in [specimen.front,specimen.back] {
+                for repetition in 1...3 {
+                    let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
+                    store.stage = .geometry; store.batch = batch; store.currentSpecimenID = specimen.id; store.face = task.side
+                    var row: [String:Any] = ["face":"\(specimen.baseName)_\(task.side.fileSuffix)","repetition":repetition]
+                    for phase in ["cold","warm"] {
+                        let oldCount = await probe.values().count,started = Date()
+                        store.refreshVisibleImage()
+                        for _ in 0..<6000 {
+                            if !store.loading.contains(task.id) { break }
+                            try await Task.sleep(for: .milliseconds(5))
+                        }
+                        row[phase + "Seconds"] = Date().timeIntervalSince(started)
+                        let calls = Array((await probe.values()).dropFirst(oldCount))
+                        row[phase + "DiscardedBitmaps"] = calls.filter { $0 == "discarded-bitmap" }.count
+                        XCTAssertEqual(calls.filter { $0 == "image" }.count,1)
+                        XCTAssertEqual(calls.filter { $0 == "geometry" }.count,1)
+                        XCTAssertEqual(store.gates[task.id]?.canConfirm,true,store.error ?? "Preview validation incomplete")
+                        XCTAssertEqual(store.solutions[task.id]?.sourceVersion,task.snapshot?.contentVersion)
+                        XCTAssertNotNil(store.displayImage(for: task))
+                    }
+                    rows.append(row)
+                    try JSONSerialization.data(withJSONObject: rows,options: [.prettyPrinted,.sortedKeys]).write(to: evidence.appendingPathComponent("timings.json"))
+                }
+            }
+        }
+    }
     private func waitUntil(_ condition: () -> Bool) async throws {
         for _ in 0..<500 { if condition() { return }; try await Task.sleep(for: .milliseconds(10)) }
         XCTFail("Timed out waiting for native store readiness")

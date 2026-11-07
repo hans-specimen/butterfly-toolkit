@@ -109,9 +109,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var manualChange: WorkflowPSDChange = .maskOnly
     private var executor: WorkflowExecutor?
     private var manifestURL: URL?
-    private let previews = WorkflowPreviewService()
-    private var previewTasks: [UUID: Task<Void,Never>] = [:]
+    private let previews: any WorkflowPreviewServing
+    private(set) var previewTasks: [UUID: Task<Void,Never>] = [:]
     private var command: Task<Void,Never>?
+    init(previews: any WorkflowPreviewServing = WorkflowPreviewService()) { self.previews = previews }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
     var currentSolution: GeometrySolution? { currentTask.flatMap { solutions[$0.id] ?? $0.geometrySolution } }
@@ -355,7 +356,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
                 imageIdentities[task.id] = identity; images[task.id] = image
                 let solution = try await previews.geometry(source: roles,request: request,savedCandidate: useSaved ? saved : nil)
                 guard !Task.isCancelled,gates[task.id]?.token == token else { return }
-                _ = try await previews.preview(source: roles,solution: solution,maximumPixelSize: 2048)
+                guard solution.sourceVersion == roles.snapshotVersion else { throw WorkflowBridgeError.staleSource }
                 guard !Task.isCancelled,gates[task.id]?.accept(token: token,sourceVersion: roles.snapshotVersion,valid: solution.isApplicable) == true else { return }
                 solutions[task.id] = solution; loading.remove(task.id); warmSources.insert(roles.snapshotVersion)
             } catch is CancellationError {} catch {

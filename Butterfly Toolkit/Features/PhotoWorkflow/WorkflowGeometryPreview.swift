@@ -38,8 +38,13 @@ nonisolated struct WorkflowPreviewCoordinates: Sendable {
     }
 }
 
+nonisolated protocol WorkflowPreviewServing: Sendable {
+    func image(url: URL,version: String,maximumPixelSize: Int) async throws -> CGImage
+    func geometry(source: RoleImages,request: GeometryRequest,savedCandidate: GeometrySolution?) async throws -> GeometrySolution
+}
+
 /// Full editable-extent thumbnails are decoded off the UI actor; source geometry always stays full resolution.
-actor WorkflowPreviewService {
+actor WorkflowPreviewService: WorkflowPreviewServing {
     private var images: [String: CGImage] = [:]
     private var prepared: [String: PreparedMaskGeometry] = [:]
     private var preparing: [String: Task<PreparedMaskGeometry,Error>] = [:]
@@ -82,21 +87,7 @@ actor WorkflowPreviewService {
             return try analysis.analyze(request: request)
         }.value
     }
-    func preview(source: RoleImages,solution: GeometrySolution,maximumPixelSize: Int = 2048) async throws -> CGImage {
-        guard source.snapshotVersion == solution.sourceVersion else { throw WorkflowBridgeError.staleSource }
-        let image = try await image(url: source.basePNG,version: source.snapshotVersion,maximumPixelSize: maximumPixelSize)
-        return try await Task.detached {
-            let crop = solution.sourceCropRect,scale = min(1,Double(maximumPixelSize)/max(crop.width,crop.height))
-            let w = max(1,Int((crop.width*scale).rounded())),h = max(1,Int((crop.height*scale).rounded()))
-            guard let ctx = CGContext(data: nil,width: w,height: h,bitsPerComponent: 8,bytesPerRow: w*4,space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw WorkflowBridgeError.invalidImage("预览画布不可用") }
-            ctx.translateBy(x: 0,y: Double(h)); ctx.scaleBy(x: scale,y: -scale)
-            ctx.translateBy(x: -crop.minX,y: -crop.minY)
-            ctx.translateBy(x: solution.rotationPivot.x,y: solution.rotationPivot.y); ctx.rotate(by: solution.angleDegrees * .pi/180); ctx.translateBy(x: -solution.rotationPivot.x,y: -solution.rotationPivot.y)
-            ctx.translateBy(x: source.coordinateOrigin.x,y: source.coordinateOrigin.y+source.pixelSize.height); ctx.scaleBy(x: 1,y: -1)
-            ctx.draw(image,in: CGRect(origin: .zero,size: source.pixelSize))
-            guard let output = ctx.makeImage() else { throw WorkflowBridgeError.invalidImage("预览生成失败") }; return output
-        }.value
-    }
+
 }
 
 struct WorkflowGeometryPreview: View {
@@ -174,7 +165,7 @@ struct WorkflowGeometryPreview: View {
                 .onEnded { value in onMoveEnded(CGSize(width: value.translation.width/map.scale,height: value.translation.height/map.scale)) })
         }.clipped().overlay { if image == nil { ProgressView("加载当前保存版本…") } }
     }
-    private var displayRect: CGRect {
+    var displayRect: CGRect {
         if let square { return CGRect(x: 0,y: 0,width: square.canvasSide,height: square.canvasSide).insetBy(dx: -120,dy: -120) }
         guard let source else { return CGRect(x: 0,y: 0,width: 100,height: 100) }
         return source.editableExtent.union(solution?.sourceCropRect ?? source.cropViewport).insetBy(dx: -80,dy: -80)
