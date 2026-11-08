@@ -1,6 +1,9 @@
+// 管理预览图解码与版本确认门槛，并绘制几何构图、方形安全框及可回传源坐标的交互画布。
+
 import SwiftUI
 import ImageIO
 
+// MARK: - 预览身份与坐标转换
 nonisolated struct WorkflowPreviewImageIdentity: Equatable, Sendable {
     var sourceVersion: String
     var url: URL
@@ -11,6 +14,7 @@ nonisolated struct WorkflowPreviewGate: Sendable {
     private(set) var token = UUID()
     private(set) var sourceVersion = ""
     private(set) var canConfirm = false
+    // 每次请求立即撤销确认资格，只有相同令牌与保存版本的结果才能重新开启。
     mutating func begin(sourceVersion: String) -> UUID {
         token = UUID(); self.sourceVersion = sourceVersion; canConfirm = false; return token
     }
@@ -38,12 +42,13 @@ nonisolated struct WorkflowPreviewCoordinates: Sendable {
     }
 }
 
+// MARK: - 异步预览服务
 nonisolated protocol WorkflowPreviewServing: Sendable {
     func image(url: URL,version: String,maximumPixelSize: Int) async throws -> CGImage
     func geometry(source: RoleImages,request: GeometryRequest,savedCandidate: GeometrySolution?) async throws -> GeometrySolution
 }
 
-/// Full editable-extent thumbnails are decoded off the UI actor; source geometry always stays full resolution.
+/// 完整可编辑区域的缩略图在界面隔离域外解码，几何计算始终保留完整源分辨率。
 actor WorkflowPreviewService: WorkflowPreviewServing {
     private var images: [String: CGImage] = [:]
     private let geometryCache: WorkflowGeometryCache
@@ -61,7 +66,7 @@ actor WorkflowPreviewService: WorkflowPreviewServing {
         let result: CGImage
         do { result = try await pending.value; decoding[key] = nil }
         catch { decoding[key] = nil; throw error }
-        // Full details belong only to the visible store face, never to this shared thumbnail cache.
+        // 完整细节图仅由界面当前面持有，不放入共享缩略图缓存。
         if maximumPixelSize <= 2048 {
             if images.count >= 12 { images.removeAll() }
             images[key] = result
@@ -74,6 +79,7 @@ actor WorkflowPreviewService: WorkflowPreviewServing {
 
 }
 
+// MARK: - 构图画布与交互
 struct WorkflowGeometryPreview: View {
     var image: CGImage?
     var source: RoleImages?
@@ -119,7 +125,7 @@ struct WorkflowGeometryPreview: View {
                     if showSafeFrame { ctx.stroke(Path(map.viewRect(CGRect(x: square.safeMargin,y: square.safeMargin,width: square.canvasSide-2*square.safeMargin,height: square.canvasSide-2*square.safeMargin))),with: .color(.orange),lineWidth: 2) }
                     ctx.stroke(Path(map.viewRect(subject)),with: .color(.green),style: StrokeStyle(lineWidth: 1.5,dash: [6,4]))
                 } else {
-                    // Empty transformed source/background remains visibly red rather than being filled as valid photo.
+                    // 无效构图以红色提示源图或背景空缺，避免将其显示为有效照片区域。
                     if let solution,!solution.isApplicable { ctx.fill(Path(map.viewRect(solution.sourceCropRect)),with: .color(.red.opacity(0.25))) }
                     if let solution {
                         let pivot = map.viewPoint(solution.rotationPivot)
@@ -141,6 +147,7 @@ struct WorkflowGeometryPreview: View {
             .contentShape(Rectangle())
             .gesture(SpatialTapGesture().onEnded { value in
                 var point = map.sourcePoint(value.location)
+                // 点击点先从显示坐标回到画布，再逆旋转到未变换的源图坐标。
                 if square == nil,let solution { point = WorkflowPreviewCoordinates.rotate(point,degrees: -solution.angleDegrees,pivot: solution.rotationPivot) }
                 onSourcePoint(point)
             })
@@ -156,8 +163,9 @@ struct WorkflowGeometryPreview: View {
     }
 }
 
+// MARK: - 可选预览性能记录
 #if DEBUG
-/// Opt-in native Canvas-closure latency, not a claim about display presentation timing.
+/// 按需记录原生 Canvas 闭包延迟，不代表画面实际显示到屏幕的时间。
 private actor WorkflowPreviewMetrics {
     static let shared = WorkflowPreviewMetrics()
     private var recorded: Set<TimeInterval> = []

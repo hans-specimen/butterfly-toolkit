@@ -1,6 +1,10 @@
+// 提供后台图片解码、透明度预览和共享视口的双栏比较界面，支持样本切换及缘毛区域定位。
+
 import SwiftUI
 import ImageIO
 import CoreImage
+
+// MARK: - 图片解码与透明度提取
 
 nonisolated enum AIImageReader {
     static func read(path: String, alpha: Bool = false, thumbnail: Bool = false) -> CGImage? {
@@ -11,6 +15,7 @@ nonisolated enum AIImageReader {
         guard let image = thumbnail ? CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
                 : CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary) else { return nil }
         guard alpha else { return image }
+        // 将源图 Alpha 映射为不透明灰度图，便于直接观察透明度细节。
         let mask = CIImage(cgImage: image).applyingFilter("CIColorMatrix", parameters: [
             "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 1), "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 1),
             "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 1), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -18,6 +23,8 @@ nonisolated enum AIImageReader {
         return CIContext().createCGImage(mask, from: mask.extent)
     }
 }
+
+// MARK: - 异步缩略图
 
 struct AIThumbnail: View {
     var path: String?
@@ -31,6 +38,7 @@ struct AIThumbnail: View {
             image = nil
             guard let path else { return }
             let decoded = await Task.detached(priority: .utility) { AIImageReader.read(path: path, thumbnail: true) }.value
+            // 路径切换会取消旧任务，避免迟到的解码结果覆盖新样本。
             if !Task.isCancelled { image = decoded }
         }
     }
@@ -38,6 +46,8 @@ struct AIThumbnail: View {
 
 enum AICompareMode: String, CaseIterable { case original = "原图", reference = "人工参考", alpha = "透明度" }
 enum AIBackground: String, CaseIterable { case black = "黑底", white = "白底", checker = "透明格" }
+
+// MARK: - 共用视口的图片面板
 
 struct AIImagePanel: View {
     let path: String?
@@ -78,6 +88,7 @@ struct AIImagePanel: View {
                 }
                 .contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 1).onChanged { value in
+                    // 固定手势起始中心，按累计位移计算，避免每次回调重复叠加位移。
                     if dragStart == nil { dragStart = viewport.center }
                     viewport.move(translation: value.translation, scale: viewport.scale(image: imageSize, panel: proxy.size), start: dragStart ?? viewport.center)
                 }.onEnded { _ in dragStart = nil })
@@ -94,11 +105,14 @@ struct AIImagePanel: View {
             image = nil; loading = path != nil
             guard let path else { return }
             let alpha = deriveAlpha
+            // 原尺寸解码在后台执行；回到界面前确认本次载入仍然有效。
             let decoded = await Task.detached(priority: .userInitiated) { AIImageReader.read(path: path, alpha: alpha) }.value
             if !Task.isCancelled { image = decoded; loading = false }
         }
     }
 }
+
+// MARK: - 抠图比较与样本导航
 
 struct AICutoutView: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -142,6 +156,7 @@ struct AICutoutView: View {
                 }.padding(16)
                 Divider()
                 GeometryReader { proxy in
+                    // 两侧绑定同一原图坐标视口，任何一侧平移或缩放都会同步。
                     HStack(spacing: 1) {
                         AIImagePanel(path: leftPath(sample), deriveAlpha: mode == .alpha && sample.alpha == nil,
                                      title: mode == .alpha ? "人工透明度" : mode.rawValue,
@@ -197,10 +212,13 @@ struct AICutoutView: View {
             }
         }
     }
+    // MARK: - 比较来源与细节定位
+
     private func leftPath(_ sample: AISample) -> String? {
         switch mode { case .original: sample.original; case .reference: sample.reference; case .alpha: sample.alpha ?? sample.reference }
     }
     private func focusRegion(_ sample: AISample) {
+        // 没有可用关注区域时以中央区域兜底；缩放值仍相对于整图适配比例。
         let region = sample.rois.indices.contains(regionIndex) ? sample.rois[regionIndex] : AIRegion(name: "自由查看", x: Double(sample.width) / 2 - 160, y: Double(sample.height) / 2 - 160, width: 320, height: 320)
         viewport.center = region.center
         let fit = min(panelSize.width / CGFloat(sample.width), panelSize.height / CGFloat(sample.height))

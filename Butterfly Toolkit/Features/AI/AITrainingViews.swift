@@ -1,4 +1,8 @@
+// 展示成对素材检查、训练准备和本机模型信息；当前训练页只维护准备状态，不执行训练。
+
 import SwiftUI
+
+// MARK: - 成对素材与对齐检查
 
 struct AISamplesView: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -36,6 +40,7 @@ struct AISamplesView: View {
                     Button("整图") { viewport.fit(sample.pixelSize) }
                     Button("细节") { focus(sample) }
                 }.padding(16)
+                // 使用相同原图坐标查看两张图，使位置偏差可以直接比较。
                 HStack(spacing: 1) {
                     AIImagePanel(path: sample.original, title: "原始底图", imageSize: sample.pixelSize, background: .black, viewport: $viewport)
                     AIImagePanel(path: sample.reference, title: "人工答案", imageSize: sample.pixelSize, background: .black, viewport: $viewport)
@@ -49,11 +54,14 @@ struct AISamplesView: View {
         }
         .onAppear { store.selectPairedSampleIfAvailable() }
     }
+    // 优先使用第二个关注区域，其次第一个；缺少区域时回到整图。
     private func focus(_ sample: AISample) {
         if let roi = sample.rois.dropFirst().first ?? sample.rois.first { viewport.center = roi.center; viewport.zoom = 8 }
         else { viewport.fit(sample.pixelSize) }
     }
 }
+
+// MARK: - 训练准备与样本选择
 
 struct AITrainingView: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -113,6 +121,7 @@ struct AITrainingView: View {
             HStack {
                 Label("尚无训练任务", systemImage: "clock").foregroundStyle(.secondary)
                 Spacer()
+                // 后端未接入时保持入口禁用，避免把素材准备表现为已启动训练。
                 Button("创建训练任务（未接入）") {}.buttonStyle(.borderedProminent).disabled(true)
             }.padding(20)
         }
@@ -125,6 +134,7 @@ struct AITrainingView: View {
                     VStack(alignment: .leading, spacing: 14) {
                         ForEach(store.pairedSamples) { sample in
                             Toggle(isOn: Binding(get: { store.trainingSelection.contains(sample.id) }, set: { enabled in
+                                // 写入选择时再次检查资格，与禁用状态共同约束已确认的训练组样本。
                                 if enabled && store.canTrain(sample) { store.trainingSelection.insert(sample.id) }
                                 else { store.trainingSelection.remove(sample.id) }
                             })) {
@@ -142,6 +152,8 @@ struct AITrainingView: View {
         }
     }
 }
+
+// MARK: - 基础模型与验证信息
 
 struct AIModelsView: View {
     @ObservedObject var store: AIWorkspaceStore

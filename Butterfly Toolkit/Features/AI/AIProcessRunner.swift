@@ -1,10 +1,14 @@
+// 负责单次 AI 桥接子进程的启动、事件读取、错误收集与取消，供目录载入、导入和独立推理使用。
+
 import Foundation
 
-/// One child per operation; all blocking reads stay off the UI actor.
+/// 每次操作独占一个子进程；阻塞读取在后台任务中执行，避免占用界面执行器。
 nonisolated final class AIProcessRunner: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var cancelled = false
+
+    // MARK: - 操作入口与取消
 
     func cancel() {
         lock.lock()
@@ -22,6 +26,8 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
         } onCancel: { self.cancel() }
     }
 
+    // MARK: - 子进程与事件流
+
     private func execute(engine: URL, arguments: [String], onEvent: @escaping @Sendable (AIEvent) async -> Void) async throws -> AIEvent {
         let python = engine.appendingPathComponent(".venv/bin/python")
         let script = engine.appendingPathComponent("scripts/toolkit_bridge.py")
@@ -38,7 +44,7 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
         child.environment = environment
         let output = Pipe()
         child.standardOutput = output
-        // A file avoids a stderr pipe filling up while stdout is being read.
+        // 将标准错误写入文件，避免读取标准输出时错误管道塞满，导致子进程互相等待。
         let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("butterfly-ai-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let log = try FileHandle(forWritingTo: logURL)
@@ -55,6 +61,7 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
             if ["completed", "catalog", "imported"].contains(event.event) { last = event }
             await onEvent(event)
         }
+        // 按换行拆分 JSON 事件；一次读取可能只有半行，也可能包含多行。
         while true {
             let bytes = output.fileHandleForReading.availableData
             if bytes.isEmpty { break }
@@ -68,6 +75,7 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
         await consume(pending)
         child.waitUntilExit()
         if isCancelled() { throw CancellationError() }
+        // 正常退出和收到终态事件缺一不可，不能把没有结果的退出当作成功。
         guard child.terminationStatus == 0, let last else {
             let diagnostic = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
             let tail = diagnostic.split(separator: "\n").suffix(3).joined(separator: "\n")
@@ -76,6 +84,9 @@ nonisolated final class AIProcessRunner: @unchecked Sendable {
         return last
     }
 
+    // MARK: - 跨线程进程状态
+
+    // 在同一把锁内检查取消并启动，避免取消发生在检查与登记进程之间。
     private func launch(_ child: Process) throws {
         lock.lock()
         defer { lock.unlock() }

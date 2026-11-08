@@ -1,9 +1,13 @@
+// 负责批次清单的校验、原子保存、上一版回退，以及中断后运行状态的恢复。
+
 import Foundation
 
 actor WorkflowBatchStore {
     private let performanceObserver: WorkflowPerformanceObserver?
     init(performanceObserver: WorkflowPerformanceObserver? = nil) { self.performanceObserver = performanceObserver }
 
+    // MARK: - 清单读写
+    // 当前清单不可用时尝试上一份已校验清单，避免将损坏内容作为恢复依据。
     func load(from url: URL) throws -> WorkflowBatch {
         if let batch = try? readValidBatch(from: url) { return try recoverInterruptedWork(batch) }
         if let batch = try? readValidBatch(from: url.appendingPathExtension("previous")) { return try recoverInterruptedWork(batch) }
@@ -21,6 +25,7 @@ actor WorkflowBatchStore {
         let data = try encoder.encode(batch)
         let manager = FileManager.default
         try manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // 仅用有效的旧清单更新恢复副本；当前文件损坏且没有有效备份时拒绝覆盖。
         let previous = url.appendingPathExtension("previous")
         if manager.fileExists(atPath: url.path) {
             if let existing = try? Data(contentsOf: url), (try? decodeValid(existing)) != nil {
@@ -32,6 +37,8 @@ actor WorkflowBatchStore {
         try data.write(to: url, options: .atomic)
     }
 
+    // MARK: - 中断恢复与有效性检查
+    // 磁盘上的 running 不能证明进程仍在运行，恢复时退回待处理并递增修订号。
     private func recoverInterruptedWork(_ batch: WorkflowBatch) throws -> WorkflowBatch {
         guard batch.activeTasks.contains(where: { task in task.records.values.contains { $0.state == .running } }) else { return batch }
         return try WorkflowStateMachine.reduce(batch: batch, event: .cancelRunning(expectedRevision: batch.revision))

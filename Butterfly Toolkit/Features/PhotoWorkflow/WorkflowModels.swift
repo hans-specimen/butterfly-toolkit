@@ -1,10 +1,13 @@
+// 定义照片工作流的批次、阶段、源文件、PSD 快照、几何与导出模型，并校验清单一致性和输出路径。
+
 import Foundation
 import CoreGraphics
 import Darwin
 
+// MARK: - 阶段与固定源映射
 nonisolated enum WorkflowStage: String, Codable, CaseIterable, Sendable {
     case stack, matte, geometry, hd, png4k, derivatives
-    // The legacy derivative case remains decodable, but is no longer a workflow step.
+    // 保留旧派生阶段以兼容清单解码，但不再将其纳入处理流程。
     static let processingStages: [Self] = [.stack, .matte, .geometry, .hd, .png4k]
 }
 
@@ -30,11 +33,11 @@ nonisolated enum WorkflowStatus: String, Codable, Sendable {
 
 nonisolated struct WorkflowSourceFile: Codable, Equatable, Sendable {
     var url: URL
-    /// Empty only for an excluded specimen's unchecked historical source reference.
+    /// 仅已排除标本的未校验历史源引用可以为空。
     var fingerprint: String
 }
 
-/// Fixed slots freeze the source-to-side mapping, independent of queue position or exclusions.
+/// 固定槽位冻结源文件与正反面的对应关系，不受队列位置或排除操作影响。
 nonisolated struct WorkflowSources: Codable, Equatable, Sendable {
     var first: WorkflowSourceFile
     var second: WorkflowSourceFile
@@ -48,7 +51,7 @@ nonisolated struct WorkflowStageRecord: Codable, Equatable, Sendable {
     var inputVersion: Int = 1
     var outputVersion: String?
     var confirmedVersion: String?
-    /// Changes on start, cancellation, retry and invalidation; asynchronous results must match it.
+    /// 开始、取消、重试和失效时更新；异步结果必须匹配此修订号。
     var revision: Int = 0
     var error: String?
     var exclusionReason: String?
@@ -72,6 +75,7 @@ nonisolated enum WorkflowPSDChange: String, Codable, Equatable, Sendable {
     case stackContent, maskOnly, geometry
 }
 
+// MARK: - 单面任务与批次记录
 nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable {
     var id: UUID = UUID()
     var side: WorkflowSide
@@ -88,7 +92,7 @@ nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable 
     var matteArtifact: MatteArtifact?
     var geometryRequest: GeometryRequest = GeometryRequest()
     var geometrySolution: GeometrySolution?
-    /// A mask edit rechecks this saved candidate; it does not estimate a new angle or crop.
+    /// 仅修改蒙版时重新校验已保存候选，不重新估算角度或裁切。
     var geometryRevalidationRequired: Bool = false
     var lastPSDChange: WorkflowPSDChange?
     var roleImages: RoleImages?
@@ -119,7 +123,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var schemaVersion: Int = 1
     var id: UUID = UUID()
     var sourceDirectory: URL
-    /// Internal batch records and resumable working data; not a user-selected export folder.
+    /// 保存内部批次记录与可恢复的工作数据，不代表用户选择的导出目录。
     var outputDirectory: URL
     var outputLocations: WorkflowOutputLocations?
     var checkAfterStack: Bool = true
@@ -127,7 +131,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var checkGeometry: Bool?
     var check4K: Bool?
     var specimens: [WorkflowSpecimen]
-    /// nil is the legacy default; [] explicitly selects no derivatives.
+    /// nil 保留旧版默认语义；空数组明确表示不选择派生图片。
     var selectedDerivativeKinds: [WorkflowAssetKind]?
     var watermarkURL: URL?
     var presets: WorkflowPresets = WorkflowPresets()
@@ -136,7 +140,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
 
     var sideTasks: [WorkflowSideTask] { specimens.flatMap { [$0.front, $0.back] } }
     var activeTasks: [WorkflowSideTask] { specimens.filter { !$0.isExcluded }.flatMap { [$0.front, $0.back] } }
-    /// Derived from durable per-side records so partially confirmed specimens can advance independently.
+    /// 从各面的持久记录推导阶段，使已确认的部分标本可以独立推进。
     var currentStage: WorkflowStage? {
         WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
     }
@@ -157,16 +161,18 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
         if let outputLocations {
             return kind == .hd ? outputLocations.hd : kind == .png4k ? outputLocations.png4k : nil
         }
-        // Older manifests used subfolders within the batch directory.
+        // 旧版清单使用批次目录内的子文件夹。
         let folders: [WorkflowAssetKind: String] = [.hd: "高清堆栈", .png4k: "png 4k", .xianyu: "闲鱼产品图", .white1k: "1K 白底", .footage: "png 素材"]
         return outputDirectory.appendingPathComponent(folders[kind]!)
     }
 
+    // MARK: - 输出路径与清单校验
+    // 解析已有祖先再拼回未创建部分，避免符号链接让输出逃离授权目录。
     private static func canonicalComponents(_ url: URL) -> [String]? {
         var ancestor = url.standardizedFileURL
         var missing: [String] = []
         let fm = FileManager.default
-        // Foundation does not resolve intermediate symlinks when the destination does not exist yet.
+        // 目标尚不存在时，Foundation 不会解析中间路径的符号链接，因此先找到已存在的祖先。
         while !fm.fileExists(atPath: ancestor.path) {
             guard ancestor.path != "/", (try? fm.destinationOfSymbolicLink(atPath: ancestor.path)) == nil else { return nil }
             missing.insert(ancestor.lastPathComponent, at: 0)
@@ -197,7 +203,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                 if let root = exportDirectory(for: kind), Self.isContained(url, in: root) { return }
             }
         }
-        // PSDs beside originals must have exactly the frozen specimen name and side.
+        // 原图旁的 PSD 必须严格使用冻结后的标本名和正反面后缀。
         let allowed = specimens.flatMap { specimen in
             WorkflowSide.allCases.map { sourceDirectory.appendingPathComponent("\(specimen.baseName)_\($0.fileSuffix).psd") }
         }
@@ -266,6 +272,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+// MARK: - 产物与保存快照
 nonisolated struct WorkflowArtifact: Codable, Equatable, Sendable {
     var ownerTaskID: UUID
     var kind: WorkflowAssetKind
@@ -294,7 +301,7 @@ nonisolated struct PSDSnapshot: Codable, Equatable, Sendable {
     var snapshotURL: URL
     var contentVersion: String
     var pixelSize: CGSize
-    /// Stack-only snapshots can lack roles. A completed matte stage cannot.
+    /// 仅完成堆栈的快照可以没有角色标识，抠图阶段完成后则必须具备。
     var roles: PSDRoleIdentifiers?
     var structureSummary: String
 }
@@ -306,7 +313,7 @@ nonisolated struct StackPNG: Codable, Equatable, Sendable {
     var pixelSize: CGSize
     var orientation: Int
     var colorProfile: String
-    /// Read the alpha channel for source-background validity; this may be the RGBA PNG itself, never its luminance.
+    /// 通过 alpha 通道判断源背景有效性；可直接使用 RGBA PNG，不能使用其亮度。
     var validBackgroundAlphaURL: URL?
 }
 
@@ -320,6 +327,7 @@ nonisolated struct MatteArtifact: Codable, Equatable, Sendable {
     var pixelSize: CGSize
 }
 
+// MARK: - 几何请求与坐标约定
 nonisolated enum GeometryRatio: String, Codable, CaseIterable, Sendable {
     case adaptive, fiveByFour, elevenByEightPointFive, square
 }
@@ -337,7 +345,7 @@ nonisolated struct GeometryRequest: Codable, Equatable, Sendable {
     var centerOverride: CGPoint?
 }
 
-/// Fractions of output width (left/right) or height (top/bottom), not pixel distances.
+/// 左右留白以输出宽度占比表示，上下留白以输出高度占比表示，均不是像素距离。
 nonisolated struct WorkflowMargins: Codable, Equatable, Sendable {
     var left: Double
     var top: Double
@@ -347,13 +355,13 @@ nonisolated struct WorkflowMargins: Codable, Equatable, Sendable {
 
 nonisolated struct GeometrySolution: Codable, Equatable, Sendable {
     var sourceVersion: String
-    /// Incremental to the identified saved source snapshot, never an instruction to repeat a prior PS edit.
+    /// 相对于指定保存快照的增量角度，不能据此重复执行已经完成的 PS 编辑。
     var angleDegrees: Double
-    /// Current saved PSD coordinates, x right/y down; positive angles rotate clockwise about this pivot.
+    /// 采用当前保存 PSD 的坐标：x 向右、y 向下，正角度绕此中心顺时针旋转。
     var rotationPivot: CGPoint
     var leftWingTip: CGPoint?
     var rightWingTip: CGPoint?
-    /// Bounds and crop are in the current saved PSD plane AFTER rotation, before the crop-origin shift.
+    /// 主体边界与裁切框位于旋转后的 PSD 平面，尚未平移裁切原点。
     var subjectBounds: CGRect
     var sourceCropRect: CGRect
     var outputSize: CGSize
@@ -362,6 +370,7 @@ nonisolated struct GeometrySolution: Codable, Equatable, Sendable {
     var reason: String?
 }
 
+// 角色图像覆盖完整可编辑范围；可见裁切框与像素数组原点分别保存，不能混用。
 nonisolated struct RoleImages: Codable, Equatable, Sendable {
     var snapshotVersion: String
     var basePNG: URL

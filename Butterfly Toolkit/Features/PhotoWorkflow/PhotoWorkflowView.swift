@@ -1,7 +1,10 @@
+// 构建照片工作流的批次准备、标本队列、正反面预览和参数检查界面，将操作交给状态存储执行。
+
 import SwiftUI
 import UniformTypeIdentifiers
 import ImageIO
 
+// MARK: - 阶段与状态显示
 extension WorkflowStage {
     var title: String {
         switch self { case .stack: "景深合成"; case .matte: "AI 抠图与回写"; case .geometry: "旋转裁切"; case .hd: "堆栈原图"; case .png4k: "4K PNG"; case .derivatives: "派生图片" }
@@ -13,6 +16,7 @@ extension WorkflowStatus {
     }
 }
 
+// MARK: - 工作流页面
 struct PhotoWorkflowView: View {
     @ObservedObject var store: PhotoWorkflowStore
     @State private var selectedDraftID: UUID?
@@ -53,6 +57,7 @@ struct PhotoWorkflowView: View {
         .onChange(of: store.face) { store.cancelMove(); store.refreshVisibleImage() }
         .onDisappear { store.cancelMove() }
     }
+    // MARK: - 批次准备与固定槽位核对
     private var setup: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -132,6 +137,7 @@ struct PhotoWorkflowView: View {
                             HStack { Text(side == 0 ? "正面" : "反面").font(.headline); Spacer(); Text(side == 0 ? "F · 3 张原图" : "U · 3 张原图").font(.caption).foregroundStyle(.secondary) }
                             HStack(alignment: .top,spacing: 12) {
                                 ForEach(0..<3) { offset in
+                                    // 每面固定三张；移除或替换仅影响该槽位，不重新排列其余照片。
                                     let slot = side*3+offset
                                     VStack(alignment: .leading,spacing: 8) {
                                         WorkflowFileThumbnail(url: group.files[slot]).aspectRatio(1.2,contentMode: .fit)
@@ -235,6 +241,7 @@ struct PhotoWorkflowView: View {
             Text("两个目录可分别指定，流程在 PNG4K 导出后结束。").font(.caption).foregroundStyle(.secondary)
         }
     }
+    // MARK: - 执行队列与正反面对照
     private var execution: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -388,6 +395,7 @@ struct PhotoWorkflowView: View {
             Text("\(task.side.fileSuffix) · \(task[store.stage].state.title)").font(.system(size: 10)).foregroundStyle(task[store.stage].state == .failed ? .red : .secondary).lineLimit(1)
         }.frame(maxWidth: .infinity)
     }
+    // MARK: - 阶段参数与人工编辑
     private var parameters: some View {
         VStack(alignment: .leading,spacing: 24) {
             HStack { Text("参数与设置").font(.headline); Spacer(); Text(store.face == .front ? "正面 F" : "反面 U").font(.caption).foregroundStyle(Color.accentColor) }
@@ -514,6 +522,7 @@ struct PhotoWorkflowView: View {
     private var primaryTitle: String {
         switch store.stage { case .stack: "整批检查完成，继续 AI"; case .matte: "整批检查完成，继续构图"; case .geometry: "确认所选标本两面构图"; case .hd: "导出堆栈原图"; case .png4k: "确认两面并导出 4K PNG"; case .derivatives: "仅重试失败资产" }
     }
+    // 检查点条件由存储层汇总；界面仅据此禁用按钮，避免未验证预览进入确认。
     private var primaryDisabled: Bool {
         if store.busy || store.manualTaskID != nil || store.batch?.isPaused == true { return true }
         if store.stage == .hd && store.exportDirectory(for: .hd) == nil { return true }
@@ -525,6 +534,7 @@ struct PhotoWorkflowView: View {
     private func assetTitle(_ kind: WorkflowAssetKind) -> String {
         switch kind { case .hd: "高清堆栈 JPG"; case .png4k: "4096 透明 PNG"; case .xianyu: "闲鱼 2000 · 浅灰 RGB 238 · 水印"; case .white1k: "1K 白底 · 1000 · 留白 10 px"; case .footage: "PNG 素材 · 原尺寸紧裁" }
     }
+    // MARK: - 本地文件选择
     private func chooseFolder(_ action: (URL) -> Void) {
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.allowsMultipleSelection = false
         if panel.runModal() == .OK,let url = panel.url { action(url) }
@@ -535,6 +545,7 @@ struct PhotoWorkflowView: View {
     }
 }
 
+// MARK: - 原图缩略预览
 struct WorkflowFileThumbnail: View {
     var url: URL?
     @State private var image: CGImage?
@@ -549,6 +560,7 @@ struct WorkflowFileThumbnail: View {
                 guard let source = CGImageSourceCreateWithURL(url as CFURL,nil) else { return Optional<CGImage>.none }
                 return CGImageSourceCreateThumbnailAtIndex(source,0,[kCGImageSourceCreateThumbnailFromImageAlways: true,kCGImageSourceThumbnailMaxPixelSize: 512,kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
             }.value
+            // URL 改变会取消旧视图任务，忽略仍在后台解码的旧图返回值。
             guard !Task.isCancelled else { return }; image = decoded
         }
     }

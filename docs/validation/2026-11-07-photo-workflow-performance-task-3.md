@@ -1,6 +1,8 @@
 # 照片工作流性能优化：任务 3
 
-日期：2026-11-07。范围：[实施计划](../superpowers/plans/2026-11-07-photo-workflow-performance-implementation.md)任务 3。Toolkit 基线 `8a3a8c4`；AI 保持 `65695ee`，未修改。
+> 历史实测记录：结论、测试数量和未完成事项以文内日期及范围为限。当前行为与待办见 [照片工作流](../PHOTO-WORKFLOW.md)，分类见 [验证索引](README.md)；原始日志和临时路径不保证仍存在。
+
+日期：2026-11-07。范围：[第一轮性能记录](README.md)任务 3。Toolkit 基线 `8a3a8c4`；AI 保持 `65695ee`，未修改。
 
 ## 实现与保护边界
 

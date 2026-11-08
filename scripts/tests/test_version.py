@@ -95,8 +95,15 @@ class VersionTests(unittest.TestCase):
 
     def test_missing_xcode_configuration_reference_rejected(self):
         project = self.root / "Butterfly Toolkit.xcodeproj/project.pbxproj"
-        project.write_text(project.read_text().replace(
-            "baseConfigurationReference = B70000000000000000000001 /* Version.xcconfig */;", "", 1))
+        contents = plistlib.loads(subprocess.check_output(
+            ["plutil", "-convert", "xml1", "-o", "-", str(project)]))
+        objects = contents["objects"]
+        configurations = objects[objects[contents["rootObject"]]["buildConfigurationList"]]
+        configuration = objects[configurations["buildConfigurations"][0]]
+        # 按工程结构移除引用，不依赖 Xcode 自动生成的标识或显示注释。
+        self.assertIn("baseConfigurationReference", configuration)
+        del configuration["baseConfigurationReference"]
+        project.write_bytes(plistlib.dumps(contents))
         self.cli("check", ok=False)
 
     def test_milestone_requires_clean_tree_but_daily_check_does_not(self):

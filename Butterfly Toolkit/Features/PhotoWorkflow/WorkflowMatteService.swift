@@ -1,7 +1,10 @@
+// 调用 AI 抠图服务并校验输入与结果身份，同时提供图像解码、ICC 和逐像素蒙版一致性检查。
+
 import Foundation
 import ImageIO
 import CoreGraphics
 
+// MARK: - 工作流错误与推理服务
 nonisolated enum WorkflowBridgeError: LocalizedError, Equatable {
     case unsavedDocument, staleSource, invalidStructure, ownershipConflict, invalidImage(String), photoshop(String)
     var errorDescription: String? {
@@ -46,6 +49,7 @@ nonisolated struct WorkflowMatteService: Sendable {
             throw WorkflowBridgeError.invalidImage("缺少完整推理事件或输入身份不符")
         }
         let alphaURL = URL(fileURLWithPath: alphaPath), cutoutURL = URL(fileURLWithPath: cutoutPath)
+        // 同时校验推理记录与当前输入哈希，防止外部文件在推理期间被替换。
         let record = try JSONSerialization.jsonObject(with: Data(contentsOf: cutoutURL.deletingLastPathComponent().appendingPathComponent("result.json"))) as? [String: Any]
         guard record?["inputSha256"] as? String == input.fingerprint,
               try AIFileValidation.hash(input.pngURL.path) == input.fingerprint else { throw WorkflowBridgeError.staleSource }
@@ -60,12 +64,13 @@ nonisolated struct WorkflowMatteService: Sendable {
     }
 }
 
+// MARK: - 图像解码与像素校验
 nonisolated struct WorkflowDecodedImage: Sendable {
     let image: CGImage
     let raster: WorkflowRaster
 }
 
-/// Decode every pixel, normalizing ICC to sRGB and checking premultiplied RGB/alpha coordinates.
+/// 完整解码像素并归一到 sRGB，供预乘 RGB 与 alpha 的坐标一致性检查使用。
 nonisolated struct WorkflowRaster: Sendable {
     let size: CGSize
     let orientation: Int
@@ -104,6 +109,7 @@ nonisolated struct WorkflowRaster: Sendable {
         }
         return false
     }
+    // alpha 图应是不透明灰度图；透明结果的颜色还需符合源图的预乘规则。
     static func validateMatte(original: Self, alpha: Self, cutout: Self, respectSourceAlpha: Bool = false) throws {
         guard original.size == alpha.size, original.size == cutout.size, alpha.orientation == 1, cutout.orientation == 1 else {
             throw WorkflowBridgeError.invalidImage("Alpha 尺寸或方向不符")

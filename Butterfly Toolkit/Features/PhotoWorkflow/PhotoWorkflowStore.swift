@@ -1,7 +1,11 @@
+// 连接照片工作流界面与执行器，管理建批次草稿、选中状态、异步预览、构图编辑和人工 PSD 操作。
+
 import SwiftUI
 import Combine
 import AppKit
 
+// MARK: - 六图分组与批次冻结
+// 移除照片只清空当前槽位，历史引用仍保留，便于明确排除整组后追溯原映射。
 nonisolated struct WorkflowDraftGroup: Identifiable, Sendable {
     var id = UUID()
     var files: [URL?] {
@@ -44,7 +48,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let specimens = try zip(groups,names).map { group,name -> WorkflowSpecimen in
             let files: [WorkflowSourceFile]
             if group.excluded {
-                // Historical references only: excluded slots are never read or represented as content-verified.
+                // 仅保留历史引用：不读取已排除槽位，也不将其标记为已校验内容。
                 files = group.historicalFiles.map { WorkflowSourceFile(url: $0,fingerprint: "") }
             } else {
                 guard group.files.allSatisfy({ $0 != nil }) else { throw WorkflowBridgeError.invalidImage("组 \(name) 的固定映射不完整") }
@@ -63,6 +67,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
 }
 
+// MARK: - 界面状态与当前预览
 @MainActor final class PhotoWorkflowStore: ObservableObject {
     @Published var draft: WorkflowBatchDraft?
     @Published var names = ""
@@ -165,7 +170,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             previewTasks[id]?.cancel(); previewTasks[id] = nil
             images[id] = nil; imageIdentities[id] = nil; requestedImageIdentities[id] = nil
             gates[id] = nil; loading.remove(id)
-            // A new thumbnail request also fences any in-flight full-detail completion.
+            // 新缩略图请求同时使尚未完成的旧全尺寸预览结果失效。
             if manualTaskID == nil,let task = batch?.task(id: id) { requestPreview(task: task) }
         }
     }
@@ -183,6 +188,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             return task[.geometry].state == .waitingReview || task[.geometry].state == .completed
         }
     }
+    // MARK: - 批次创建、打开与切换
     func scan(_ directory: URL) {
         do { draft = try WorkflowBatchDraft.scan(directory: directory); error = nil } catch { self.error = error.localizedDescription }
     }
@@ -256,7 +262,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let executor,let batch,let manifestURL else { return }
         await executor.pause(batchID: batch.id)
         let paused = try await executor.batch(batchID: batch.id)
-        // pause is intentionally best-effort at executor level; switching requires a successful durable save.
+        // 执行器暂停采用尽力保存策略；切换批次则必须确认持久化成功。
         try await WorkflowBatchStore().save(paused,to: manifestURL)
         self.batch = paused
     }
@@ -273,6 +279,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let workspace = output.appendingPathComponent(".work")
         return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),matte: WorkflowMatteService(engine: engine ?? URL(fileURLWithPath: enginePath),workspace: workspace,worker: inference),geometry: geometry))
     }
+    // MARK: - 命令执行与状态同步
     private func launch(_ action: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil
         command = Task { [self] in
@@ -287,6 +294,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let executor,let id = batch?.id else { return }
         do {
             let value = try await readBatch(executor,id)
+            // 读取可能跨越批次切换；只接收仍属于当前执行器与批次的返回值。
             guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id else { return }
             let previous = batch; batch = value
             if let current = value.currentStage,previous?.currentStage != current { stage = current }
@@ -316,11 +324,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     func refreshVisibleImage() {
         guard manualTaskID == nil,let task = currentTask else { return }; requestPreview(task: task)
     }
+    // MARK: - 构图草稿与异步预览
     func editRequest(_ edit: (inout GeometryRequest) -> Void) {
         guard let task = currentTask,manualTaskID == nil else { return }
         if let version = task.snapshot?.contentVersion,warmSources.contains(version),images[task.id] != nil { previewInteractionStarted[task.id] = ProcessInfo.processInfo.systemUptime }
         var request = currentRequest; edit(&request); requests[task.id] = request
-        // Dragging uses the cached full source immediately; exact validation follows asynchronously.
+        // 交互时立即用缓存源图更新预览，精确校验随后异步完成。
         if var solution = solutions[task.id] {
             if case .manual(let angle) = request.angleStrategy { solution.angleDegrees = angle }
             let b = solution.subjectBounds,factor = 1-2*request.targetMargin
@@ -366,6 +375,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         previewTasks[task.id]?.cancel()
         requestedImageIdentities[task.id] = identity
         if imageIdentities[task.id] != identity { images[task.id] = nil; imageIdentities[task.id] = nil }
+        // 取消旧任务之外还更新令牌，拦截不响应取消的解码或几何服务迟到结果。
         var gate = gates[task.id] ?? WorkflowPreviewGate(); let token = gate.begin(sourceVersion: roles.snapshotVersion); gates[task.id] = gate; loading.insert(task.id)
         let request = request ?? requests[task.id] ?? task.geometryRequest
         let saved = task.geometrySolution
@@ -387,6 +397,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             }
         }
     }
+    // MARK: - 检查点确认与人工编辑
     func primary() {
         guard let e = executor,let b = batch else { return }
         let selected = b.specimens.filter { selectedSpecimens.contains($0.id) }.flatMap { [$0.front,$0.back] }

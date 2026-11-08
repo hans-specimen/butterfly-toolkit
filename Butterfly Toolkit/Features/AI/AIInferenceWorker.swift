@@ -1,5 +1,9 @@
+// 负责照片工作流的常驻 AI 推理会话，以先进先出队列复用子进程，并校验请求身份、输出路径和取消清理。
+
 import Foundation
 import Darwin
+
+// MARK: - 推理请求
 
 nonisolated struct WorkflowInferenceRequest: Sendable {
     let engine: URL
@@ -8,7 +12,9 @@ nonisolated struct WorkflowInferenceRequest: Sendable {
     let device: String
 }
 
-/// A batch session has an explicit FIFO lease; actor reentrancy alone does not serialize inference.
+// MARK: - 会话队列与生命周期
+
+/// 批次会话显式按先进先出顺序占用连接；仅靠 actor 隔离无法阻止等待期间的重入推理。
 actor AIInferenceWorker {
     private struct Job {
         let id: UUID
@@ -36,6 +42,7 @@ actor AIInferenceWorker {
             }
         } onCancel: { Task { await self.cancel(id) } }
     }
+    // 并发关闭共用同一清理任务，等待当前请求结束后再释放连接。
     func shutdown() async {
         if let pending = shutdownTask { await pending.value; return }
         stopping = true
@@ -75,9 +82,10 @@ actor AIInferenceWorker {
                     connection = nil; active = nil
                     job.result.resume(throwing: CancellationError()); return
                 }
+                // 单个请求失败仍可复用连接；进程或协议失败则使整个会话失效。
                 if error is AIWorkerRequestError { job.result.resume(throwing: error) }
                 else {
-                    // Keep the session failed until its owner ends it; a next automatic face cannot restart it.
+                    // 保留失败状态直到会话所有者关闭，防止下一个自动处理的标本面擅自重启会话。
                     sessionFailure = error; stopping = true; failQueued(error)
                     if let current = connection { current.cancel(); await Task.detached { current.finish() }.value }
                     connection = nil; stopping = false; active = nil
@@ -94,7 +102,9 @@ private nonisolated struct AIWorkerRequestError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// One blocking exchange at a time, always on a detached task. Only cancel is concurrent.
+// MARK: - 常驻进程连接与协议
+
+/// 每次只执行一个阻塞交互，且始终在独立任务中运行；只有取消允许并发调用。
 private nonisolated final class AIWorkerConnection: @unchecked Sendable {
     private struct Envelope: Decodable {
         let event: String
@@ -130,7 +140,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
         child.environment = environment
         child.terminationHandler = { [exited] _ in exited.leave() }
         child.standardInput = input; child.standardOutput = output; child.standardError = log
-        // A dead child must produce a write error, never SIGPIPE in the application.
+        // 子进程退出后写入应返回错误，不能通过 SIGPIPE 终止应用。
         _ = fcntl(input.fileHandleForWriting.fileDescriptor,F_SETNOSIGPIPE,1)
     }
     func cancel() {
@@ -147,7 +157,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
     }
     func finish() {
         cancel()
-        // Launch and cleanup can use different threads; wait on exit notification, not a thread's run loop.
+        // 启动与清理可能位于不同线程；等待退出通知，避免依赖启动线程的运行循环。
         if started { exited.wait() }
         try? input.fileHandleForWriting.close(); try? output.fileHandleForReading.close()
         try? input.fileHandleForReading.close(); try? output.fileHandleForWriting.close()
@@ -162,12 +172,15 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
             catch { exited.leave(); throw error }
         }
     }
+    // MARK: - 请求交换与响应校验
+
     func exchange(_ request: WorkflowInferenceRequest,id: UUID) throws -> AIEvent {
         guard request.engine.standardizedFileURL == identity.engine.standardizedFileURL,
               request.workspace.standardizedFileURL == identity.workspace.standardizedFileURL,request.device == identity.device else {
             throw AIWorkerRequestError(message: "AI 会话不能切换引擎、工作目录或设备，请先关闭会话。")
         }
         try launch()
+        // 首次请求先校验协议版本，后续响应必须携带当前请求的标识。
         if !ready {
             let data = try line(),envelope = try JSONDecoder().decode(Envelope.self,from: data)
             guard envelope.event == "ready",envelope.version == 1,envelope.requestID == nil else { throw protocolError() }
@@ -185,6 +198,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
             case "completed":
                 guard event.input.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath() }) == request.input.resolvingSymlinksInPath(),
                       let directory = event.outputDirectory,let prediction = event.prediction,let alpha = event.predictionAlpha else { throw protocolError() }
+                // 解析符号链接后限制输出归属，防止接受其他输入或工作目录之外的结果。
                 let root = request.workspace.resolvingSymlinksInPath().appendingPathComponent("outputs").path+"/"
                 let folder = URL(fileURLWithPath: directory).resolvingSymlinksInPath()
                 guard folder.path.hasPrefix(root),[prediction,alpha].allSatisfy({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().deletingLastPathComponent().path == folder.path }) else { throw protocolError() }
@@ -193,6 +207,7 @@ private nonisolated final class AIWorkerConnection: @unchecked Sendable {
             }
         }
     }
+    // 限制单行事件大小，避免异常子进程输出无限累积在内存中。
     private func line() throws -> Data {
         while true {
             if let end = buffer.firstIndex(of: 10) {

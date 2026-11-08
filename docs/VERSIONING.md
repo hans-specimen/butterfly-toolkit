@@ -98,6 +98,7 @@ git worktree add --detach ../butterfly-toolkit-v1.2.3 v1.2.3
 ```sh
 python3 -m unittest discover -s scripts/tests -v
 python3 scripts/version.py check
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 xcodebuild -project 'Butterfly Toolkit.xcodeproj' -scheme 'Butterfly Toolkit' \
   -configuration Release -derivedDataPath /tmp/toolkit-version-build \
   CODE_SIGNING_ALLOWED=NO build

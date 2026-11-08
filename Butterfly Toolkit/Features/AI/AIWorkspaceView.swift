@@ -1,6 +1,10 @@
+// 组装 AI 工作区页面、工具栏和检查器，并提供标本分组设置及成对训练素材导入界面。
+
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+
+// MARK: - 工作区容器与页面路由
 
 struct AIWorkspaceView: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -21,6 +25,7 @@ struct AIWorkspaceView: View {
             } else if store.isLoading && store.catalog == nil {
                 ProgressView("正在读取本机资料…").frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                // 共用一个工作区状态，切换页面时保留样本选择和处理进度。
                 switch page {
                 case .aiCutout: AICutoutView(store: store)
                 case .aiSamples: AISamplesView(store: store)
@@ -81,6 +86,8 @@ struct AIWorkspaceView: View {
         } message: { Text(store.error ?? "") }
         .task { store.loadOnce() }
     }
+
+    // MARK: - 当前页面检查器
 
     @ViewBuilder private var inspectorContent: some View {
         switch page {
@@ -171,6 +178,8 @@ struct AIWorkspaceView: View {
     }
 }
 
+// MARK: - 检查器信息行
+
 struct AIInfoRow: View {
     let label: String
     let value: String
@@ -179,6 +188,8 @@ struct AIInfoRow: View {
         HStack(alignment: .top, spacing: 12) { Text(label).foregroundStyle(.secondary); Spacer(minLength: 2); Text(value).multilineTextAlignment(.trailing) }.font(.callout)
     }
 }
+
+// MARK: - 标本组与用途设置
 
 struct AICurationSheet: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -196,6 +207,7 @@ struct AICurationSheet: View {
             Picker("整组用途", selection: $use) { ForEach(AISampleUse.allCases) { Text($0.rawValue).tag($0) } }
             Text("这只保存分组信息，不启动训练。对齐异常的图片即使属于训练组，也无法选入训练任务。")
                 .font(.callout).foregroundStyle(.secondary)
+            // 保存操作交由工作区按标本组更新用途，同时清理不再合格的训练选择。
             HStack { Button("取消", role: .cancel) { dismiss() }; Spacer(); Button("保存") {
                 store.updateCuration(sample: sample, group: group, confirmed: confirmed, use: use); dismiss()
             }.buttonStyle(.borderedProminent).disabled(group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !confirmed) }
@@ -203,6 +215,8 @@ struct AICurationSheet: View {
             .onAppear { let record = store.record(for: sample); group = record.specimenGroup; confirmed = record.groupConfirmed; use = store.curation.use(for: sample.id) }
     }
 }
+
+// MARK: - 成对素材导入
 
 struct AIImportSheet: View {
     @ObservedObject var store: AIWorkspaceStore
@@ -231,6 +245,7 @@ struct AIImportSheet: View {
                 if store.isLoading { ProgressView().controlSize(.small) }
                 Button("复制并导入") {
                     guard let original, let reference else { return }
+                    // 仅成功导入后关闭弹窗；失败时保留选择，便于查看错误并重试。
                     Task { if await store.importPair(original: original, reference: reference, group: group, kind: kind, confirmed: confirmed) { dismiss() } }
                 }.buttonStyle(.borderedProminent).disabled(original == nil || reference == nil || store.busy || (confirmed && group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }

@@ -1,3 +1,5 @@
+// 桥接 Photoshop 堆栈、蒙版回写、角色提取与几何操作，维护文档归属、不可变快照和中断恢复。
+
 import Foundation
 import CoreGraphics
 
@@ -33,6 +35,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }) {
         self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver; self.stackProcessor = stackProcessor; self.reuseDocumentsWithinOperation = reuseDocumentsWithinOperation
     }
+    // MARK: - 持久归属与服务元数据
     private struct InstallTransaction: Codable, Sendable {
         var sourceVersion: String
         var result: PSDSnapshot
@@ -65,6 +68,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var performance: [String: Double]?
         var documentPeak: Int?
     }
+    // MARK: - 堆栈创建与保存输入
     func stackWithInput(job: FocusStackJob, owner: UUID) async throws -> WorkflowStackPreparation {
         try await prepareStack(job: job, owner: owner, prepareInput: true)
     }
@@ -98,7 +102,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                 try await stackProcessor(ownedJob, hook)
             }
             guard try job.sourceFiles.map({ try hash($0.path) }) == hashes else { throw WorkflowBridgeError.staleSource }
-            // Move refuses a late same-name collision; the legacy processor's skip behavior cannot adopt an unknown PSD.
+            // 移动操作拒绝后出现的同名冲突，不能借旧处理器的跳过行为接管归属未知的 PSD。
             let record = ownershipURL(job.destinationURL)
             try FileManager.default.createDirectory(at: job.destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let sources = zip(job.sourceFiles, hashes).map { WorkflowSourceFile(url: $0.0.resolvingSymlinksInPath(), fingerprint: $0.1) }
@@ -107,7 +111,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             do { try FileManager.default.moveItem(at: staged, to: job.destinationURL) }
             catch { try? FileManager.default.removeItem(at: record); throw error }
             let snapshot = try await capture(document: job.destinationURL, owner: owner)
-            // Optional input failure must never invalidate an already published, recoverable PSD.
+            // 可选输入准备失败不能使已发布且可恢复的 PSD 失效。
             var input: StackPNG?
             if prepareInput, snapshot.contentVersion == ownership.initialStackVersion {
                 input = try? preparedInput(candidate, snapshot: snapshot)
@@ -120,7 +124,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         guard raster.size == snapshot.pixelSize, raster.orientation == 1, raster.hasProfile else {
             throw WorkflowBridgeError.invalidImage("预备 PNG 尺寸、方向或 ICC 缺失")
         }
-        // PSD serialization can change hidden RGB at alpha=0. Keep transparent inputs on the reopened path.
+        // PSD 序列化可能改变 alpha 为零处的隐藏 RGB，因此透明输入仍需重新打开 PSD 后导出。
         guard stride(from: 3, to: raster.pixels.count, by: 4).allSatisfy({ raster.pixels[$0] == 255 }) else {
             throw WorkflowBridgeError.invalidImage("透明输入保留重新打开 PSD 导出路径")
         }
@@ -152,7 +156,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
     func validateStackInput(snapshot: PSDSnapshot, input: StackPNG) async throws -> Bool {
         try await withLease("validateStackInput", owner: snapshot.taskID, savedRead: true) {
-            // Keep the source-version fence that reopening/exporting the input would have performed.
+            // 即使复用输入，也保留重新打开并导出时应执行的源版本校验。
             try await verify(snapshot)
             guard input.snapshotVersion == snapshot.contentVersion, input.pixelSize == snapshot.pixelSize,
                   input.orientation == 1, !input.colorProfile.isEmpty,
@@ -174,6 +178,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                 pixelSize: raster.size, orientation: raster.orientation, colorProfile: raster.profileName ?? metadata.profile, validBackgroundAlphaURL: output)
         }
     }
+    // MARK: - 蒙版事务与发布恢复
     func installMatte(snapshot: PSDSnapshot, matte: MatteArtifact) async throws -> PSDSnapshot {
         try await withLease("install", owner: snapshot.taskID, savedRead: false) {
             let record = ownershipURL(snapshot.workingURL)
@@ -196,7 +201,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try measure("pixel.validateMatte-including-read") {
                 try WorkflowRaster.validateMatte(original: readRaster(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
             }
-            // Prepare and validate off to the side; a failure here leaves the working PSD and its ownership unchanged.
+            // 先在独立副本中准备并校验，失败时不会改变工作 PSD 及其归属。
             let staged = try outputDirectory("install/\(UUID())", owner: snapshot.taskID).appendingPathComponent("result.psd")
             try self.copy(at: snapshot.snapshotURL, to: staged)
             try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: staged.path)
@@ -218,7 +223,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             return saved
         }
     }
-    /// Only a persisted, fully validated result may bridge the PSD/ownership publication boundary.
+    /// 只有已持久化且完整校验的结果，才能用于恢复 PSD 与归属记录之间的发布过程。
     private func recoverInstall(document: URL, owner: UUID, allowPublication: Bool, captureResult: Bool = false) async throws -> PSDSnapshot? {
         let record = ownershipURL(document)
         let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
@@ -231,7 +236,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
               (try hash(pending.matte.cutoutURL.path)) == pending.matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
         let current = try hash(document.path)
         if current == pending.sourceVersion {
-            // Saved readback during manual editing must never publish an automatic PSD write.
+            // 人工编辑期间读取保存结果，不得触发自动 PSD 写入发布。
             guard allowPublication else { return nil }
             let closed = try await invoke(Self.closeForPublicationScript(document: document))
             guard closed.roles == nil, try hash(document.path) == pending.sourceVersion else { throw WorkflowBridgeError.staleSource }
@@ -244,7 +249,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             if closed.wasOpen == true { _ = try await invoke(Self.reopenScript(document: document)) }
             try await installCheckpoint(.published)
         } else if current != pending.result.contentVersion { throw WorkflowBridgeError.staleSource }
-        // Publication has closed the old handle; acquire the new disk version only now.
+        // 发布已关闭旧文档句柄，此时才能重新取得磁盘上的新版本。
         let previousOwnership = ownership
         return try await withOpenDocument(at: document) {
             let metadata = try await invoke(Self.inspectScript(document: document))
@@ -270,6 +275,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             throw WorkflowBridgeError.invalidImage("PSD 保存后的蒙版与 AI Alpha 不一致")
         }
     }
+    // MARK: - 角色提取与几何写回
     func extractRoles(snapshot: PSDSnapshot) async throws -> RoleImages {
         try await withLease("extract", owner: snapshot.taskID, savedRead: true) {
             try await verify(snapshot)
@@ -293,7 +299,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
     private func extractUnlocked(_ snapshot: PSDSnapshot) async throws -> RoleImages {
         guard snapshot.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
-        // Callers have already checked the saved PSD. Reuse only the exact validated pixels.
+        // 调用方已校验保存的 PSD，此处只复用身份与内容完全匹配的已校验像素。
         let receipt = workspace.appendingPathComponent("role-cache/\(snapshot.taskID)/\(snapshot.contentVersion).json")
         if let cache = try? JSONDecoder().decode(RoleCache.self, from: Data(contentsOf: receipt)),
            sameExtractionSource(cache.snapshot, snapshot), cache.images.snapshotVersion == snapshot.contentVersion,
@@ -315,7 +321,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         do { try measure("pixel.validateMatte") { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) } }
         catch { throw WorkflowBridgeError.invalidStructure }
         guard try roleFingerprints(images) == fingerprints else { throw WorkflowBridgeError.staleSource }
-        // Cache publication is optional; a missing or damaged receipt simply triggers extraction.
+        // 缓存写入为可选优化；凭据缺失或损坏时重新提取即可。
         if let data = try? JSONEncoder().encode(RoleCache(snapshot: snapshot, images: images, fingerprints: fingerprints)) {
             try? FileManager.default.createDirectory(at: receipt.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: receipt, options: .atomic)
@@ -323,7 +329,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         return images
     }
     private func sameExtractionSource(_ lhs: PSDSnapshot, _ rhs: PSDSnapshot) -> Bool {
-        // Publication changes the working path, not the validated immutable extraction source.
+        // 发布会改变工作路径，但不会改变已校验的不可变提取源。
         lhs.taskID == rhs.taskID && lhs.contentVersion == rhs.contentVersion &&
         lhs.snapshotURL == rhs.snapshotURL && lhs.pixelSize == rhs.pixelSize &&
         lhs.roles == rhs.roles && lhs.structureSummary == rhs.structureSummary
@@ -331,6 +337,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     private func roleFingerprints(_ images: RoleImages) throws -> [String] {
         try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try hash($0.path) }
     }
+    // MARK: - 快照捕获与源版本验证
     private func capture(document: URL, owner: UUID) async throws -> PSDSnapshot {
         let started = observationStart()
         defer { report("capture", since: started) }
@@ -347,7 +354,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         if !existing { try self.copy(at: document, to: temporary) }
         guard try hash((existing ? immutable : temporary).path) == before,
               (try hash(document.path)) == before else { throw WorkflowBridgeError.staleSource }
-        // A retained working document is not disk readback. Inspect the hashed copy independently.
+        // 保留的工作文档句柄不能代表磁盘读回，因此独立检查经过哈希校验的副本。
         let held = Self.openedDocument?.url == document.resolvingSymlinksInPath()
         let readback = held ? (existing ? immutable : temporary) : document
         let second = try await invoke(Self.inspectScript(document: readback))
@@ -374,7 +381,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true); return directory
     }
     private func ownershipURL(_ document: URL) -> URL { document.appendingPathExtension("workflow-owner.json") }
-    // Observation is synchronous and opt-in; it never adds suspension to a publication fence.
+    // 观察回调按需同步执行，不在发布前的校验边界增加挂起点。
     private func observationStart() -> Double? { performanceObserver == nil ? nil : ProcessInfo.processInfo.systemUptime }
     private func report(_ operation: String, since start: Double?) {
         guard let start, let observer = performanceObserver else { return }
@@ -390,6 +397,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         try measure("copy") { try FileManager.default.copyItem(at: source, to: destination) }
     }
     private func readRaster(_ url: URL) throws -> WorkflowRaster { try measure("raster.read") { try WorkflowRaster.read(url) } }
+    // MARK: - 协调器租约与脚本执行
     private func withLease<T: Sendable>(_ name: String, owner: UUID, savedRead: Bool,
         operation: @escaping @Sendable () async throws -> T) async throws -> T {
         let queued = observationStart()
@@ -404,7 +412,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         if savedRead { return try await coordinator.readSaved(owner: owner, operation: body) }
         return try await coordinator.run(owner: owner, operation: body)
     }
-    /// Called only inside an existing coordinator lease. No handles survive this service scope.
+    /// 仅在已持有协调器租约时调用，文档句柄不得超出本次服务作用域。
     private func withOpenDocument<T: Sendable>(at url: URL, operation: @Sendable () async throws -> T) async throws -> T {
         guard reuseDocumentsWithinOperation else { return try await operation() }
         let path = url.resolvingSymlinksInPath(), token = "workflowDocument_" + UUID().uuidString
@@ -414,7 +422,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             opened = try await invoke(Self.acquireDocumentScript(path, token: token))
             guard opened.documentID != nil, opened.wasOpen != nil else { throw WorkflowBridgeError.invalidStructure }
         } catch {
-            // Even a lost/invalid response may have opened a document; the nonce proves ownership.
+            // 响应丢失或无效时文档仍可能已打开，使用随机令牌证明本次操作的归属。
             _ = try? await Task.detached {
                 try await Self.$performanceTaskID.withValue(performanceTaskID) {
                     try await invoke(Self.releaseDocumentScript(path, token: token, documentID: nil))
@@ -426,7 +434,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         let result: Result<T, Error>
         do { result = .success(try await Self.$openedDocument.withValue(handle) { try await operation() }) }
         catch { result = .failure(error) }
-        // Cancellation must not release the coordinator lease before Photoshop cleanup finishes.
+        // 即使任务取消，也必须等 Photoshop 清理完成后再释放协调器租约。
         _ = try await Task.detached {
             try await Self.$performanceTaskID.withValue(performanceTaskID) {
                 try await invoke(Self.releaseDocumentScript(path, token: token, documentID: handle.documentID))
@@ -442,7 +450,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         if performanceObserver == nil {
             script = Self.commonScript + scope + "\n(function(){" + body + "}());"
         } else {
-            // Attach metrics after the inner finally blocks have closed temporary documents.
+            // 等内部 finally 关闭临时文档后，再附加性能指标。
             script = Self.commonScript + Self.performanceScript + scope + "\nvar wfResult=(function(){" + body + "}());" +
                 "var wfDecoded=eval('('+wfResult+')');wfDecoded.performance=wfPerformance;wfDecoded.documentPeak=wfPeak;wfJSON(wfDecoded);"
         }
@@ -467,7 +475,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             guard let application = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("workflow-\(UUID()).jsx")
             defer { try? FileManager.default.removeItem(at: url) }
-            // ExtendScript otherwise guesses legacy encoding when Chinese text occurs late in a long script.
+            // 添加 BOM，避免中文位于长脚本后部时 ExtendScript 误判为旧编码。
             try ("\u{FEFF}" + script).write(to: url, atomically: true, encoding: .utf8)
             let process = Process(), stdout = Pipe(), stderr = Pipe()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -493,6 +501,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
 }
 
+// MARK: - Photoshop 脚本生成
 extension PhotoshopWorkflowBridge {
     private static func acquireDocumentScript(_ url: URL, token: String) -> String {
         """
@@ -560,6 +569,7 @@ extension PhotoshopWorkflowBridge {
     wfRolePNG=wfWrap('role-encode',wfRolePNG);
     wfStackPNG=wfWrap('stack-encode',wfStackPNG);
     """#
+    // 公共脚本负责保存状态、角色结构与图层身份校验，后续脚本共享同一组约束。
     private static let commonScript = #"""
     #target photoshop
     function wfJSON(v) {
@@ -624,7 +634,7 @@ extension PhotoshopWorkflowBridge {
         return {width:doc.width.as('px'),height:doc.height.as('px'),profile:doc.colorProfileName,roles:roles?roles.ids:null,summary:summary};
     }
     function wfPNG(doc,path) { var p=new ExportOptionsSaveForWeb();p.format=SaveDocumentType.PNG;p.PNG8=false;p.transparency=true;p.interlaced=false;p.includeProfile=true;doc.exportDocument(new File(path),ExportType.SAVEFORWEB,p); }
-    // Role PNGs need fast lossless encoding and ICC; PNGSaveOptions omits the profile.
+    // 角色 PNG 需要快速无损编码并保留 ICC；PNGSaveOptions 会遗漏色彩配置。
     function wfRolePNG(doc,path) {
         if(doc.bitsPerChannel!==BitsPerChannelType.EIGHT || doc.mode!==DocumentMode.RGB){wfPNG(doc,path);return;}
         app.activeDocument=doc;var s=stringIDToTypeID,p=new ActionDescriptor(),d=new ActionDescriptor();
@@ -638,7 +648,7 @@ extension PhotoshopWorkflowBridge {
     }
     function wfStackPNG(doc,path) {
         if(doc.mode!==DocumentMode.RGB || doc.bitsPerChannel!==BitsPerChannelType.EIGHT || doc.colorProfileName!=='sRGB IEC61966-2.1'){wfPNG(doc,path);return;}
-        // Match Save for Web's canonical sRGB ICC without transforming the already-sRGB pixels.
+        // 匹配 Save for Web 使用的标准 sRGB ICC，不再变换已经处于 sRGB 的像素。
         app.activeDocument=doc;var profile=new ActionDescriptor();
         var target=new ActionReference();target.putEnumerated(charIDToTypeID('Dcmn'),charIDToTypeID('Ordn'),charIDToTypeID('Trgt'));
         profile.putReference(charIDToTypeID('null'),target);
@@ -722,6 +732,7 @@ extension PhotoshopWorkflowBridge {
         }finally{if(maskDoc)wfCloseDocument(maskDoc);if(copy)wfCloseDocument(copy);app.displayDialogs=dialogs;wfClose(o);}
         """
     }
+    // 在临时副本上展开隐藏像素，并回传相对当前 PSD 的像素原点和可编辑范围。
     private static func rolesScript(document: URL, folder: URL) -> String {
         """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null,mask=null;
@@ -730,7 +741,7 @@ extension PhotoshopWorkflowBridge {
             copy=wfDuplicate(o.doc);app.activeDocument=copy;var r=wfRoles(copy),b=wfBounds(r.base);
             var left=Math.min(0,Math.floor(b[0])),top=Math.min(0,Math.floor(b[1]));
             var right=Math.max(meta.width,Math.ceil(b[2])),bottom=Math.max(meta.height,Math.ceil(b[3]));
-            // Reveal hidden pixels only on a disposable duplicate, never crop the task PSD.
+            // 仅在可丢弃的副本上展开隐藏像素，不裁切任务 PSD。
             copy.resizeCanvas(UnitValue(right-left,'px'),UnitValue(bottom-top,'px'),AnchorPosition.TOPLEFT);
             r.adjust.translate(UnitValue(-left,'px'),UnitValue(-top,'px'));
             wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;
@@ -748,6 +759,7 @@ extension PhotoshopWorkflowBridge {
         }finally{if(mask)wfCloseDocument(mask);if(copy)wfCloseDocument(copy);wfClose(o);}
         """
     }
+    // 共同调整组先绕自身中心旋转，再平移补偿为指定支点；裁切保留框外可编辑像素。
     private static func geometryScript(document: URL, solution: GeometrySolution) -> String {
         let rect = solution.sourceCropRect
         return """

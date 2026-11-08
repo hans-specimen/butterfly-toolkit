@@ -1,3 +1,5 @@
+// 管理 AI 工作区的界面状态、目录载入、素材导入、单图推理与分组记录，并保护原始文件及结果内容的一致性。
+
 import SwiftUI
 import Combine
 import AppKit
@@ -6,6 +8,8 @@ import ImageIO
 
 @MainActor
 final class AIWorkspaceStore: ObservableObject {
+    // MARK: - 界面状态与派生数据
+
     @Published var enginePath: String
     @Published var catalog: AICatalog?
     @Published var samples: [AISample] = []
@@ -40,6 +44,8 @@ final class AIWorkspaceStore: ObservableObject {
         record(for: sample).canTrain(sample) && curation.use(for: sample.id) == .training
     }
     func record(for sample: AISample) -> AISampleCuration { curation.samples[sample.id] ?? AISampleCuration() }
+
+    // MARK: - 项目选择与目录载入
 
     func loadOnce() { if !hasLoaded && !enginePath.isEmpty { hasLoaded = true; load() } }
     func chooseEngine() {
@@ -79,6 +85,7 @@ final class AIWorkspaceStore: ObservableObject {
                 catalog = loaded
                 selectedRunPath = loaded.runPath.isEmpty ? nil : loaded.runPath
                 UserDefaults.standard.set(selectedRunPath, forKey: "aiRunPath")
+                // 大文件哈希校验移出主执行器，载入后只合并仍有效的持久化结果。
                 curation = try await Task.detached {
                     try AIFileValidation.readCuration(engine: engine, samples: loaded.samples)
                 }.value
@@ -97,6 +104,8 @@ final class AIWorkspaceStore: ObservableObject {
             catch { catalog = nil; samples = []; self.error = error.localizedDescription; status = "载入失败" }
         }
     }
+    // MARK: - 单图推理与取消
+
     func runInference() {
         guard !busy, let sample = selected else { return }
         let engine = engineURL
@@ -116,6 +125,7 @@ final class AIWorkspaceStore: ObservableObject {
                     let output = try AIFileValidation.captureOutput(prediction: prediction, alpha: alpha, original: sample.original)
                     let recordURL = URL(fileURLWithPath: prediction).deletingLastPathComponent().appendingPathComponent("result.json")
                     let record = try JSONSerialization.jsonObject(with: Data(contentsOf: recordURL)) as? [String: Any]
+                    // 与引擎记录的输入哈希核对，拒绝推理期间原图变化产生的过期结果。
                     guard record?["inputSha256"] as? String == output.inputHash else {
                         throw AIWorkspaceError(message: "原图已变化，刚完成的结果不再与当前原图对应，请重新处理。")
                     }
@@ -134,12 +144,15 @@ final class AIWorkspaceStore: ObservableObject {
     private func setStatus(_ message: String) { status = message }
     func cancel() { status = "正在停止处理…"; runner?.cancel() }
 
+    // MARK: - 分组记录与持久化
+
     func updateCuration(sample: AISample, group: String, confirmed: Bool, use: AISampleUse) {
         let group = group.trimmingCharacters(in: .whitespacesAndNewlines)
         var record = record(for: sample)
         record.specimenGroup = group; record.groupConfirmed = confirmed && !group.isEmpty
         curation.samples[sample.id] = record
         if record.groupConfirmed { curation.groupUses[group] = use }
+        // 分组或用途改变后立即清除失去资格的选择，避免旧选择绕过训练条件。
         trainingSelection = trainingSelection.filter { id in samples.contains { $0.id == id && canTrain($0) } }
         saveCuration()
     }
@@ -150,6 +163,8 @@ final class AIWorkspaceStore: ObservableObject {
             try JSONEncoder().encode(curation).write(to: url, options: .atomic)
         } catch { self.error = "素材设置未能保存：\(error.localizedDescription)" }
     }
+    // MARK: - 文件定位与安全导出
+
     func reveal(_ path: String?) {
         guard let path else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
@@ -171,6 +186,7 @@ final class AIWorkspaceStore: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
     nonisolated static func copyResult(from source: URL, to destination: URL, protectedPaths: [String]) throws {
+        // 比较解析后的真实路径，并拒绝覆盖任何已有文件，保护原图及人工答案。
         let target = destination.resolvingSymlinksInPath().standardizedFileURL
         guard !protectedPaths.contains(where: { URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL == target }),
               !FileManager.default.fileExists(atPath: destination.path) else {
@@ -178,6 +194,8 @@ final class AIWorkspaceStore: ObservableObject {
         }
         try FileManager.default.copyItem(at: source, to: destination)
     }
+
+    // MARK: - 待抠原图导入
 
     func chooseImages() {
         guard !busy, catalog != nil else { return }
@@ -198,6 +216,7 @@ final class AIWorkspaceStore: ObservableObject {
         defer { isLoading = false }
         var importedIDs: [String] = []
         var failures: [String] = []
+        // 逐张导入并保留成功项；单个文件失败不阻断其余文件。
         for (index, url) in urls.enumerated() {
             status = "正在添加 \(index + 1)/\(urls.count)：\(url.lastPathComponent)…"
             do {
@@ -213,6 +232,8 @@ final class AIWorkspaceStore: ObservableObject {
         if !failures.isEmpty { error = failures.joined(separator: "\n") }
     }
 
+    // MARK: - 成对训练素材导入
+
     func importPair(original: URL, reference: URL, group: String, kind: String, confirmed: Bool) async -> Bool {
         guard !busy, catalog != nil else { return false }
         isLoading = true; defer { isLoading = false }
@@ -223,6 +244,7 @@ final class AIWorkspaceStore: ObservableObject {
                 imported.sourceHashes = try AIFileValidation.sourceHashes(imported)
                 return imported
             }.value
+            // 尺寸检查不能证明内容对齐，只有人工确认才能赋予已对齐状态。
             sample.alignment = confirmed ? "aligned" : "unverified"
             sample.alignmentNote = confirmed ? "用户已检查并确认原图与人工答案对齐" : "尺寸一致；内容对齐仍需人工确认，暂不可训练"
             curation.imported.append(sample)
@@ -244,6 +266,7 @@ final class AIWorkspaceStore: ObservableObject {
             }
             return (width, height, values[kCGImagePropertyProfileName] as? String ?? "未标记色彩配置", values[kCGImagePropertyHasAlpha] as? Bool ?? false)
         }
+        // 复制前验证真实 PNG 类型、尺寸及答案透明通道，避免留下无效导入。
         let sourceInfo = try metadata(original), referenceInfo = try metadata(reference)
         guard sourceInfo.0 == referenceInfo.0, sourceInfo.1 == referenceInfo.1, referenceInfo.3 else {
             throw AIWorkspaceError(message: "原图与人工答案必须尺寸相同，且答案必须带透明通道。未导入任何素材。")
@@ -251,6 +274,7 @@ final class AIWorkspaceStore: ObservableObject {
         let id = UUID().uuidString
         let directory = engine.appendingPathComponent("data/processed/toolkit-imports/\(id)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // 成对副本必须一起建立；第二份复制失败时清理本次新建目录。
         do {
             try FileManager.default.copyItem(at: original, to: directory.appendingPathComponent("original.png"))
             try FileManager.default.copyItem(at: reference, to: directory.appendingPathComponent("foreground.png"))

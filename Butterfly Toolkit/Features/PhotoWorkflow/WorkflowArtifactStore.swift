@@ -1,3 +1,5 @@
+// 使用独立归属凭据发布和恢复导出图片，在校验内容后保留旧版本并原子替换产物。
+
 import Foundation
 import Darwin
 import ImageIO
@@ -8,8 +10,8 @@ nonisolated enum WorkflowArtifactError: Error, Equatable {
     case ownershipConflict, invalidImage, fingerprintMismatch, invalidArtifact
 }
 
-/// The receipt is written before the image, independently of batch.json. Never infer ownership from a name.
-/// Sync operations belong on the workflow's background worker. A process-wide lock serializes publishers.
+/// 归属凭据独立于 batch.json，先于图片写入；不能仅凭文件名推断归属。
+/// 同步操作由工作流后台执行，进程级锁串行化发布者。
 nonisolated struct WorkflowArtifactStore: Sendable {
     typealias Read = @Sendable (URL) throws -> WorkflowRaster
     typealias Copy = @Sendable (URL,URL) throws -> Void
@@ -25,7 +27,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         var pending: WorkflowArtifact?
     }
 
-    /// Evidence belongs only to this publish call and these exact candidate bytes.
+    /// 校验证据仅属于本次发布调用及这些确切的候选字节。
     private struct ValidatedCandidate {
         let fingerprint: String
     }
@@ -37,6 +39,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         return ValidatedCandidate(fingerprint: before)
     }
 
+    // MARK: - 发布与崩溃恢复
     func publish(temp: URL, artifact: WorkflowArtifact) throws -> WorkflowArtifact {
         Self.lock.lock(); defer { Self.lock.unlock() }
         try validateMetadata(artifact)
@@ -52,7 +55,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         var result = artifact; result.fileFingerprint = hash; result.state = .completed
         let fm = FileManager.default
         try fm.createDirectory(at: artifact.url.deletingLastPathComponent(),withIntermediateDirectories: true)
-        // Stage identical validated bytes on the destination filesystem before touching an older output.
+        // 先将相同的已校验字节暂存到目标文件系统，再处理旧输出。
         let sibling = artifact.url.deletingLastPathComponent().appendingPathComponent(".publish-\(UUID().uuidString)")
         defer { try? fm.removeItem(at: sibling) }
         try copy(temp,sibling)
@@ -62,29 +65,29 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         guard current?.fileFingerprint == original?.fileFingerprint,current?.ownerTaskID == original?.ownerTaskID,
               current?.kind == original?.kind else { throw WorkflowArtifactError.ownershipConflict }
         if let previous = original {
-            // Legacy pending receipts may describe the same bytes under a newer recipe.
+            // 旧版待提交凭据可能以较新的配方描述相同字节。
             try preserveCommittedRecipe(receipt,matching: previous)
             try archive(previous)
         }
-        // Preserve all prior recipes BEFORE exposing pending: equal hashes cannot identify the recipe.
+        // 暴露待提交记录前先保留全部旧配方，因为相同哈希无法区分配方。
         receipt.committed = original
         receipt.pending = result
         try save(receipt,at: artifact.url)
         if original != nil {
-            // Atomic replacement after a verified, retained copy. The current file never disappears.
+            // 旧文件校验并留存副本后再原子替换，避免当前文件短暂消失。
             guard rename(sibling.path,artifact.url.path) == 0 else { throw CocoaError(.fileWriteUnknown) }
         } else {
-            // A first publication refuses any collision rather than replacing it.
+            // 首次发布拒绝任何同名冲突，避免替换已有文件。
             try fm.moveItem(at: sibling,to: result.url)
         }
         receipt.committed = result; receipt.pending = nil
         try save(receipt,at: artifact.url)
-        // Caller owns temporary files and may retain them for retry; do not remove them here.
+        // 临时文件由调用方管理，可能保留用于重试，因此这里不删除。
         return result
     }
 
-    /// nil means this recipe has no published file yet. A mismatched owner or changed bytes is an error.
-    /// This also finalizes the pending receipt when a crash happened between image move and receipt/manifest save.
+    /// nil 表示该配方尚无已发布文件；归属不匹配或内容变化则报错。
+    /// 若图片已移动，但凭据或清单尚未保存时崩溃，此处也会完成待提交凭据。
     func recover(artifact: WorkflowArtifact) throws -> WorkflowArtifact? {
         Self.lock.lock(); defer { Self.lock.unlock() }
         try validateMetadata(artifact)
@@ -99,11 +102,12 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         return existing
     }
 
+    // MARK: - 归属凭据与历史保留
     private func preserveCommittedRecipe(_ receipt: Receipt,matching current: WorkflowArtifact) throws {
         guard let committed = receipt.committed else { return }
         guard committed.ownerTaskID == current.ownerTaskID,committed.kind == current.kind,
               committed.url.standardizedFileURL == current.url.standardizedFileURL else { throw WorkflowArtifactError.ownershipConflict }
-        // Same bytes can represent two legitimate source/preset versions. Keep the old provenance, too.
+        // 相同字节可能对应两个有效的源或预设版本，因此也要保留旧的来源记录。
         if committed != current,committed.fileFingerprint == current.fileFingerprint { try archive(committed) }
     }
     private func archive(_ previous: WorkflowArtifact) throws {
@@ -152,6 +156,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         try rejectSymlink(receiptURL(url))
         try JSONEncoder().encode(receipt).write(to: receiptURL(url),options: .atomic)
     }
+    // MARK: - 文件格式与像素检查
     private func validateImage(_ url: URL,kind: WorkflowAssetKind) throws {
         try rejectSymlink(url)
         let raster = try read(url)

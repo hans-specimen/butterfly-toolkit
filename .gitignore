@@ -40,6 +40,8 @@ staging/
 *.swp
 *.swo
 *~
+*.log
+*.xcresult/
 
 # Local environment and secrets
 .env

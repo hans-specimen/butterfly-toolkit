@@ -1,12 +1,15 @@
+// 调度照片批次各处理阶段，协调检查点与人工编辑，并通过版本校验和持久化顺序保护异步结果。
+
 import Foundation
 import CoreGraphics
 import CryptoKit
 
 nonisolated enum WorkflowMatteScheduling: Sendable { case interleaved, phased }
 
-/// Owns cached live state. All expensive services suspend off MainActor; publication is synchronous
-/// inside this actor so a revision cannot change between its last check and replacing an output.
+/// 持有运行中的批次状态；耗时服务在 MainActor 外执行，产物发布则在此 actor 内同步完成，
+/// 保证最后一次版本校验与替换输出之间不会发生修订变化。
 actor WorkflowExecutor {
+    // MARK: - 可注入服务与执行资源
     nonisolated struct Services: Sendable {
         var stack: @Sendable (FocusStackJob, UUID) async throws -> PSDSnapshot
         var refresh: @Sendable (URL, UUID, [WorkflowSourceFile]?) async throws -> PSDSnapshot
@@ -101,6 +104,7 @@ actor WorkflowExecutor {
         self.exportLimit = max(1,min(2,exportLimit)); self.matteLimit = max(1,min(2,matteLimit))
     }
 
+    // MARK: - 批次登记与输出配置
     func register(batch: WorkflowBatch, manifestURL: URL) async throws {
         guard batches[batch.id] == nil else { throw WorkflowStateError.invalidTransition }
         var value = batch
@@ -124,7 +128,7 @@ actor WorkflowExecutor {
         guard let value = batches[batchID] else { throw WorkflowStateError.unknownTask }; return value
     }
 
-    /// A narrow optimistic update API for checkpoint toggles, sources, presets and explicit exclusions.
+    /// 事件更新使用预期版本进行乐观校验，集中处理来源、预设和明确排除等状态变更。
     func update(batchID: UUID, event: WorkflowEvent) async throws {
         try reduce(batchID,event); try await persist(batchID)
     }
@@ -142,7 +146,7 @@ actor WorkflowExecutor {
             for index in batch.specimens.indices {
                 for side in WorkflowSide.allCases {
                     var task = side == .front ? batch.specimens[index].front : batch.specimens[index].back
-                    // Published files retain their independent ownership receipts in the old folder.
+                    // 已发布文件及其独立归属凭据保留在旧目录中。
                     task.artifacts.removeAll { $0.kind == kind }
                     if !batch.specimens[index].isExcluded {
                         if task[kind.stage].state == .completed || task[kind.stage].state == .failed {
@@ -165,6 +169,7 @@ actor WorkflowExecutor {
         try await persist(batchID)
     }
 
+    // MARK: - 暂停与人工编辑协调
     func pause(batchID: UUID) async {
         guard let value = batches[batchID] else { return }
         try? reduce(batchID,.cancelRunning(expectedRevision: value.revision))
@@ -201,7 +206,7 @@ actor WorkflowExecutor {
         manual[batchID] = taskID
         return snapshot.workingURL
     }
-    /// Caller supplies the observed edit class; bridge verifies saved, stable roles under the manual lease.
+    /// 调用方提供编辑类型，桥接层在人工编辑租约内校验已保存且稳定的角色结构。
     func refreshSavedPSD(batchID: UUID, taskID: UUID, change: WorkflowPSDChange) async throws {
         let before = try task(batchID,taskID)
         guard let old = before.snapshot else { throw WorkflowStateError.invalidTransition }
@@ -220,6 +225,7 @@ actor WorkflowExecutor {
         try await persist(batchID)
     }
 
+    // MARK: - 阶段队列与抠图子阶段
     func runPending(batchID: UUID) async throws {
         guard !confirming.contains(batchID) else { return }
         try await runStages(batchID: batchID)
@@ -282,7 +288,7 @@ actor WorkflowExecutor {
                 }
             }
         } catch is CancellationError {
-            // Explicit pause has already persisted pending states; parent cancellation still propagates.
+            // 显式暂停已持久化待处理状态；来自父任务的取消仍需继续传播。
             let paused = try batch(batchID: batchID).isPaused
             if Task.isCancelled || !paused { throw CancellationError() }
         }
@@ -295,7 +301,7 @@ actor WorkflowExecutor {
             let value = try batch(batchID: batchID)
             guard !value.isPaused else { return }
             let ids = value.activeTasks.filter { $0[.matte].state == .pending && eligible($0,stage: .matte,batch: value) }.map(\.id)
-            // Serial subphases stay below the existing two-face cap; no PS during inference.
+            // 各子阶段串行执行，不超过既有双面并发上限，推理期间不调用 PS。
             try await runStageTasks(batchID: batchID,stage: .matte,taskIDs: ids,limit: 1,matteStep: step)
         }
     }
@@ -335,7 +341,7 @@ actor WorkflowExecutor {
         if before.matteArtifact != nil {
             do { try Self.validatePreparedMatte(before) }
             catch {
-                // Only preparation may rebuild caches, after a failed face is explicitly retried.
+                // 失败面被明确重试后，仅准备阶段允许重建缓存。
                 try mutateTask(batchID,before.id) { $0.matteArtifact = nil }
             }
         }
@@ -357,6 +363,7 @@ actor WorkflowExecutor {
         try mutateTask(batchID,before.id) { $0.matteArtifact = matte }
     }
 
+    // MARK: - 检查点推进与双面确认
     private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {
         let value = try batch(batchID: batchID)
         guard !value.isPaused else { return false }
@@ -445,9 +452,10 @@ actor WorkflowExecutor {
                 try checkSelection(batchID,expected,stage: .geometry,presets: presets)
                 let saved = try await services.apply(snapshot,solution)
                 try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                // Applying geometry is intentionally never blindly retried after an interrupted write.
+                // 几何写入中断后禁止盲目重试，避免再次叠加旋转或裁切。
                 let roles = try await services.extract(saved)
                 try checkSelection(batchID,expected,stage: .geometry,presets: presets)
+                // 写回后坐标原点已随裁切移动；将增量角度归零，防止下一次确认重复旋转。
                 var currentFit = solution
                 currentFit.sourceVersion = saved.contentVersion; currentFit.angleDegrees = 0
                 currentFit.rotationPivot = CGPoint(x: roles.cropViewport.midX,y: roles.cropViewport.midY)
@@ -540,6 +548,7 @@ actor WorkflowExecutor {
         try await persist(batchID); try await runPending(batchID: batchID)
     }
 
+    // MARK: - 单面阶段执行与失败记录
     private func execute(_ batchID: UUID, _ id: UUID, stage: WorkflowStage, matteStep: MatteStep? = nil) async throws {
         try Task.checkCancellation()
         let value = try batch(batchID: batchID)
@@ -596,7 +605,7 @@ actor WorkflowExecutor {
                 } else {
                     let input: StackPNG
                     var cached = before.stackPNG
-                    // A durable AI result may need the existing published-install recovery below.
+                    // 已持久化的 AI 结果可能需要使用下方已发布蒙版的恢复路径。
                     if let candidate = cached, before.matteArtifact?.inputPNGFingerprint != candidate.fingerprint,
                        let validate = services.validateStackInput {
                         let valid = try await validate(snapshot, candidate)
@@ -616,7 +625,7 @@ actor WorkflowExecutor {
                         guard matteStep != .install else { throw WorkflowBridgeError.staleSource }
                         matte = try await services.infer(input)
                         try check(batchID,before,stage: stage)
-                        // The old snapshot and validated immutable AI result are durable before PS publication.
+                        // 发布到 PS 之前，先持久化旧快照及已校验的不可变 AI 结果。
                         try mutateTask(batchID,id) { $0.matteArtifact = matte }; try await persist(batchID)
                     }
                     try check(batchID,before,stage: stage)
@@ -642,7 +651,7 @@ actor WorkflowExecutor {
                 guard roles.snapshotVersion == saved.contentVersion else { throw WorkflowStateError.staleVersion }
                 let solution: GeometrySolution
                 if before.geometryRevalidationRequired, var candidate = before.geometrySolution {
-                    // Prior geometry is already present in the saved PSD. Recheck its current fit only.
+                    // 已保存 PSD 已包含此前的几何变换，此处只重新校验当前构图适配性。
                     candidate.sourceVersion = saved.contentVersion; candidate.angleDegrees = 0
                     candidate.rotationPivot = CGPoint(x: roles.cropViewport.midX,y: roles.cropViewport.midY)
                     candidate.sourceCropRect = roles.cropViewport; candidate.outputSize = roles.cropViewport.size
@@ -700,6 +709,7 @@ actor WorkflowExecutor {
         }
     }
 
+    // MARK: - 临时文件清理与导出发布
     private func cleanMatteTemporaryFiles(_ batchID: UUID, _ id: UUID) async throws {
         let value = try batch(batchID: batchID), task = try task(batchID, id)
         guard task.snapshot?.roles?.isValid == true,
@@ -707,7 +717,7 @@ actor WorkflowExecutor {
         let work = value.outputDirectory.appendingPathComponent(".work")
         let urls = [task.stackPNG?.pngURL, task.stackPNG?.validBackgroundAlphaURL,
                     task.matteArtifact?.alphaURL, task.matteArtifact?.cutoutURL].compactMap { $0 }
-        // The saved PSD and completed stage are durable before any temporary image disappears.
+        // 先保证已保存 PSD 与完成阶段持久化，再删除临时图片。
         for url in Set(urls) where url.pathExtension.lowercased() == "png" &&
             ["data/processed", "AI"].contains(where: { WorkflowBatch.isContained(url, in: work.appendingPathComponent($0)) }) {
             if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
@@ -733,7 +743,7 @@ actor WorkflowExecutor {
         try check(batchID,before,stage: stage)
         if let existing = before.artifacts.last(where: { Self.sameRecipe($0,recipe) && $0.state == .completed }),
            let recovered = try services.recover(existing) { return recovered }
-        // Receipt/recipe intent precedes file writes, allowing recovery when batch.json misses completion.
+        // 先记录导出配方与发布意图，再写文件，以便 batch.json 未记录完成时恢复。
         if !before.artifacts.contains(where: { Self.sameRecipe($0,recipe) }) {
             try mutateTask(batchID,id) { $0.artifacts.append(recipe) }; try await persist(batchID)
         }
@@ -753,7 +763,7 @@ actor WorkflowExecutor {
             guard try presetFingerprint(kind,batch: latest,task: current) == preset,
                   current.artifacts.contains(where: { Self.sameRecipe($0,recipe) }) else { throw WorkflowStateError.staleVersion }
             try latest.validateArtifactURL(url, kind: kind); try latest.validateOutputURL(temp)
-            // No await between the fence and publication: actor reentrancy cannot publish obsolete bytes.
+            // 版本校验与发布之间没有 await，避免 actor 重入后发布过时内容。
             let result = try services.publish(temp,recipe)
             try recordArtifact(batchID,id,result); try await persist(batchID); return result
         } catch {
@@ -780,6 +790,7 @@ actor WorkflowExecutor {
         try await persist(batchID)
     }
 
+    // MARK: - 版本约束与持久化
     private func readCurrentRoles(_ batchID: UUID, _ before: WorkflowSideTask, stage: WorkflowStage) async throws -> RoleImages {
         guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
         let roles = try await services.extract(snapshot)
@@ -818,6 +829,7 @@ actor WorkflowExecutor {
             }
         }
     }
+    // 每次跨越异步服务后重检来源、阶段修订与快照，拒绝暂停、排除或编辑前启动的旧结果。
     private func check(_ batchID: UUID, _ before: WorkflowSideTask, stage: WorkflowStage, allowPaused: Bool = false) throws {
         let value = try batch(batchID: batchID), now = try task(batchID,before.id)
         guard (allowPaused || !value.isPaused), now.sourceRevision == before.sourceRevision, now.sources == before.sources,
@@ -840,7 +852,7 @@ actor WorkflowExecutor {
     }
     private func persist(_ id: UUID) async throws {
         let value = try batch(batchID: id), url = manifests[id]!, previous = saves[id], store = store
-        // Enqueue before suspension: an older save can never finish after a newer revision's save.
+        // 挂起前先排队，确保旧版保存不会晚于新版保存完成。
         let write = Task { if let previous { _ = try? await previous.value }; try await store.save(value,to: url) }
         saves[id] = write
         try await write.value

@@ -1,5 +1,8 @@
+// 集中处理工作流事件、版本校验、检查点和下游失效规则，在批次副本上校验并维护状态一致性。
+
 import Foundation
 
+// MARK: - 事件与状态错误
 nonisolated enum WorkflowStateError: Error, Equatable {
     case staleVersion
     case unknownTask
@@ -28,6 +31,8 @@ nonisolated enum WorkflowEvent: Sendable {
     case resume(expectedRevision: Int)
 }
 
+// MARK: - 原子状态转换
+// 仅修改批次副本，完整校验通过后才返回新状态；不写入文件或调用处理服务，但清单校验会读取路径信息。
 nonisolated enum WorkflowStateMachine {
     static func reduce(batch: WorkflowBatch, event: WorkflowEvent) throws -> WorkflowBatch {
         try batch.validate()
@@ -40,7 +45,7 @@ nonisolated enum WorkflowStateMachine {
                 guard task[.matte].state == .running, let snapshot = task.snapshot,
                       snapshot.taskID == id, !snapshot.contentVersion.isEmpty,
                       snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0 else { throw WorkflowStateError.invalidTransition }
-                // Installed PSD recovery does not require already-cleaned input files.
+                // 恢复已回写的 PSD 时，不再要求存在已清理的输入文件。
                 if snapshot.roles?.isValid != true {
                     guard let input = task.stackPNG, input.snapshotVersion == snapshot.contentVersion,
                           input.pixelSize == snapshot.pixelSize, input.orientation == 1,
@@ -91,6 +96,7 @@ nonisolated enum WorkflowStateMachine {
                     task[stage].revision += 1
                 }
             }
+        // 以整只标本的正反面共同确认，且必须匹配界面检查时看到的输出版本。
         case let .confirmSelected(ids, stage, versions, expected):
             try check(batch.revision, expected)
             guard stage == .geometry || stage == .png4k, !ids.isEmpty,
@@ -135,6 +141,7 @@ nonisolated enum WorkflowStateMachine {
                 task.sourceRevision += 1
                 invalidate(&task, from: .stack)
             }
+        // 根据修改范围失效下游；仅改蒙版时保留旧构图候选以重新校验。
         case let .savedPSDChanged(id, snapshot, change, expectedSource, expectedSnapshot):
             try updateTask(&next, id: id) { task in
                 try check(task.sourceRevision, expectedSource)
@@ -221,6 +228,7 @@ nonisolated enum WorkflowStateMachine {
         return next
     }
 
+    // MARK: - 阶段屏障与下游失效
     private static func check(_ actual: Int, _ expected: Int) throws {
         guard actual == expected else { throw WorkflowStateError.staleVersion }
     }
@@ -235,7 +243,7 @@ nonisolated enum WorkflowStateMachine {
     private static func canStart(_ stage: WorkflowStage, task: WorkflowSideTask, batch: WorkflowBatch) -> Bool {
         let earlier = WorkflowStage.allCases.prefix { $0 != stage }
         guard earlier.allSatisfy({ task[$0].state == .completed }) else { return false }
-        // Neither side can enter matte/geometry before the whole batch has crossed both early barriers.
+        // 堆栈与抠图设有整批屏障，任一面都须等待对应前置阶段整批完成后才能进入后续步骤。
         if stage != .stack && !batch.activeTasks.allSatisfy({ $0[.stack].state == .completed }) { return false }
         if stage != .stack && stage != .matte && !batch.activeTasks.allSatisfy({ $0[.matte].state == .completed }) { return false }
         return true
@@ -259,6 +267,7 @@ nonisolated enum WorkflowStateMachine {
 
     private static func invalidate(_ task: inout WorkflowSideTask, from stage: WorkflowStage, onlyAsset: WorkflowAssetKind? = nil) {
         let stages = Array(WorkflowStage.allCases.drop { $0 != stage })
+        // 同时清除输出确认并递增修订，让正在执行的旧任务无法回写已失效阶段。
         for invalidStage in stages {
             task[invalidStage].state = .pending
             task[invalidStage].inputVersion += 1
