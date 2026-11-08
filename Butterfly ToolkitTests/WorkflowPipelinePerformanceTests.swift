@@ -51,7 +51,9 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
         var env = ProcessInfo.processInfo.environment
         if nextRound {
             guard env["WORKFLOW_NEXT_MODE"] != nil else { throw XCTSkip("Next-round real measurements are opt-in") }
-            guard env["WORKFLOW_NEXT_MODE"] == "A" else { throw WorkflowStateError.invalidTransition }
+            guard ["A","C","D"].contains(env["WORKFLOW_NEXT_MODE"]) else { throw WorkflowStateError.invalidTransition }
+            // Task 4 compares scheduling on identical saved stacks, not fresh stack fusion.
+            guard !fullBatch || env["WORKFLOW_NEXT_MODE"] == "A" else { throw WorkflowStateError.invalidTransition }
             for key in ["BATCH", "STACKS", "EVIDENCE", "ENGINE", "COUNT"] { env["WORKFLOW_PIPELINE_" + key] = env["WORKFLOW_NEXT_" + key] }
             env["WORKFLOW_PIPELINE_LIMIT"] = "2"
             env["WORKFLOW_PIPELINE_PAUSE"] = "0"
@@ -84,7 +86,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
                 case .published: await pauseGate.mark("install-published")
                 }
             }
-        }, performanceObserver: observer)
+        }, performanceObserver: observer, reuseDocumentsWithinOperation: nextRound && ["C","D"].contains(env["WORKFLOW_NEXT_MODE"]))
         let worker = AIInferenceWorker(),matte = WorkflowMatteService(engine: URL(fileURLWithPath: enginePath),workspace: workspace,worker: worker)
         let setupStart = ProcessInfo.processInfo.systemUptime
         var specimens: [WorkflowSpecimen] = []
@@ -154,7 +156,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
         services.render = { k,r,l,s,w,u in try await measures.measure("render-"+k.rawValue) { try await base.render(k,r,l,s,w,u) } }
         // Publication remains synchronous inside the executor's version fence.
         services.publish = { temp,artifact in try publications.measure { try base.publish(temp,artifact) } }
-        let e = WorkflowExecutor(store: WorkflowBatchStore(performanceObserver: observer), services: services,coordinator: ps,exportLimit: limit,matteLimit: limit)
+        let e = WorkflowExecutor(store: WorkflowBatchStore(performanceObserver: observer), services: services,coordinator: ps,exportLimit: limit,matteLimit: limit,matteScheduling: env["WORKFLOW_NEXT_MODE"] == "D" ? .phased : .interleaved)
         let manifest = root.appendingPathComponent("batch.json")
         try await e.register(batch: batch,manifestURL: manifest)
         let setup = ProcessInfo.processInfo.systemUptime-setupStart,started = ProcessInfo.processInfo.systemUptime
@@ -186,7 +188,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
             XCTAssertFalse(paused.sideTasks.flatMap(\.artifacts).contains { $0.state == .completed })
             let callsBefore = await measures.samples.filter { $0.stage == "infer" }.count
             await ps.endManualEditing(owner: owner)
-            let reopened = WorkflowExecutor(services: services,coordinator: ps,exportLimit: limit,matteLimit: limit)
+            let reopened = WorkflowExecutor(services: services,coordinator: ps,exportLimit: limit,matteLimit: limit,matteScheduling: env["WORKFLOW_NEXT_MODE"] == "D" ? .phased : .interleaved)
             _ = try await reopened.register(manifestURL: manifest)
             try await reopened.continueAutomatic(batchID: batch.id)
             after = try await reopened.batch(batchID: batch.id)
@@ -212,7 +214,7 @@ private nonisolated final class PipelineObservations: @unchecked Sendable {
         try await measures.save(root.appendingPathComponent("stages.json"))
         var usage = rusage(); getrusage(RUSAGE_SELF,&usage)
         var summary: [String:Any] = ["count":count,"limit":limit,"seconds":seconds,"setupSeconds":setup,"publicationSeconds":publications.values(),"appPeakRSSBytes":usage.ru_maxrss,"allSucceeded":after.allSucceeded,"singleFaceMatteCheckpoint":count == 1]
-        summary["mode"] = nextRound ? "A" : "legacy-limit-\(limit)"; summary["fullBatch"] = fullBatch; summary["observed"] = observer != nil
+        summary["mode"] = nextRound ? env["WORKFLOW_NEXT_MODE"]! : "legacy-limit-\(limit)"; summary["fullBatch"] = fullBatch; summary["observed"] = observer != nil
         summary["runPendingWallSeconds"] = ended - started
         summary["measurementStartUptime"] = fullBatch ? try XCTUnwrap(firstStack) : started
         summary["measurementEndUptime"] = ended

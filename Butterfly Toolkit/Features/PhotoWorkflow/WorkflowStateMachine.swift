@@ -12,6 +12,7 @@ nonisolated enum WorkflowPresetScope: Equatable, Sendable {
 }
 
 nonisolated enum WorkflowEvent: Sendable {
+    case mattePreparationStored(taskID: UUID, expectedVersion: Int)
     case stageStarted(taskID: UUID, stage: WorkflowStage, expectedVersion: Int)
     case stageCompleted(taskID: UUID, stage: WorkflowStage, expectedVersion: Int, outputVersion: String)
     case stageFailed(taskID: UUID, stage: WorkflowStage, expectedVersion: Int, reason: String)
@@ -32,6 +33,22 @@ nonisolated enum WorkflowStateMachine {
         try batch.validate()
         var next = batch
         switch event {
+        case let .mattePreparationStored(id, expected):
+            guard !batch.isPaused else { throw WorkflowStateError.invalidTransition }
+            try updateTask(&next, id: id) { task in
+                try check(task[.matte].revision, expected)
+                guard task[.matte].state == .running, let snapshot = task.snapshot,
+                      snapshot.taskID == id, !snapshot.contentVersion.isEmpty,
+                      snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0 else { throw WorkflowStateError.invalidTransition }
+                // Installed PSD recovery does not require already-cleaned input files.
+                if snapshot.roles?.isValid != true {
+                    guard let input = task.stackPNG, input.snapshotVersion == snapshot.contentVersion,
+                          input.pixelSize == snapshot.pixelSize, input.orientation == 1,
+                          !input.fingerprint.isEmpty, !input.colorProfile.isEmpty else { throw WorkflowStateError.invalidTransition }
+                }
+                task[.matte].state = .pending; task[.matte].revision += 1
+                task[.matte].error = nil; task[.matte].outputVersion = nil; task[.matte].confirmedVersion = nil
+            }
         case let .stageStarted(id, stage, expected):
             guard !batch.isPaused else { throw WorkflowStateError.invalidTransition }
             try updateTask(&next, id: id) { task in

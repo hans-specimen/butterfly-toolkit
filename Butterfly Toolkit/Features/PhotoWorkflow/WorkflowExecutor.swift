@@ -2,6 +2,8 @@ import Foundation
 import CoreGraphics
 import CryptoKit
 
+nonisolated enum WorkflowMatteScheduling: Sendable { case interleaved, phased }
+
 /// Owns cached live state. All expensive services suspend off MainActor; publication is synchronous
 /// inside this actor so a revision cannot change between its last check and replacing an output.
 actor WorkflowExecutor {
@@ -90,10 +92,12 @@ actor WorkflowExecutor {
     private var stageRuns: [UUID: [UUID: Task<Void,Error>]] = [:]
     private let exportLimit: Int
     private let matteLimit: Int
+    private let matteScheduling: WorkflowMatteScheduling
+    private enum MatteStep { case prepare, infer, install }
 
     init(store: WorkflowBatchStore = WorkflowBatchStore(), services: Services,
-         coordinator: PhotoshopExecutionCoordinator = .shared, exportLimit: Int = 2, matteLimit: Int = 2) {
-        self.store = store; self.services = services; self.coordinator = coordinator
+         coordinator: PhotoshopExecutionCoordinator = .shared, exportLimit: Int = 2, matteLimit: Int = 2, matteScheduling: WorkflowMatteScheduling = .interleaved) {
+        self.store = store; self.services = services; self.coordinator = coordinator; self.matteScheduling = matteScheduling
         self.exportLimit = max(1,min(2,exportLimit)); self.matteLimit = max(1,min(2,matteLimit))
     }
 
@@ -232,7 +236,8 @@ actor WorkflowExecutor {
                     let ids = value.activeTasks.filter { $0[stage].state == .pending && eligible($0,stage: stage,batch: value) }.map(\.id)
                     if !ids.isEmpty {
                         let limit = stage == .matte ? matteLimit : (stage == .hd || stage == .png4k ? exportLimit : 1)
-                        try await runStageTasks(batchID: batchID,stage: stage,taskIDs: ids,limit: limit)
+                        if stage == .matte && matteScheduling == .phased { try await runPhasedMatte(batchID: batchID) }
+                        else { try await runStageTasks(batchID: batchID,stage: stage,taskIDs: ids,limit: limit) }
                         advanced = true
                     }
                     if stage == .matte { await services.endInferenceSession() }
@@ -253,7 +258,7 @@ actor WorkflowExecutor {
         await services.endInferenceSession()
     }
 
-    private func runStageTasks(batchID: UUID,stage: WorkflowStage,taskIDs: [UUID],limit: Int) async throws {
+    private func runStageTasks(batchID: UUID,stage: WorkflowStage,taskIDs: [UUID],limit: Int,matteStep: MatteStep? = nil) async throws {
         defer { stageRuns[batchID] = nil }
         do {
             try await withThrowingTaskGroup(of: UUID.self) { group in
@@ -265,7 +270,7 @@ actor WorkflowExecutor {
                         let value = try batch(batchID: batchID)
                         guard let item = value.activeTasks.first(where: { $0.id == id }),item[stage].state == .pending,
                               eligible(item,stage: stage,batch: value) else { continue }
-                        let run = Task { try await self.execute(batchID,id,stage: stage) }
+                        let run = Task { try await self.execute(batchID,id,stage: stage,matteStep: matteStep) }
                         stageRuns[batchID,default: [:]][id] = run
                         group.addTask {
                             try await withTaskCancellationHandler { try await run.value } onCancel: { run.cancel() }
@@ -281,6 +286,75 @@ actor WorkflowExecutor {
             let paused = try batch(batchID: batchID).isPaused
             if Task.isCancelled || !paused { throw CancellationError() }
         }
+    }
+
+    private func runPhasedMatte(batchID: UUID) async throws {
+        for step in [MatteStep.prepare, .infer, .install] {
+            if step == .install { await services.endInferenceSession() }
+            try Task.checkCancellation()
+            let value = try batch(batchID: batchID)
+            guard !value.isPaused else { return }
+            let ids = value.activeTasks.filter { $0[.matte].state == .pending && eligible($0,stage: .matte,batch: value) }.map(\.id)
+            // Serial subphases stay below the existing two-face cap; no PS during inference.
+            try await runStageTasks(batchID: batchID,stage: .matte,taskIDs: ids,limit: 1,matteStep: step)
+        }
+    }
+
+    private static func validInput(_ input: StackPNG, for snapshot: PSDSnapshot) -> Bool {
+        input.snapshotVersion == snapshot.contentVersion && input.pixelSize == snapshot.pixelSize &&
+        input.orientation == 1 && !input.colorProfile.isEmpty &&
+        (try? AIFileValidation.hash(input.pngURL.path)) == input.fingerprint
+    }
+    private static func validatePreparedMatte(_ task: WorkflowSideTask) throws {
+        guard let snapshot = task.snapshot, let input = task.stackPNG, validInput(input,for: snapshot),
+              let matte = task.matteArtifact, matte.inputPNGFingerprint == input.fingerprint,
+              matte.pixelSize == input.pixelSize, matte.orientation == 1,
+              (try? AIFileValidation.hash(matte.alphaURL.path)) == matte.alphaFingerprint,
+              (try? AIFileValidation.hash(matte.cutoutURL.path)) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+    }
+    private func prepareMatteInput(batchID: UUID, before: WorkflowSideTask) async throws {
+        guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
+        if snapshot.roles != nil {
+            _ = try await services.extract(snapshot)
+            try check(batchID,before,stage: .matte)
+            return
+        }
+        let current = try await services.refresh(snapshot.workingURL,before.id,nil)
+        try check(batchID,before,stage: .matte)
+        if current.contentVersion != snapshot.contentVersion {
+            try Self.validatePreparedMatte(before)
+            guard current.roles?.isValid == true else { throw WorkflowBridgeError.staleSource }
+            let roles = try await services.extract(current)
+            try await services.validateInstalledMatte(roles,before.stackPNG!,before.matteArtifact!)
+            try check(batchID,before,stage: .matte)
+            try mutateTask(batchID,before.id) { $0.snapshot = current }
+            return
+        }
+        guard current.taskID == before.id, current.roles == snapshot.roles,
+              current.pixelSize == snapshot.pixelSize, current.structureSummary == snapshot.structureSummary else { throw WorkflowBridgeError.staleSource }
+        if before.matteArtifact != nil {
+            do { try Self.validatePreparedMatte(before) }
+            catch {
+                // Only preparation may rebuild caches, after a failed face is explicitly retried.
+                try mutateTask(batchID,before.id) { $0.matteArtifact = nil }
+            }
+        }
+        if let input = before.stackPNG, Self.validInput(input,for: snapshot) { return }
+        let input = try await services.exportStack(snapshot)
+        try check(batchID,before,stage: .matte)
+        guard Self.validInput(input,for: snapshot) else { throw WorkflowBridgeError.staleSource }
+        try mutateTask(batchID,before.id) { $0.stackPNG = input }
+    }
+    private func inferPreparedMatte(batchID: UUID, before: WorkflowSideTask) async throws {
+        guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
+        if snapshot.roles?.isValid == true { return }
+        if before.matteArtifact != nil { try Self.validatePreparedMatte(before); return }
+        guard let input = before.stackPNG, Self.validInput(input,for: snapshot) else { throw WorkflowBridgeError.staleSource }
+        let matte = try await services.infer(input)
+        try check(batchID,before,stage: .matte)
+        var prepared = before; prepared.matteArtifact = matte
+        try Self.validatePreparedMatte(prepared)
+        try mutateTask(batchID,before.id) { $0.matteArtifact = matte }
     }
 
     private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {
@@ -466,7 +540,7 @@ actor WorkflowExecutor {
         try await persist(batchID); try await runPending(batchID: batchID)
     }
 
-    private func execute(_ batchID: UUID, _ id: UUID, stage: WorkflowStage) async throws {
+    private func execute(_ batchID: UUID, _ id: UUID, stage: WorkflowStage, matteStep: MatteStep? = nil) async throws {
         try Task.checkCancellation()
         let value = try batch(batchID: batchID)
         guard let pending = value.activeTasks.first(where: { $0.id == id }),pending[stage].state == .pending,
@@ -512,6 +586,9 @@ actor WorkflowExecutor {
                 }
                 try mutateTask(batchID,id) { $0.snapshot = saved; $0.stackPNG = prepared }; output = saved.contentVersion
             case .matte:
+                if matteStep == .prepare { try await prepareMatteInput(batchID: batchID, before: before); break }
+                if matteStep == .infer { try await inferPreparedMatte(batchID: batchID, before: before); break }
+                if matteStep == .install && before.snapshot?.roles == nil { try Self.validatePreparedMatte(before) }
                 guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
                 let saved: PSDSnapshot
                 if snapshot.roles != nil {
@@ -528,6 +605,7 @@ actor WorkflowExecutor {
                     }
                     if let cached, cached.snapshotVersion == snapshot.contentVersion { input = cached }
                     else {
+                        guard matteStep != .install else { throw WorkflowBridgeError.staleSource }
                         input = try await services.exportStack(snapshot)
                         try check(batchID,before,stage: stage)
                         try mutateTask(batchID,id) { $0.stackPNG = input }; try await persist(batchID)
@@ -535,6 +613,7 @@ actor WorkflowExecutor {
                     let matte: MatteArtifact
                     if let cached = before.matteArtifact, cached.inputPNGFingerprint == input.fingerprint { matte = cached }
                     else {
+                        guard matteStep != .install else { throw WorkflowBridgeError.staleSource }
                         matte = try await services.infer(input)
                         try check(batchID,before,stage: stage)
                         // The old snapshot and validated immutable AI result are durable before PS publication.
@@ -599,6 +678,11 @@ actor WorkflowExecutor {
             let final = try task(batchID,id)
             guard final[stage].revision == before[stage].revision, final.sourceRevision == before.sourceRevision,
                   !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.staleVersion }
+            if matteStep == .prepare || matteStep == .infer {
+                try reduce(batchID,.mattePreparationStored(taskID: id,expectedVersion: before[stage].revision))
+                try await persist(batchID)
+                return
+            }
             try reduce(batchID,.stageCompleted(taskID: id,stage: stage,expectedVersion: before[stage].revision,outputVersion: output))
             try await persist(batchID)
             if stage == .matte { try await cleanMatteTemporaryFiles(batchID, id) }

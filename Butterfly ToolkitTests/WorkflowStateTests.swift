@@ -314,6 +314,30 @@ final class WorkflowStateTests: XCTestCase {
         XCTAssertEqual(decoded.task(id: id)?.roleImages?.coordinateOrigin.x, -100)
     }
 
+    func testMattePreparationStoredRemainsPending() throws {
+        var batch = fixture(stackCheck: false,matteCheck: true)
+        try completeAll(&batch,stage: .stack)
+        let id = batch.specimens[0].front.id
+        batch = try start(batch,taskID: id,stage: .matte)
+        let snapshot = ExecutorFixture.snapshot(id,URL(fileURLWithPath: "/output/task.psd"),"stack",roles: false)
+        batch.specimens[0].front.snapshot = snapshot
+        let input = StackPNG(snapshotVersion: "stack",pngURL: URL(fileURLWithPath: "/output/input.png"),fingerprint: "input",pixelSize: snapshot.pixelSize,orientation: 1,colorProfile: "sRGB")
+        batch.specimens[0].front.stackPNG = input
+        let before = batch.specimens[0].front, event = WorkflowEvent.mattePreparationStored(taskID: id,expectedVersion: before[.matte].revision)
+        let after = try WorkflowStateMachine.reduce(batch: batch,event: event)
+        XCTAssertEqual(after.specimens[0].front[.matte].state,.pending)
+        XCTAssertEqual(after.specimens[0].front[.matte].revision,before[.matte].revision+1)
+        XCTAssertNil(after.specimens[0].front[.matte].outputVersion)
+        XCTAssertNil(after.specimens[0].front[.matte].confirmedVersion)
+        XCTAssertEqual(after.specimens[0].front.stackPNG,input)
+        XCTAssertEqual(after.specimens[0].back,batch.specimens[0].back)
+        XCTAssertThrowsError(try WorkflowStateMachine.reduce(batch: after,event: event))
+        var invalid = batch; invalid.isPaused = true
+        XCTAssertThrowsError(try WorkflowStateMachine.reduce(batch: invalid,event: event))
+        invalid = batch; invalid.specimens[0].front.stackPNG = nil
+        XCTAssertThrowsError(try WorkflowStateMachine.reduce(batch: invalid,event: event))
+    }
+
     private func fixture(stackCheck: Bool = true, matteCheck: Bool = true) -> WorkflowBatch {
         WorkflowBatch(sourceDirectory: URL(fileURLWithPath: "/input"), outputDirectory: URL(fileURLWithPath: "/output"),
             checkAfterStack: stackCheck, checkAfterMatte: matteCheck, specimens: [

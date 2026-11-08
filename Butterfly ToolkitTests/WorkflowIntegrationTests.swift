@@ -6,10 +6,11 @@ import CoreGraphics
 @MainActor
 final class WorkflowIntegrationTests: XCTestCase {
     func testTwoSpecimensRespectAllFourCheckpointCombinationsAndPairConfirmations() async throws {
+        for scheduling in [WorkflowMatteScheduling.interleaved,.phased] {
         for stackCheck in [false, true] { for matteCheck in [false, true] {
             let f = try ExecutorFixture(checks: stackCheck, count: 2, checkMatte: matteCheck)
             defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-            let e = try await start(f)
+            let e = try await start(f,services: f.cachedServices,scheduling: scheduling)
             var b = try await e.batch(batchID: f.batch.id)
             if stackCheck {
                 XCTAssertTrue(b.activeTasks.allSatisfy { $0[.stack].state == .waitingReview })
@@ -60,6 +61,7 @@ final class WorkflowIntegrationTests: XCTestCase {
                 XCTAssertEqual(try AIFileValidation.hash(source.url.path), source.fingerprint)
             }
         } }
+        }
     }
 
     func testSingleSideFailureBlocksAutomaticAdvanceAndRetryKeepsSuccessfulSides() async throws {
@@ -258,8 +260,8 @@ final class WorkflowIntegrationTests: XCTestCase {
         }
     }
 
-    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil) async throws -> WorkflowExecutor {
-        let e = WorkflowExecutor(services: services ?? f.services, coordinator: PhotoshopExecutionCoordinator())
+    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil, scheduling: WorkflowMatteScheduling = .interleaved) async throws -> WorkflowExecutor {
+        let e = WorkflowExecutor(services: services ?? f.services, coordinator: PhotoshopExecutionCoordinator(),matteScheduling: scheduling)
         try await e.register(batch: f.batch, manifestURL: f.manifest)
         try await e.runPending(batchID: f.batch.id)
         return e

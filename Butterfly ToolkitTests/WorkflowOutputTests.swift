@@ -150,10 +150,11 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testChangingCompleted4KDirectoryAllowsImmediateConfirmation() async throws {
+        for scheduling in [WorkflowMatteScheduling.interleaved,.phased] {
         let f = try ExecutorFixture(checks: false)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch; batch.checkGeometry = false; batch.check4K = false
-        let e = WorkflowExecutor(services: f.services)
+        let e = WorkflowExecutor(services: f.cachedServices,matteScheduling: scheduling)
         try await e.register(batch: batch, manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
         let before = try await e.batch(batchID: batch.id)
@@ -167,6 +168,7 @@ final class WorkflowOutputTests: XCTestCase {
         }
         for task in before.activeTasks {
             XCTAssertTrue(FileManager.default.fileExists(atPath: task.artifacts.first { $0.kind == .png4k }!.url.path))
+        }
         }
     }
 
@@ -226,13 +228,14 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testAllFourCheckpointSwitchCombinationsRespectReviewChoices() async throws {
+        for scheduling in [WorkflowMatteScheduling.interleaved, .phased] {
         for stackCheck in [false,true] { for matteCheck in [false,true] {
         for geometryCheck in [false, true] {
             for fourKCheck in [false, true] {
                 let f = try ExecutorFixture(checks: stackCheck,count: 2,checkMatte: matteCheck)
                 defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
                 var batch = f.batch; batch.checkGeometry = geometryCheck; batch.check4K = fourKCheck
-                let e = WorkflowExecutor(services: f.services)
+                let e = WorkflowExecutor(services: f.cachedServices,matteScheduling: scheduling)
                 try await e.register(batch: batch, manifestURL: f.manifest)
                 try await e.runPending(batchID: batch.id)
                 var result = try await e.batch(batchID: batch.id)
@@ -264,6 +267,7 @@ final class WorkflowOutputTests: XCTestCase {
             }
         }
         } }
+        }
     }
 
 }
