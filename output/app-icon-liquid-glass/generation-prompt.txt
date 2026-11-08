@@ -1,0 +1,12 @@
+Generation mode: built-in image_gen
+Design reference: https://developer.apple.com/design/human-interface-guidelines/app-icons
+
+Use case: logo-brand.
+Create a completely new minimalist macOS app icon for a professional image-processing toolkit. The user explicitly requests NO butterfly imagery, a very simple design, and Apple's latest Liquid Glass visual language.
+Deliver one single finished app icon, square composition, ideally 1024x1024, front-on orthographic view, no presentation board.
+Design: one extremely clean familiar crop glyph formed from two interlocking offset right-angle brackets, as a single central symbol. Broad uniform strokes, subtly rounded ends, balanced proportions. The glyph occupies about 55 percent of the tile width with generous negative space. No extra objects or details.
+Material: the crop glyph is clear optical liquid glass with softly rounded lenticular edges, restrained white specular edge highlights, physically believable transparent refraction, a faint icy blue tint, and a subtle soft shadow that separates it from the base. It must read clearly at small icon sizes; some translucent milky white in the glass core for contrast. It should feel like Apple's refined layered Liquid Glass app icons, sleek and restrained, not metallic, not chrome, not plastic, not rubber, not a neon gaming icon.
+Base: one smooth macOS continuous rounded-square tile with a very quiet pale ice-blue to muted cornflower-blue gradient, brighter at the upper left, a subtle translucent glass rim. Near-flat face, modest layered depth. Tile approximately 88% of canvas width, centered with equal transparent exterior margins.
+Composition is radically simple: only the rounded-square tile and the glass crop glyph. Soft natural studio lighting, very controlled reflections. Sophisticated quiet Apple-like system-icon craftsmanship.
+No butterflies, insects, wings, nature imagery, letters, words, logos, gear, toolbox, wrench, photo landscape, rainbow, sparkles, multiple tiny symbols, textures, dramatic glow, strong cast shadow, exaggerated bevel, angled perspective or background scenery.
+Outside the rounded tile is actual alpha transparency, no checkerboard pattern.

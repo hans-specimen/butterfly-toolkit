@@ -17,9 +17,9 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		B70000000000000000000001 /* Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Version.xcconfig; sourceTree = SOURCE_ROOT; };
 		3AE0A8743021AACD00D0ACE5 /* Butterfly Toolkit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Butterfly Toolkit.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000001 /* Butterfly ToolkitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Butterfly ToolkitTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B70000000000000000000001 /* Config/Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Config/Version.xcconfig; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -56,7 +56,7 @@
 		3AE0A86B3021AACD00D0ACE5 = {
 			isa = PBXGroup;
 			children = (
-				B70000000000000000000001 /* Version.xcconfig */,
+				B70000000000000000000001 /* Config/Version.xcconfig */,
 				3AE0A8763021AACD00D0ACE5 /* Butterfly Toolkit */,
 				A10000000000000000000002 /* Butterfly ToolkitTests */,
 				3AE0A8753021AACD00D0ACE5 /* Products */,
@@ -204,7 +204,7 @@
 /* Begin XCBuildConfiguration section */
 		3AE0A87D3021AACE00D0ACE5 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = B70000000000000000000001 /* Version.xcconfig */;
+			baseConfigurationReference = B70000000000000000000001 /* Config/Version.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
@@ -268,7 +268,7 @@
 		};
 		3AE0A87E3021AACE00D0ACE5 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = B70000000000000000000001 /* Version.xcconfig */;
+			baseConfigurationReference = B70000000000000000000001 /* Config/Version.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;

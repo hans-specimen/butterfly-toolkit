@@ -1,0 +1,10 @@
+Generation mode: built-in image_gen
+
+Use case: logo-brand
+Asset type: production macOS application icon for Butterfly Toolkit, a butterfly specimen photo processing application (cutout, crop, focus stacking).
+Create one exceptionally polished app icon, square 1024 x 1024 composition. This is the final standalone icon asset, not a presentation mockup.
+A warm ivory rounded-square macOS tile, centered and front-facing, with generous transparent exterior margin (tile occupies approximately 88% of the canvas). Soft continuous corners, subtly beveled ceramic surface, very restrained shadow.
+On the tile, a striking symmetrical butterfly with four clearly differentiated sculpted wings, deep forest green enamel with restrained amber-orange inlay accents near the outer wing edges. Top wings broad and gently pointed, lower wings smaller and rounded. Slim central body and two elegantly curved antennae. The butterfly reads as a single bold emblem at small sizes. Fine shallow material depth, satin surface, no intricate veins or tiny patterns.
+Behind the butterfly, four simple forest-green photographic crop/viewfinder corner brackets form a subtle square frame, clearly separated from the wings, lighter and smaller in visual weight than the butterfly. Communicate precise photo editing through this one supporting motif.
+Balanced, calm, refined professional creative tool aesthetic. Controlled soft studio light from upper left. Straight-on orthographic view, no tilted perspective. Forest green, warm ivory and amber orange only. Strong clean silhouette, ample breathing room, crisp antialiased contours, excellent small-size legibility.
+No text, letters, wordmarks, watermarks, tools, gears, sparkles, extra symbols or mockup scenery. The area outside the rounded-square tile must be truly transparent, not white and not a checkerboard texture.
