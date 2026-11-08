@@ -10,7 +10,7 @@
 | `Features/AI` | `AIWorkspaceStore` 管理独立 AI 页面；`AIProcessRunner` 运行单次桥接命令；`AIInferenceWorker` 为照片工作流复用推理会话 |
 | `Features/PhotoWorkflow` | `PhotoWorkflowStore/View` 负责交互；`WorkflowExecutor` 调度；`WorkflowStateMachine` 校验状态转换；模型、预览、几何、持久化、发布各有专属文件 |
 | 其他 `Features` | 按工具保存界面及专用处理器，如智能裁剪、PSD 导出；没有为了层级统一强行拆出每个工具的模型或服务 |
-| `Core/ImageProcessing` | 压缩／旋转、透明 PNG 裁切、闲鱼产品图合成等共用能力 |
+| `Core/ImageProcessing` | `SpecimenGeometry` 共用主体边界、翅顶扶正和真实背景裁切；另有压缩／旋转、透明 PNG 裁切、闲鱼产品图合成 |
 | `Core/Photoshop` | 景深合成计划与脚本生成、应用查找，以及跨工具共享的 Photoshop 执行协调 |
 | `Resources`、`Assets.xcassets` | 水印、完成提示音、图标与颜色 |
 | `Butterfly ToolkitTests`、`scripts/tests` | Swift 行为回归与 Python 版本工具测试 |
@@ -26,7 +26,7 @@ PhotoWorkflowView / PhotoWorkflowStore
           ├─ WorkflowStateMachine → WorkflowBatchStore → batch.json
           ├─ PhotoshopWorkflowBridge → PhotoshopExecutionCoordinator → Photoshop
           ├─ WorkflowMatteService → AIInferenceWorker → Python 引擎
-          ├─ WorkflowGeometryCache → MaskGeometryProcessor
+          ├─ WorkflowGeometryCache → MaskGeometryProcessor → SpecimenGeometry
           └─ WorkflowAssetRenderer → WorkflowArtifactStore → 导出文件与归属凭据
 ```
 
@@ -37,6 +37,8 @@ PhotoWorkflowView / PhotoWorkflowStore
 - `WorkflowGeometryCache` 以内容和坐标相关身份缓存几何准备结果，默认最多 4 项、512 MiB 保留量；该上限不是整个应用或 GPU 的内存峰值。
 
 具体阶段、输出目录、检查点和候选开关见 [照片工作流](PHOTO-WORKFLOW.md)。
+
+独立智能裁剪通过 `SmartCropStore → SmartCropService` 串行处理 JPEG，由 Vision／背景色识别或人工矩形生成蒙版，再进入同一个 `SpecimenGeometry`。共用模型的序列化字段保持不变；文件读取、保存版本与 Photoshop 调度仍由照片流适配层负责。独立服务只缓存一张分析，保留数组超过 256 MiB 时不缓存，该限制不代表解码或计算峰值。缩略图与原图预览独立于主体分析加载；完成的预览由 `SmartCropPreviewCache` 保存到会话专属临时目录，内存最多保留三组且不超过 96 MiB 的解码预览，淘汰后从磁盘恢复而不重新识别。切回时校验源哈希；修改构图、重新载入或覆盖源图后使相应结果失效，新批次释放旧会话缓存。预览以原图左上角坐标保存选点，导出转换到 Core Image 坐标并校验源哈希；离页撤销异步结果并取消批次。
 
 ## 并发与外部进程
 

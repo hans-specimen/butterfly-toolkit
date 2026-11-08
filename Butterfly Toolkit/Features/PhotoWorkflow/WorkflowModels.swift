@@ -327,49 +327,6 @@ nonisolated struct MatteArtifact: Codable, Equatable, Sendable {
     var pixelSize: CGSize
 }
 
-// MARK: - 几何请求与坐标约定
-nonisolated enum GeometryRatio: String, Codable, CaseIterable, Sendable {
-    case adaptive, fiveByFour, elevenByEightPointFive, square
-}
-
-nonisolated enum GeometryAngleStrategy: Codable, Equatable, Sendable {
-    case automaticWingTips
-    case twoPoints(left: CGPoint, right: CGPoint)
-    case manual(degrees: Double)
-}
-
-nonisolated struct GeometryRequest: Codable, Equatable, Sendable {
-    var ratio: GeometryRatio = .adaptive
-    var targetMargin: Double = 0.1
-    var angleStrategy: GeometryAngleStrategy = .automaticWingTips
-    var centerOverride: CGPoint?
-}
-
-/// 左右留白以输出宽度占比表示，上下留白以输出高度占比表示，均不是像素距离。
-nonisolated struct WorkflowMargins: Codable, Equatable, Sendable {
-    var left: Double
-    var top: Double
-    var right: Double
-    var bottom: Double
-}
-
-nonisolated struct GeometrySolution: Codable, Equatable, Sendable {
-    var sourceVersion: String
-    /// 相对于指定保存快照的增量角度，不能据此重复执行已经完成的 PS 编辑。
-    var angleDegrees: Double
-    /// 采用当前保存 PSD 的坐标：x 向右、y 向下，正角度绕此中心顺时针旋转。
-    var rotationPivot: CGPoint
-    var leftWingTip: CGPoint?
-    var rightWingTip: CGPoint?
-    /// 主体边界与裁切框位于旋转后的 PSD 平面，尚未平移裁切原点。
-    var subjectBounds: CGRect
-    var sourceCropRect: CGRect
-    var outputSize: CGSize
-    var actualMargins: WorkflowMargins
-    var isApplicable: Bool
-    var reason: String?
-}
-
 // 角色图像覆盖完整可编辑范围；可见裁切框与像素数组原点分别保存，不能混用。
 nonisolated struct RoleImages: Codable, Equatable, Sendable {
     var snapshotVersion: String

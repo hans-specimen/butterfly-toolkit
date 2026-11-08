@@ -39,13 +39,13 @@ python3 scripts/version.py check
 
 ## Swift 测试分组
 
-当前有 14 个 Swift 测试文件。按修改涉及的行为选择局部测试，涉及共享状态、路径或发布机制时再运行相关集成测试。
+按修改涉及的行为选择局部测试，涉及共享状态、路径或发布机制时再运行相关集成测试。
 
 | 分组 | 文件与主要范围 |
 |---|---|
 | AI 工作区 | [AIWorkspaceTests](<../Butterfly ToolkitTests/AIWorkspaceTests.swift>)：分组资格、素材导入、结果校验、安全导出和单次子进程 |
 | 常驻推理 | [AIInferenceWorkerTests](<../Butterfly ToolkitTests/AIInferenceWorkerTests.swift>)：会话复用、串行队列、协议错误、取消和退出清理 |
-| 独立智能裁剪 | [ButterflyCropProcessorTests](<../Butterfly ToolkitTests/ButterflyCropProcessorTests.swift>)：比例、留白和旋转后的有效裁剪范围 |
+| 独立智能裁剪 | [ButterflyCropProcessorTests](<../Butterfly ToolkitTests/ButterflyCropProcessorTests.swift>)：固定留白、整数尺寸、完整主体与人工范围；[SmartCropNativeTests](<../Butterfly ToolkitTests/SmartCropNativeTests.swift>)：蒙版格式、方向、灰度 JPEG、真实渲染导出和源文件保护；[SmartCropStoreTests](<../Butterfly ToolkitTests/SmartCropStoreTests.swift>)：旧预览隔离、离页取消、原图与缩略图独立加载、切图与批次结果复用、磁盘缓存恢复、构图／源版本失效，以及重新载入与取消覆盖后的刷新 |
 | 工作流几何 | [MaskGeometryProcessorTests](<../Butterfly ToolkitTests/MaskGeometryProcessorTests.swift>)：主体细节、翅顶、真实背景、坐标与裁切约束 |
 | 几何缓存 | [WorkflowGeometryCacheTests](<../Butterfly ToolkitTests/WorkflowGeometryCacheTests.swift>)：并发合并、串行准备、容量、取消和清空 |
 | 状态与清单 | [WorkflowStateTests](<../Butterfly ToolkitTests/WorkflowStateTests.swift>)：阶段屏障、版本失效、双面确认、保存与恢复 |
@@ -58,7 +58,7 @@ python3 scripts/version.py check
 | 堆栈输入准备 | [WorkflowStackPreparationTests](<../Butterfly ToolkitTests/WorkflowStackPreparationTests.swift>)：可选预备 PNG、回退、保存顺序和恢复 |
 | 真实流水线测量 | [WorkflowPipelinePerformanceTests](<../Butterfly ToolkitTests/WorkflowPipelinePerformanceTests.swift>)：按需性能比较，以及默认执行的素材复制与证据目录保护 |
 
-状态、执行器、集成和输出测试的名称可能相近，但验证层次不同。独立智能裁剪与工作流蒙版几何也使用不同算法，不按名称判定重复。
+状态、执行器、集成和输出测试的名称可能相近，但验证层次不同。独立智能裁剪与照片流共用几何核心，独立测试另行覆盖 JPEG 识别适配、交互状态和导出边界，不按名称判定重复。
 
 四个检查点的完整组合由输出测试覆盖；集成测试另行检查逐标本确认、持久化和原图不变。旧派生阶段的兼容数据与仍存在的渲染能力继续保留相关测试。
 
