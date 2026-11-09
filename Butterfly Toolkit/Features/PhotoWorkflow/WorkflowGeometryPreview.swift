@@ -74,7 +74,15 @@ actor WorkflowPreviewService: WorkflowPreviewServing {
         return result
     }
     func geometry(source: RoleImages,request: GeometryRequest,savedCandidate: GeometrySolution? = nil) async throws -> GeometrySolution {
-        try await geometryCache.geometry(source: source,request: request,savedCandidate: savedCandidate)
+        if let savedCandidate,!savedCandidate.isApplicable {
+            guard savedCandidate.sourceVersion == source.snapshotVersion else { throw WorkflowBridgeError.staleSource }
+            // 预览失败方案仍展示当前保存画布；确认/应用继续走严格 validate，不能把建议当成已执行结果。
+            var current = try await geometryCache.geometry(source: source,request: GeometryRequest(angleStrategy: .manual(degrees: 0)))
+            current.angleDegrees = 0; current.sourceCropRect = source.cropViewport; current.outputSize = source.cropViewport.size
+            current.isApplicable = false; current.reason = "自动裁切未应用，请在 PSD 中检查并调整后刷新"
+            return current
+        }
+        return try await geometryCache.geometry(source: source,request: request,savedCandidate: savedCandidate)
     }
 
 }
@@ -88,6 +96,7 @@ struct WorkflowGeometryPreview: View {
     var zoom: Double
     var background: String
     var showSafeFrame = true
+    var savedCanvasOnly = false
     var interactionStarted: TimeInterval?
     var onSourcePoint: (CGPoint) -> Void = { _ in }
     var onMoveChanged: (CGSize) -> Void = { _ in }
@@ -127,14 +136,14 @@ struct WorkflowGeometryPreview: View {
                 } else {
                     // 无效构图以红色提示源图或背景空缺，避免将其显示为有效照片区域。
                     if let solution,!solution.isApplicable { ctx.fill(Path(map.viewRect(solution.sourceCropRect)),with: .color(.red.opacity(0.25))) }
+                    var pixels = ctx
+                    if savedCanvasOnly || source.isFinalized == true { pixels.clip(to: Path(map.viewRect(source.cropViewport))) }
                     if let solution {
                         let pivot = map.viewPoint(solution.rotationPivot)
-                        ctx.translateBy(x: pivot.x,y: pivot.y); ctx.rotate(by: .degrees(solution.angleDegrees)); ctx.translateBy(x: -pivot.x,y: -pivot.y)
+                        pixels.translateBy(x: pivot.x,y: pivot.y); pixels.rotate(by: .degrees(solution.angleDegrees)); pixels.translateBy(x: -pivot.x,y: -pivot.y)
                     }
-                    ctx.draw(Image(decorative: image,scale: 1),in: map.viewRect(CGRect(origin: source.coordinateOrigin,size: source.pixelSize)))
+                    pixels.draw(Image(decorative: image,scale: 1),in: map.viewRect(CGRect(origin: source.coordinateOrigin,size: source.pixelSize)))
                     if let solution {
-                        let pivot = map.viewPoint(solution.rotationPivot)
-                        ctx.translateBy(x: pivot.x,y: pivot.y); ctx.rotate(by: .degrees(-solution.angleDegrees)); ctx.translateBy(x: -pivot.x,y: -pivot.y)
                         ctx.stroke(Path(map.viewRect(solution.subjectBounds)),with: .color(.green),lineWidth: 1)
                         ctx.stroke(Path(map.viewRect(solution.sourceCropRect)),with: .color(solution.isApplicable ? .orange : .red),lineWidth: 2)
                         for p in [solution.leftWingTip,solution.rightWingTip].compactMap({ $0 }) {
@@ -159,6 +168,7 @@ struct WorkflowGeometryPreview: View {
     var displayRect: CGRect {
         if let square { return CGRect(x: 0,y: 0,width: square.canvasSide,height: square.canvasSide).insetBy(dx: -120,dy: -120) }
         guard let source else { return CGRect(x: 0,y: 0,width: 100,height: 100) }
+        if savedCanvasOnly || source.isFinalized == true { return source.cropViewport.insetBy(dx: -80,dy: -80) }
         return source.editableExtent.union(solution?.sourceCropRect ?? source.cropViewport).insetBy(dx: -80,dy: -80)
     }
 }

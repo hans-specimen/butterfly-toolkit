@@ -814,6 +814,12 @@ actor WorkflowExecutor {
                     try check(batchID,before,stage: stage)
                     guard applied.pixelSize == solution.outputSize,extracted.snapshotVersion == applied.contentVersion else { throw WorkflowBridgeError.invalidStructure }
                     var fit = solution
+                    let toSavedCanvas: (CGPoint) -> CGPoint = { point in
+                        let rotated = WorkflowPreviewCoordinates.rotate(point,degrees: solution.angleDegrees,pivot: solution.rotationPivot)
+                        return CGPoint(x: rotated.x-solution.sourceCropRect.minX,y: rotated.y-solution.sourceCropRect.minY)
+                    }
+                    fit.leftWingTip = solution.leftWingTip.map(toSavedCanvas)
+                    fit.rightWingTip = solution.rightWingTip.map(toSavedCanvas)
                     fit.sourceVersion = applied.contentVersion; fit.angleDegrees = 0
                     fit.rotationPivot = CGPoint(x: extracted.cropViewport.midX,y: extracted.cropViewport.midY)
                     fit.subjectBounds = solution.subjectBounds.offsetBy(dx: -solution.sourceCropRect.minX,dy: -solution.sourceCropRect.minY)

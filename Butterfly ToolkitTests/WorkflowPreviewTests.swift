@@ -78,6 +78,12 @@ import UniformTypeIdentifiers
         XCTAssertEqual(map.viewRect(solution.sourceCropRect),CGRect(x: 80,y: 80,width: 35,height: 21))
         XCTAssertEqual(map.viewRect(CGRect(origin: roles.coordinateOrigin,size: roles.pixelSize)),CGRect(x: 100,y: 100,width: 100,height: 100))
     }
+    func testManualInspectionPreviewUsesSavedCanvasInsteadOfHiddenLayerExtent() {
+        let url = URL(fileURLWithPath: "/tmp/role.png")
+        let roles = RoleImages(snapshotVersion: "saved",basePNG: url,cutoutPNG: url,maskPNG: url,pixelSize: CGSize(width: 500,height: 400),coordinateOrigin: CGPoint(x: -100,y: -80),editableExtent: CGRect(x: -100,y: -80,width: 500,height: 400),cropViewport: CGRect(x: 0,y: 0,width: 200,height: 180))
+        let preview = WorkflowGeometryPreview(image: nil,source: roles,solution: nil,zoom: 1,background: "棋盘",savedCanvasOnly: true)
+        XCTAssertEqual(preview.displayRect,CGRect(x: -80,y: -80,width: 360,height: 340))
+    }
     func testSavedGeometryStartsAtIncrementalZeroInsteadOfReestimating() {
         let file = WorkflowSourceFile(url: URL(fileURLWithPath: "/tmp/input.jpg"),fingerprint: "hash")
         let sources = WorkflowSources(first: file,second: file,third: file)

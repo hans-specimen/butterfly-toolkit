@@ -4,6 +4,17 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class MaskGeometryProcessorTests: XCTestCase {
+    func testRemoteFaintResidueDoesNotExpandCropOnOpaqueBackground() throws {
+        let f = try Fixture(width: 200,height: 200,subject: CGRect(x: 60,y: 60,width: 80,height: 80),extras: { p in
+            for x in 0..<200 { p[195*200+x] = 2 }
+            for y in 40..<60 { p[y*200+100] = 1 } // 连通触角保持原样
+            for y in 65..<72 { p[y*200+57] = 2 } // 临近的断续细毛
+        })
+        defer { f.remove() }
+        let prepared = try MaskGeometryProcessor().prepare(input: f.input)
+        XCTAssertEqual(prepared.support.bounds,CGRect(x: 57,y: 40,width: 83,height: 100))
+        XCTAssertTrue(try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0))).isApplicable)
+    }
     func testInvisibleMaskResidueDoesNotExpandSubjectButVisibleFineHairSurvives() throws {
         let f = try Fixture(width: 100,height: 100,subject: CGRect(x: 30,y: 30,width: 40,height: 40),extras: { p in
             for x in 0..<100 { p[x] = 64 }
@@ -122,13 +133,13 @@ final class MaskGeometryProcessorTests: XCTestCase {
         // Each small fragment is below the previous size threshold; no full-subject crop may drop it.
         let cases: [([(Int,Int)],UInt8,CGRect)] = [
             ((60..<80).map { ($0,80) },255,CGRect(x: 60,y: 80,width: 240,height: 200)),
-            ((50..<80).map { (70,$0) },2,CGRect(x: 70,y: 50,width: 230,height: 230)),
-            ((0..<20).map { (60+$0,60+$0) },1,CGRect(x: 60,y: 60,width: 240,height: 220)),
+            ((110..<140).map { (97,$0) },2,CGRect(x: 97,y: 100,width: 203,height: 180)),
+            ((0..<20).map { (77+$0,110+$0) },1,CGRect(x: 77,y: 100,width: 223,height: 180)),
             ([(50,50),(51,50),(50,51),(51,51)],255,CGRect(x: 50,y: 50,width: 250,height: 230)),
             ((0..<120).map { step in
                 let angle = Double(step)*2*Double.pi/120
-                return (Int(round(60+14*cos(angle))),Int(round(60+14*sin(angle))))
-            },1,CGRect(x: 46,y: 46,width: 254,height: 234))
+                return (Int(round(88+14*cos(angle))),Int(round(88+14*sin(angle))))
+            },1,CGRect(x: 74,y: 74,width: 226,height: 206))
         ]
         for (detail,alpha,bounds) in cases {
             let f = try Fixture(width: 400,height: 400,subject: CGRect(x: 100,y: 100,width: 200,height: 180),extras: { p in
@@ -148,7 +159,7 @@ final class MaskGeometryProcessorTests: XCTestCase {
     }
     func testDetachedWeakDetailDoesNotMoveAutomaticWingProfile() throws {
         let baseline = try butterfly(); defer { baseline.remove() }
-        let detailed = try butterfly(extra: { p in for x in 10..<30 { p[40*400+x] = 1 } }); defer { detailed.remove() }
+        let detailed = try butterfly(extra: { p in for x in 40..<59 { p[97*400+x] = 1 } }); defer { detailed.remove() }
         let processor = MaskGeometryProcessor(),request = GeometryRequest()
         let before = try processor.analyze(input: baseline.input,request: request)
         let prepared = try processor.prepare(input: detailed.input)
@@ -161,7 +172,7 @@ final class MaskGeometryProcessorTests: XCTestCase {
     }
     func testRotatedCropKeepsDetachedDetail() throws {
         let f = try Fixture(width: 400,height: 400,subject: CGRect(x: 100,y: 100,width: 200,height: 180),extras: { p in
-            for x in 60..<80 { p[80*400+x] = 2 }
+            for x in 60..<80 { p[80*400+x] = 32 }
         }); defer { f.remove() }
         let s = try MaskGeometryProcessor().analyze(input: f.input,request: GeometryRequest(targetMargin: 0,angleStrategy: .manual(degrees: 90)))
         XCTAssertTrue(s.isApplicable)

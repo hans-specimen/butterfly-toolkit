@@ -3,6 +3,24 @@ import XCTest
 @testable import Butterfly_Toolkit
 
 final class WorkflowFinalizationTests: XCTestCase {
+    func testAppliedGeometryMovesWingTipsIntoSavedCanvasCoordinates() async throws {
+        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch; batch.manualFinalization = true
+        var services = f.services
+        services.analyze = { roles,_ in
+            var result = ExecutorFixture.solution(roles.snapshotVersion)
+            result.angleDegrees = 90; result.rotationPivot = CGPoint(x: 50,y: 40)
+            result.leftWingTip = CGPoint(x: 50,y: 30); result.rightWingTip = CGPoint(x: 50,y: 50)
+            result.sourceCropRect.origin = CGPoint(x: -10,y: -20)
+            return result
+        }
+        let executor = WorkflowExecutor(services: services)
+        try await executor.register(batch: batch,manifestURL: f.manifest); try await executor.runPending(batchID: batch.id)
+        let actual = try await executor.batch(batchID: batch.id)
+        let fit = try XCTUnwrap(actual.activeTasks.first?.geometrySolution)
+        XCTAssertEqual(fit.leftWingTip,CGPoint(x: 70,y: 60)); XCTAssertEqual(fit.rightWingTip,CGPoint(x: 50,y: 60))
+        XCTAssertEqual(fit.angleDegrees,0)
+    }
     func testAutomaticGeometryStopsForMandatoryReviewEvenWhenOldChecksAreOff() async throws {
         let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch; batch.manualFinalization = true; batch.checkGeometry = false; batch.check4K = false

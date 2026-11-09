@@ -88,6 +88,7 @@ python3 scripts/version.py check
 | AI worker 真实推理 | `WORKFLOW_WORKER_REAL_INPUT/EVIDENCE/ENGINE`；需要已配置好的 AI 引擎 |
 | 已有 PSD 真实流程 | `WORKFLOW_IMPORT_REAL_SOURCE/EVIDENCE/ENGINE`；仅复制输入到新证据目录，验证接管、自动 PNG、AI、回写、恢复校验和裁切；`WORKFLOW_IMPORT_FLATTEN=1` 额外验证单层 Background PSD |
 | 人工定稿真实 PSD | `WORKFLOW_FINAL_SOURCE/EVIDENCE`，使用 WorkflowFinalPSDLiveTests 验证独立副本的保留／应用蒙版、4K 像素一致、双输出及未保存／旧版本保护。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 只读指定旧批次并复制受影响蒙版分析；新证据目录必须不存在 |
+| 微弱残留回写与裁切 | `WORKFLOW_RESIDUE_BATCH/EVIDENCE`，WorkflowResidueLiveTests 只读批次的 `222_V` 蒙版与底图，在新目录建立 PSD 副本，回放已有蒙版经过生产清理、回写、裁切，并核对 Photoshop 应用蒙版后的真实图层边界；不运行模型或修改原批次 |
 | 蒙版真实素材分析 | `TASK3_EVIDENCE_DIR`；还依赖 `/tmp/butterfly-task2-real/` 下的 `F/U-roles.json`、`F/U-saved.json` 及其引用文件 |
 | 渲染与发布计时 | `WORKFLOW_RENDER_BATCH/EVIDENCE`；批次须包含有效角色图像 |
 | 几何缓存计时 | `WORKFLOW_GEOMETRY_BATCH/EVIDENCE`；批次须包含角色图像与已保存几何方案 |

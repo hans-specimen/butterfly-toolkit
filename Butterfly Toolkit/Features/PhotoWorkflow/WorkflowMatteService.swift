@@ -3,6 +3,7 @@
 import Foundation
 import ImageIO
 import CoreGraphics
+import UniformTypeIdentifiers
 
 // MARK: - 工作流错误与推理服务
 nonisolated enum WorkflowBridgeError: LocalizedError, Equatable {
@@ -58,6 +59,27 @@ nonisolated struct WorkflowMatteService: Sendable {
         try WorkflowRaster.validateMatte(original: original, alpha: alpha, cutout: cutout)
         guard try AIFileValidation.hash(alphaPath) == alphaHash, (try AIFileValidation.hash(cutoutPath)) == cutoutHash,
               (try AIFileValidation.hash(input.pngURL.path)) == input.fingerprint else { throw WorkflowBridgeError.staleSource }
+        // 先验证外部结果，再生成独立清理产物；不覆盖引擎结果或人工 PSD。
+        var values = stride(from: 0,to: alpha.pixels.count,by: 4).map { alpha.pixels[$0] }
+        let source = try WorkflowRaster.read(input.pngURL)
+        guard source.size == alpha.size,source.pixels.count == alpha.pixels.count else { throw WorkflowBridgeError.staleSource }
+        for i in values.indices where source.pixels[i*4+3] == 0 { values[i] = 0 }
+        let cleaned = try MaskResidueCleanup.clean(values,width: Int(alpha.size.width),height: Int(alpha.size.height))
+        if cleaned != stride(from: 0,to: alpha.pixels.count,by: 4).map({ alpha.pixels[$0] }) {
+            let folder = workspace.appendingPathComponent("AI/matte-cleaned/\(UUID())",isDirectory: true)
+            try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
+            do {
+                let cleanAlpha = folder.appendingPathComponent("alpha.png"),cleanCutout = folder.appendingPathComponent("cutout.png")
+                try WorkflowRaster.writeCleanedMatte(alpha: cleaned,originalAlpha: alpha,cutoutURL: cutoutURL,alphaURL: cleanAlpha,outputURL: cleanCutout)
+                try WorkflowRaster.validateMatte(original: original,alpha: WorkflowRaster.read(cleanAlpha),cutout: WorkflowRaster.read(cleanCutout))
+                guard try AIFileValidation.hash(alphaPath) == alphaHash,try AIFileValidation.hash(cutoutPath) == cutoutHash,
+                      try AIFileValidation.hash(input.pngURL.path) == input.fingerprint else { throw WorkflowBridgeError.staleSource }
+                try Task.checkCancellation()
+                return MatteArtifact(inputPNGFingerprint: input.fingerprint,alphaURL: cleanAlpha,
+                    alphaFingerprint: try AIFileValidation.hash(cleanAlpha.path),cutoutURL: cleanCutout,
+                    cutoutFingerprint: try AIFileValidation.hash(cleanCutout.path),orientation: 1,pixelSize: input.pixelSize)
+            } catch { try? FileManager.default.removeItem(at: folder); throw error }
+        }
         return MatteArtifact(inputPNGFingerprint: input.fingerprint, alphaURL: alphaURL,
             alphaFingerprint: alphaHash, cutoutURL: cutoutURL,
             cutoutFingerprint: cutoutHash, orientation: 1, pixelSize: input.pixelSize)
@@ -113,6 +135,62 @@ nonisolated struct WorkflowRaster: Sendable {
         let raster = Self(size: CGSize(width: image.width, height: image.height), orientation: info[kCGImagePropertyOrientation] as? Int ?? 1,
                     hasProfile: try hasEmbeddedICC(url), profileName: info[kCGImagePropertyProfileName] as? String, profileData: image.colorSpace?.copyICCData() as Data?, pixels: pixels)
         return WorkflowDecodedImage(image: image,raster: raster)
+    }
+    // 在原 ICC 空间清零对应像素，避免用 sRGB 校验像素重建宽色域输出。
+    static func writeCleanedMatte(alpha: [UInt8],originalAlpha: Self,cutoutURL: URL,alphaURL: URL,outputURL: URL) throws {
+        let decoded = try decode(cutoutURL),image = decoded.image,w = image.width,h = image.height
+        guard alpha.count == w*h,originalAlpha.size == decoded.raster.size,
+              let space = image.colorSpace else { throw WorkflowBridgeError.invalidImage("清理尺寸或颜色空间不符") }
+        var rgba = [UInt8](repeating: 0,count: w*h*4)
+        let output: CGImage? = rgba.withUnsafeMutableBytes { bytes in
+            guard let context = CGContext(data: bytes.baseAddress,width: w,height: h,bitsPerComponent: 8,bytesPerRow: w*4,
+                space: space,bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            context.draw(image,in: CGRect(x: 0,y: 0,width: w,height: h))
+            let pixels = bytes.bindMemory(to: UInt8.self)
+            for i in alpha.indices where alpha[i] == 0 {
+                for channel in 0..<4 { pixels[i*4+channel] = 0 }
+            }
+            return context.makeImage()
+        }
+        let maskPixels = alpha.flatMap { [$0,$0,$0,UInt8(255)] }
+        guard let output,let provider = CGDataProvider(data: Data(maskPixels) as CFData),
+              let mask = CGImage(width: w,height: h,bitsPerComponent: 8,bitsPerPixel: 32,bytesPerRow: w*4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider,decode: nil,shouldInterpolate: false,intent: .defaultIntent) else {
+            throw WorkflowBridgeError.invalidImage("无法生成清理后的蒙版")
+        }
+        for (image,url) in [(mask,alphaURL),(output,outputURL)] {
+            guard let destination = CGImageDestinationCreateWithURL(url as CFURL,UTType.png.identifier as CFString,1,nil) else { throw WorkflowBridgeError.invalidImage("无法创建清理结果") }
+            CGImageDestinationAddImage(destination,image,[kCGImagePropertyOrientation:1] as CFDictionary)
+            guard CGImageDestinationFinalize(destination) else { throw WorkflowBridgeError.invalidImage("无法保存清理结果") }
+        }
+        try preservePNGColorMetadata(from: cutoutURL,to: outputURL)
+    }
+    // ImageIO 对标准 sRGB 可能只写 sRGB 简记；原样携带颜色块，避免丢失必需的嵌入 ICC。
+    static func preservePNGColorMetadata(from source: URL,to destination: URL) throws {
+        let colorTypes: Set<String> = ["iCCP","sRGB","gAMA","cHRM"]
+        func chunks(_ data: Data) throws -> [(String,Data)] {
+            guard data.prefix(8) == Data([137,80,78,71,13,10,26,10]) else { throw WorkflowBridgeError.invalidImage("不是完整 PNG") }
+            var result: [(String,Data)] = [],offset = 8
+            while offset+12 <= data.count {
+                let length = data[offset..<(offset+4)].reduce(0) { ($0 << 8) | Int($1) }
+                guard length <= data.count-offset-12 else { throw WorkflowBridgeError.invalidImage("PNG 块不完整") }
+                let type = String(decoding: data[(offset+4)..<(offset+8)],as: UTF8.self)
+                result.append((type,data.subdata(in: offset..<(offset+12+length))))
+                offset += length+12
+            }
+            guard offset == data.count,result.first?.0 == "IHDR",result.last?.0 == "IEND" else { throw WorkflowBridgeError.invalidImage("PNG 结构不完整") }
+            return result
+        }
+        let colors = try chunks(Data(contentsOf: source)).filter { colorTypes.contains($0.0) }
+        guard colors.contains(where: { $0.0 == "iCCP" }) else { throw WorkflowBridgeError.invalidImage("源 PNG 缺少 ICC") }
+        let encoded = try Data(contentsOf: destination)
+        var result = Data(encoded.prefix(8))
+        for (type,data) in try chunks(encoded) where !colorTypes.contains(type) {
+            result.append(data)
+            if type == "IHDR" { for (_,color) in colors { result.append(color) } }
+        }
+        try result.write(to: destination,options: .atomic)
     }
     private static func hasEmbeddedICC(_ url: URL) throws -> Bool {
         let data = try Data(contentsOf: url, options: .mappedIfSafe)

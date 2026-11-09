@@ -77,6 +77,7 @@ nonisolated struct MeaningfulMaskSupport: Sendable {
     fileprivate var estimatedStorageBytes: Int { pixels.count + wingPixels.count + (rowMin.count + rowMax.count) * MemoryLayout<Int>.stride }
 
     init(values: [UInt8],width: Int,height: Int,origin: CGPoint) throws {
+        let values = try MaskResidueCleanup.clean(values,width: width,height: height)
         self.width = width; self.height = height; coordinateOrigin = origin
         var labels = [Int32](repeating: 0,count: values.count),components = [MaskComponent()]
         var queue = [Int](); queue.reserveCapacity(values.count / 4)

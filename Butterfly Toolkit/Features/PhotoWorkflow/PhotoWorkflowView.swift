@@ -348,7 +348,7 @@ struct PhotoWorkflowView: View {
                     WorkflowGeometryPreview(image: store.displayImage(for: task),source: roles,
                         solution: active ? store.currentPreviewSolution : store.solutions[task.id] ?? task.geometrySolution,
                         square: store.stage == .png4k ? (active ? store.currentPreviewLayout : store.layouts[task.id] ?? task.squareLayout) : nil,
-                        zoom: store.zoom,background: store.previewBackground,showSafeFrame: store.showSafeFrame,
+                        zoom: store.zoom,background: store.previewBackground,showSafeFrame: store.showSafeFrame,savedCanvasOnly: store.usesFinalization,
                         interactionStarted: store.previewInteractionStarted[task.id],onSourcePoint: store.pickTip,onMoveChanged: store.updateMove,onMoveEnded: store.commitMove)
                         .allowsHitTesting(active)
                         .overlay(alignment: .topLeading) {

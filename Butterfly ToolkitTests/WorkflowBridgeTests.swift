@@ -533,6 +533,43 @@ final class WorkflowBridgeTests: XCTestCase {
         let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         XCTAssertEqual(files, ["owned.psd"], "No snapshot may be created during an unsaved edit")
     }
+    func testInferenceClearsRemoteFaintAlphaAndCutoutBeforeWriteback() async throws {
+        try await assertResidueCleanup(standardSRGB: false)
+    }
+    func testStandardSRGBMatteCleanupPreservesEmbeddedICC() async throws {
+        try await assertResidueCleanup(standardSRGB: true)
+    }
+    private func assertResidueCleanup(standardSRGB: Bool) async throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("input.png"),alpha = directory.appendingPathComponent("alpha.png"),cutout = directory.appendingPathComponent("cutout.png")
+        var values = [UInt8](repeating: 0,count: 10000)
+        for y in 30..<70 { for x in 30..<70 { values[y*100+x] = 255 } }
+        for y in 20..<30 { values[y*100+50] = 1 }
+        for x in 0..<100 { values[95*100+x] = 2 }
+        if standardSRGB {
+            // 固定白色夹具只含标准 sRGB ICC，无用户照片；ImageIO 再编码会将该 ICC 简写为 sRGB 块。
+            let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/srgb-matte-input.png")
+            try FileManager.default.copyItem(at: fixture,to: source)
+        } else {
+            try png(source,width: 100,height: 100,pixels: Array(repeating: [UInt8](repeating: 255,count: 4),count: 10000).flatMap { $0 })
+        }
+        try png(alpha,width: 100,height: 100,pixels: values.flatMap { [$0,$0,$0,255] },colorSpaceName: CGColorSpace.sRGB)
+        try png(cutout,width: 100,height: 100,pixels: values.flatMap { [255,255,255,$0] },colorSpaceName: standardSRGB ? CGColorSpace.sRGB : CGColorSpace.adobeRGB1998)
+        if standardSRGB { try WorkflowRaster.preservePNGColorMetadata(from: source,to: cutout) }
+        let input = StackPNG(snapshotVersion: "saved",pngURL: source,fingerprint: try AIFileValidation.hash(source.path),pixelSize: CGSize(width: 100,height: 100),orientation: 1,colorProfile: "Adobe RGB")
+        let rawAlpha = try Data(contentsOf: alpha),rawCutout = try Data(contentsOf: cutout)
+        try JSONSerialization.data(withJSONObject: ["inputSha256":input.fingerprint]).write(to: directory.appendingPathComponent("result.json"))
+        let event = AIEvent(event: "completed",input: source.path,prediction: cutout.path,predictionAlpha: alpha.path)
+        let result = try await WorkflowMatteService(engine: directory,workspace: directory,run: { _ in event }).infer(input: input)
+        let a = try WorkflowRaster.read(result.alphaURL),c = try WorkflowRaster.read(result.cutoutURL)
+        XCTAssertEqual(a.pixels[9500*4],0); XCTAssertEqual(c.pixels[9500*4+3],0)
+        XCTAssertTrue(c.hasProfile); XCTAssertEqual(c.profileData,try WorkflowRaster.read(source).profileData)
+        XCTAssertEqual(a.pixels[2050*4],1); XCTAssertEqual(c.pixels[2050*4+3],1)
+        try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(source),alpha: a,cutout: c)
+        XCTAssertEqual(try Data(contentsOf: alpha),rawAlpha); XCTAssertEqual(try Data(contentsOf: cutout),rawCutout)
+        XCTAssertEqual(try AIFileValidation.hash(result.alphaURL.path),result.alphaFingerprint)
+        XCTAssertEqual(try AIFileValidation.hash(result.cutoutURL.path),result.cutoutFingerprint)
+    }
     func testInvalidMatteResultsCannotSucceed() async throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let inputURL = directory.appendingPathComponent("input.png")
@@ -601,7 +638,7 @@ final class WorkflowBridgeTests: XCTestCase {
         XCTAssertThrowsError(try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true))
         let installed = directory.appendingPathComponent("installed.png")
         try png(installed, width: 4, height: 1, pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
-        let roles = RoleImages(snapshotVersion: "installed",basePNG: source,cutoutPNG: installed,maskPNG: alpha,pixelSize: input.pixelSize,coordinateOrigin: .zero,editableExtent: CGRect(origin: .zero,size: input.pixelSize),cropViewport: CGRect(origin: .zero,size: input.pixelSize))
+        let roles = RoleImages(snapshotVersion: "installed",basePNG: source,cutoutPNG: installed,maskPNG: result.alphaURL,pixelSize: input.pixelSize,coordinateOrigin: .zero,editableExtent: CGRect(origin: .zero,size: input.pixelSize),cropViewport: CGRect(origin: .zero,size: input.pixelSize))
         let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: directory),matte: service)
         // 中断恢复须分别验证 AI 白底结果和保留源 Alpha 的 PSD，不能要求两者透明边缘相等。
         try await services.validateInstalledMatte(roles,input,result)

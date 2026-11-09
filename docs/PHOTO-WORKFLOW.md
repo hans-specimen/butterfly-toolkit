@@ -29,7 +29,8 @@
 - 新流程在输入文件夹内创建 `<输入文件夹名>_堆栈原图` 和 `<输入文件夹名>_4K_PNG` 子文件夹，无需选目录。新输出统一使用 D／V 后缀；旧批次保存的历史路径继续有效，不自动改名既有文件。内部批次记录在应用支持目录的 `Butterfly Toolkit/PhotoWorkflow/<UUID>/`，通过“查看文件 → 批次记录”定位 `batch.json`。
 - `.work` 保存快照及恢复材料。蒙版成功回写且阶段持久化后，仅清理本批次受控路径中的 AI 输入／结果 PNG；失败时保留重试材料，不应手动清空整个工作目录。
 - 旧清单仍兼容历史输出子目录和派生字段；当前工作流不执行闲鱼、1K 白底或紧裁素材阶段，独立图片工具另行使用。
-- 自动几何分析使用蒙版与底图 Alpha 的乘积，排除完全透明背景中的不可见残留；不修改原蒙版，不通过提高统一阈值删除触角和细毛。
+- AI 结果先通过输入身份、ICC、像素与 Alpha 校验，再派生清理后的蒙版与透明图：去除透明底图外的不可见像素，以及远离可信主体、完全由低于 16/255 Alpha 组成的分离残留。可信主体周围保留图像长边 1%（至少 3 px）的保护区；连通边缘、触角、细毛和带明显像素的分离细节保留。清理结果再次严格校验后回写，不覆盖引擎原始结果。
+- 几何分析使用蒙版与底图 Alpha 的乘积及同一残留规则；分析和刷新不改写已有 PSD。已完成或手工修改的 PSD 不会因更新应用而自动清理。人工检查预览只显示保存的画布，不把非破坏裁切保留的画布外像素当成当前结果。
 - 高清构图支持自适应、5:4、22:17（11:8.5）、1:1；默认相对留白 10%。自动构图优先主体居中，背景不足时减少留白，不补背景、不截断主体。
 - 堆栈原图 JPEG 质量为 0.82。PNG4K 为 4096×4096 透明图，默认安全边距 256 px，界面可调 0…512 px；预览底色不写入输出。
 - PNG4K 使用已确认的姿态重新排版，不重复旋转；只改其布局不重跑 AI，也不改已确认高清构图。完整细节 alpha 保留，分析用的主体支持区域不能替换原蒙版。
@@ -112,5 +113,7 @@
 - [初始验收与后续居中／4K 优化](validation/2026-11-05-photo-workflow-acceptance.md)：按段落日期阅读，早期六阶段和 PS 豁免不是现行状态。
 - 第一轮性能：[1 角色复用](validation/2026-11-07-photo-workflow-performance-task-1.md)、[2 PNG 编码](validation/2026-11-07-photo-workflow-performance-task-2.md)、[3 确认读取](validation/2026-11-07-photo-workflow-performance-task-3.md)、[4 几何缓存](validation/2026-11-07-photo-workflow-performance-task-4.md)、[5 预览](validation/2026-11-07-photo-workflow-performance-task-5.md)、[6 渲染发布](validation/2026-11-07-photo-workflow-performance-task-6.md)、[7 交错调度](validation/2026-11-07-photo-workflow-performance-task-7.md)、[8 模型会话](validation/2026-11-07-photo-workflow-performance-task-8.md)。
 - 第二轮候选：[1 完整基线与失败诊断](validation/2026-11-07-photo-workflow-batched-ps-task-1.md)、[2 输入融合限制](validation/2026-11-08-photo-workflow-batched-ps-task-2.md)、[3 文档复用与恢复](validation/2026-11-08-photo-workflow-batched-ps-task-3.md)、[4 集中调度](validation/2026-11-08-photo-workflow-batched-ps-task-4.md)。
+
+- [微弱蒙版残留修复验证](validation/2026-11-10-matte-residue.md)：本批四面分析、真实副本回写和应用蒙版后的边界验证；不代表重跑模型或修改历史 PSD。
 
 报告内临时图片、日志和 xcresult 可能被系统清理；仓库记录保留关键测量及限制，路径存在与否须复核，不能补造历史结果。

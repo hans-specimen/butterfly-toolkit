@@ -4,6 +4,22 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 @MainActor final class WorkflowGeometryCacheTests: XCTestCase {
+    func testInapplicableSavedPreviewReanalyzesWithoutClaimingSourceChanged() async throws {
+        let f = try MaskGeometryProcessorTests.Fixture(width: 100,height: 100,subject: CGRect(x: 0,y: 0,width: 100,height: 100))
+        defer { f.remove() }
+        let roles = Self.roles(f.input),cache = WorkflowGeometryCache(prepare: Self.prepare)
+        let preview = WorkflowPreviewService(geometry: cache)
+        var saved = try Self.prepare(roles).analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0)))
+        saved.isApplicable = false
+        do {
+            let result = try await preview.geometry(source: roles,request: GeometryRequest(angleStrategy: .manual(degrees: 0)),savedCandidate: saved)
+            XCTAssertNotNil(result.reason); XCTAssertFalse(result.isApplicable)
+            XCTAssertEqual(result.sourceCropRect,roles.cropViewport)
+        } catch { XCTFail("An already inapplicable preview is a diagnostic, not a stale-source error: \(error)") }
+        do { _ = try await cache.geometry(source: roles,request: GeometryRequest(),savedCandidate: saved); XCTFail("Strict apply validation accepted an inapplicable solution") } catch {}
+        saved.sourceVersion = "stale"
+        do { _ = try await preview.geometry(source: roles,request: GeometryRequest(),savedCandidate: saved); XCTFail("Stale preview accepted") } catch {}
+    }
     func testConcurrentRequestsJoinOnePreparation() async throws {
         let f = try MaskGeometryProcessorTests.Fixture(width: 100,height: 100,subject: CGRect(x: 35,y: 35,width: 30,height: 30))
         defer { f.remove() }
