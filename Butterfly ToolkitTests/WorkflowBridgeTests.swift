@@ -515,7 +515,7 @@ final class WorkflowBridgeTests: XCTestCase {
         let document = directory.appendingPathComponent("unknown.psd")
         try Data("user-edited".utf8).write(to: document)
         let bridge = PhotoshopWorkflowBridge(workspace: directory, scriptRunner: { _ in XCTFail("Existing PSD must not open"); return "" })
-        let job = FocusStackJob(id: 0,sourceFiles: [document,document,document],destinationURL: document,butterflyName: "sample",side: "F")
+        let job = FocusStackJob(id: 0,sourceFiles: [document,document,document],destinationURL: document,butterflyName: "sample",side: "D")
         do { _ = try await bridge.stack(job: job,owner: UUID()); XCTFail("Unknown PSD accepted") }
         catch { XCTAssertEqual(error as? WorkflowBridgeError,.ownershipConflict) }
         XCTAssertEqual(try Data(contentsOf: document),Data("user-edited".utf8))
@@ -570,6 +570,44 @@ final class WorkflowBridgeTests: XCTestCase {
         await rejects { _ = try await service.infer(input: input) }
         try FileManager.default.removeItem(at: alpha)
         await rejects { _ = try await service.infer(input: input) }
+    }
+    func testMatteAcceptsWhiteCompositedEdgesButRejectsChangedPixels() async throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("input.png")
+        let alpha = directory.appendingPathComponent("alpha.png"), cutout = directory.appendingPathComponent("cutout.png")
+        // 使用 Adobe RGB，确保先在输入色彩空间铺白底，再转换到校验用的 sRGB。
+        try png(source, width: 4, height: 1, pixels: [23,45,67,0, 0,255,0,128, 255,0,0,255, 0,0,255,255])
+        try png(alpha, width: 4, height: 1, pixels: [7,7,7,255, 128,128,128,255, 255,255,255,255, 0,0,0,255], colorSpaceName: CGColorSpace.sRGB)
+        let expected: [UInt8] = [255,255,255,7, 127,255,127,128, 255,0,0,255, 0,0,255,0]
+        try png(cutout, width: 4, height: 1, pixels: expected)
+        let input = StackPNG(snapshotVersion: "saved",pngURL: source,fingerprint: try AIFileValidation.hash(source.path),pixelSize: CGSize(width: 4,height: 1),orientation: 1,colorProfile: "Adobe RGB")
+        try JSONSerialization.data(withJSONObject: ["inputSha256":input.fingerprint]).write(to: directory.appendingPathComponent("result.json"))
+        let event = AIEvent(event: "completed",input: source.path,prediction: cutout.path,predictionAlpha: alpha.path)
+        let service = WorkflowMatteService(engine: directory,workspace: directory,run: { _ in event })
+        let result = try await service.infer(input: input)
+        XCTAssertEqual(result.inputPNGFingerprint,input.fingerprint)
+        for (channel,value) in [(0,UInt8(0)),(5,UInt8(0)),(9,UInt8(255)),(7,UInt8(64))] {
+            var corrupt = expected; corrupt[channel] = value
+            try png(cutout, width: 4, height: 1, pixels: corrupt)
+            do { _ = try await service.infer(input: input); XCTFail("Accepted changed channel \(channel)") }
+            catch { XCTAssertTrue(error is WorkflowBridgeError) }
+        }
+        try png(cutout, width: 4, height: 1, pixels: expected, colorSpaceName: CGColorSpace.sRGB)
+        await rejects { _ = try await service.infer(input: input) }
+        // PSD 回写继续使用原始 Alpha，不能套用 AI 的白底参照。
+        try png(cutout, width: 4, height: 1, pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
+        try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true)
+        try png(cutout, width: 4, height: 1, pixels: expected)
+        XCTAssertThrowsError(try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true))
+        let installed = directory.appendingPathComponent("installed.png")
+        try png(installed, width: 4, height: 1, pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
+        let roles = RoleImages(snapshotVersion: "installed",basePNG: source,cutoutPNG: installed,maskPNG: alpha,pixelSize: input.pixelSize,coordinateOrigin: .zero,editableExtent: CGRect(origin: .zero,size: input.pixelSize),cropViewport: CGRect(origin: .zero,size: input.pixelSize))
+        let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: directory),matte: service)
+        // 中断恢复须分别验证 AI 白底结果和保留源 Alpha 的 PSD，不能要求两者透明边缘相等。
+        try await services.validateInstalledMatte(roles,input,result)
+        try png(installed, width: 4, height: 1, pixels: [0,0,0,0, 255,0,0,64, 255,0,0,255, 0,0,0,0])
+        await rejects { try await services.validateInstalledMatte(roles,input,result) }
+        XCTAssertEqual(try AIFileValidation.hash(source.path),input.fingerprint)
     }
     func testSavedRefreshCanReadWithinManualLeaseWithoutReleasingIt() async throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
@@ -1195,8 +1233,8 @@ final class WorkflowBridgeTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("WorkflowBridgeTests-\(UUID())")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true); return url
     }
-    private func png(_ url: URL, width: Int, height: Int, pixels: [UInt8]) throws {
-        let color = CGColorSpace(name: CGColorSpace.adobeRGB1998)!
+    private func png(_ url: URL, width: Int, height: Int, pixels: [UInt8], colorSpaceName: CFString = CGColorSpace.adobeRGB1998) throws {
+        let color = CGColorSpace(name: colorSpaceName)!
         let provider = CGDataProvider(data: Data(pixels) as CFData)!
         let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4, space: color, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
         let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!

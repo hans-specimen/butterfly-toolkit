@@ -36,7 +36,7 @@ nonisolated struct WorkflowMatteService: Sendable {
         return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
     }
     private func performInference(input: StackPNG) async throws -> MatteArtifact {
-        let original = try WorkflowRaster.read(input.pngURL)
+        let original = try WorkflowRaster.readMatteInput(input.pngURL)
         guard try AIFileValidation.hash(input.pngURL.path) == input.fingerprint,
               original.size == input.pixelSize, original.orientation == input.orientation,
               original.orientation == 1, !input.colorProfile.isEmpty, original.hasProfile else {
@@ -79,12 +79,29 @@ nonisolated struct WorkflowRaster: Sendable {
     let profileData: Data?
     let pixels: [UInt8]
     static func read(_ url: URL) throws -> Self { try decode(url).raster }
-    static func decode(_ url: URL) throws -> WorkflowDecodedImage {
+    static func readMatteInput(_ url: URL) throws -> Self { try decode(url, compositingOnWhite: true).raster }
+    static func decode(_ url: URL) throws -> WorkflowDecodedImage { try decode(url, compositingOnWhite: false) }
+    private static func decode(_ url: URL, compositingOnWhite: Bool) throws -> WorkflowDecodedImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               CGImageSourceGetStatus(source) == .statusComplete,
-              let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
+              var image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
               image.width > 0, image.height > 0 else { throw WorkflowBridgeError.invalidImage(url.lastPathComponent) }
         let info = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
+        if compositingOnWhite {
+            // AI 的 white_rgb 在输入 ICC 空间铺白底；必须先合成再转 sRGB，不能跳过透明边缘的颜色校验。
+            guard let space = image.colorSpace, space.model == .rgb,
+                  let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8,
+                    bytesPerRow: image.width * 4, space: space,
+                    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                throw WorkflowBridgeError.invalidImage("无法建立 AI 白底校验参照")
+            }
+            let rect = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+            context.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+            context.fill(rect)
+            context.draw(image, in: rect)
+            guard let composited = context.makeImage() else { throw WorkflowBridgeError.invalidImage("无法合成 AI 白底校验参照") }
+            image = composited
+        }
         var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
         let success = pixels.withUnsafeMutableBytes { bytes -> Bool in
             guard let context = CGContext(data: bytes.baseAddress, width: image.width, height: image.height, bitsPerComponent: 8,

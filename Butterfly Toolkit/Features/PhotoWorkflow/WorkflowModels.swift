@@ -13,7 +13,9 @@ nonisolated enum WorkflowStage: String, Codable, CaseIterable, Sendable {
 
 nonisolated enum WorkflowSide: String, Codable, CaseIterable, Sendable {
     case front, back
-    var fileSuffix: String { self == .front ? "F" : "U" }
+    var fileSuffix: String { self == .front ? "D" : "V" }
+    // 仅供旧清单定位已保存文件；新生成名称统一使用 D/V。
+    var legacyFileSuffix: String { self == .front ? "F" : "U" }
 }
 
 nonisolated enum WorkflowAssetKind: String, Codable, CaseIterable, Sendable {
@@ -37,12 +39,13 @@ nonisolated struct WorkflowSourceFile: Codable, Equatable, Sendable {
     var fingerprint: String
 }
 
-/// 固定槽位冻结源文件与正反面的对应关系，不受队列位置或排除操作影响。
+/// 每面冻结三张照片或一份已合成 PSD，不受队列位置或排除操作影响；可选槽位兼容旧三图清单。
 nonisolated struct WorkflowSources: Codable, Equatable, Sendable {
     var first: WorkflowSourceFile
-    var second: WorkflowSourceFile
-    var third: WorkflowSourceFile
-    var files: [WorkflowSourceFile] { [first, second, third] }
+    var second: WorkflowSourceFile?
+    var third: WorkflowSourceFile?
+    var files: [WorkflowSourceFile] { [first, second, third].compactMap { $0 } }
+    var isPSD: Bool { second == nil && third == nil && first.url.pathExtension.lowercased() == "psd" }
 }
 
 nonisolated struct WorkflowStageRecord: Codable, Equatable, Sendable {
@@ -205,9 +208,12 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
         }
         // 原图旁的 PSD 必须严格使用冻结后的标本名和正反面后缀。
         let allowed = specimens.flatMap { specimen in
-            WorkflowSide.allCases.map { sourceDirectory.appendingPathComponent("\(specimen.baseName)_\($0.fileSuffix).psd") }
+            WorkflowSide.allCases.flatMap { side in
+                [side.fileSuffix,side.legacyFileSuffix].map { sourceDirectory.appendingPathComponent("\(specimen.baseName)_\($0).psd") }
+            }
         }
-        if Self.isContained(url, in: sourceDirectory), allowed.contains(url.standardizedFileURL) { return }
+        let imported = sideTasks.filter { $0.sources.isPSD }.map { $0.sources.first.url.standardizedFileURL }
+        if Self.isContained(url, in: sourceDirectory), (allowed + imported).contains(url.standardizedFileURL) { return }
         throw WorkflowStateError.invalidManifest("Output destination is outside the batch's authorized locations")
     }
     private static func isSafeBaseName(_ name: String) -> Bool {
@@ -241,8 +247,16 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                     else { try validateOutputURL(artifact.url) }
                 }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
+                      task.sources.isPSD || task.sources.files.count == 3,
                       task.sources.files.allSatisfy({ $0.url.isFileURL && (specimen.isExcluded || !$0.fingerprint.isEmpty) }) else {
                     throw WorkflowStateError.invalidManifest("Incomplete source or stage records")
+                }
+                if task.sources.isPSD {
+                    guard Self.isContained(task.sources.first.url,in: sourceDirectory),
+                          task.stackAttemptURL == nil || task.stackAttemptURL == task.sources.first.url,
+                          task.snapshot == nil || task.snapshot?.workingURL == task.sources.first.url else {
+                        throw WorkflowStateError.invalidManifest("Imported PSD must retain its frozen source path")
+                    }
                 }
                 for stage in WorkflowStage.allCases {
                     let record = task[stage]

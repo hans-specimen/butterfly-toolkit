@@ -28,7 +28,7 @@ enum FocusStackError: LocalizedError, Sendable {
         case .emptyNames:
             "请粘贴 PSD 名称清单，每行填写一只蝴蝶。"
         case .invalidName(let name):
-            "名称“\(name)”包含 /、:，或已经带有 _F/_U 后缀。请只填写基础名称。"
+            "名称“\(name)”包含 /、:，或已经带有 _D/_V 后缀。请只填写基础名称。"
         case .duplicateName(let name):
             "名称清单中存在重复项：\(name)"
         case .countMismatch(let images, let names):
@@ -109,9 +109,9 @@ struct FocusStackProcessor {
 
         var jobs: [FocusStackJob] = []
         var skipped = 0
-        // 自然排序后的每六张对应一只标本：前三张为正面 F，后三张为反面 U。
+        // 自然排序后的每六张对应一只标本：前三张为正面 D，后三张为反面 V。
         for (butterflyIndex, name) in names.enumerated() {
-            for (sideIndex, side) in ["F", "U"].enumerated() {
+            for (sideIndex, side) in ["D", "V"].enumerated() {
                 let first = butterflyIndex * 6 + sideIndex * 3
                 let destination = outputFolder
                     .appendingPathComponent("\(name)_\(side)")
@@ -238,7 +238,7 @@ struct FocusStackProcessor {
         for name in names {
             let lower = name.lowercased()
             guard !name.contains("/"), !name.contains(":"),
-                  !lower.hasSuffix("_f"), !lower.hasSuffix("_u"),
+                  !lower.hasSuffix("_d"), !lower.hasSuffix("_v"),
                   !lower.hasSuffix(".psd") else {
                 throw FocusStackError.invalidName(name)
             }

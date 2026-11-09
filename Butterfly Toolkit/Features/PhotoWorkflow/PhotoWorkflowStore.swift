@@ -4,7 +4,12 @@ import SwiftUI
 import Combine
 import AppKit
 
-// MARK: - 六图分组与批次冻结
+// MARK: - 输入分组与批次冻结
+nonisolated enum WorkflowInputMode: String, CaseIterable, Sendable {
+    case photos, psd
+    var title: String { self == .photos ? "从景深合成开始" : "从 AI 抠图开始（已有 PSD）" }
+    var filesPerSide: Int { self == .photos ? 3 : 1 }
+}
 // 移除照片只清空当前槽位，历史引用仍保留，便于明确排除整组后追溯原映射。
 nonisolated struct WorkflowDraftGroup: Identifiable, Sendable {
     var id = UUID()
@@ -12,15 +17,17 @@ nonisolated struct WorkflowDraftGroup: Identifiable, Sendable {
         didSet { for index in files.indices { if let url = files[index] { historicalFiles[index] = url } } }
     }
     private(set) var historicalFiles: [URL]
+    var suggestedName: String?
     var excluded = false
-    init(files: [URL?]) {
-        precondition(files.count == 6 && files.allSatisfy { $0 != nil })
-        self.files = files; historicalFiles = files.map { $0! }
+    init(files: [URL?], suggestedName: String? = nil) {
+        precondition([2,6].contains(files.count) && files.allSatisfy { $0 != nil })
+        self.files = files; historicalFiles = files.map { $0! }; self.suggestedName = suggestedName
     }
     mutating func swapFaces() {
         let prior = historicalFiles
-        files = Array(files[3..<6])+Array(files[0..<3])
-        historicalFiles = Array(prior[3..<6])+Array(prior[0..<3])
+        let half = files.count / 2
+        files = Array(files[half...])+Array(files[..<half])
+        historicalFiles = Array(prior[half...])+Array(prior[..<half])
     }
 }
 
@@ -29,18 +36,46 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var groups: [WorkflowDraftGroup]
     var remainder: [URL]
     var otherFiles: [URL]
+    var inputMode: WorkflowInputMode = .photos
     var ignoreRemainder = false
-    var photoCount: Int { groups.count*6+remainder.count }
-    static func scan(directory: URL) throws -> Self {
+    var photoCount: Int { groups.reduce(0) { $0 + $1.files.count } + remainder.count }
+    static func scan(directory: URL,inputMode: WorkflowInputMode = .photos) throws -> Self {
         let files = try FileManager.default.contentsOfDirectory(at: directory,includingPropertiesForKeys: [.isRegularFileKey],options: [.skipsHiddenFiles]).filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        if inputMode == .psd {
+            let psds = files.filter { $0.pathExtension.lowercased() == "psd" }
+            let pairs = try psdGroups(files: psds)
+            return Self(directory: directory,groups: pairs.groups,remainder: pairs.remainder,otherFiles: files.filter { $0.pathExtension.lowercased() != "psd" },inputMode: .psd)
+        }
         let photos = files.filter { ["jpg","jpeg"].contains($0.pathExtension.lowercased()) }
         let count = photos.count/6
         return Self(directory: directory,groups: (0..<count).map { WorkflowDraftGroup(files: photos[($0*6)..<($0*6+6)].map { Optional($0) }) },remainder: Array(photos.dropFirst(count*6)),otherFiles: files.filter { !["jpg","jpeg"].contains($0.pathExtension.lowercased()) })
     }
+    static func psdGroups(files: [URL]) throws -> (groups: [WorkflowDraftGroup],remainder: [URL]) {
+        var pairs: [String: (name: String, faces: [String: URL])] = [:]
+        var remainder: [URL] = []
+        for file in files {
+            let stem = file.deletingPathExtension().lastPathComponent
+            guard stem.count > 2,stem.suffix(2).first == "_",let side = stem.last?.uppercased(),["D","V"].contains(side) else {
+                remainder.append(file); continue
+            }
+            let name = String(stem.dropLast(2)), key = name.precomposedStringWithCanonicalMapping.lowercased()
+            var pair = pairs[key] ?? (name,[:])
+            guard pair.faces[side] == nil else { throw WorkflowBridgeError.invalidImage("PSD 正反面重复：\(file.lastPathComponent)") }
+            pair.faces[side] = file; pairs[key] = pair
+        }
+        var groups: [WorkflowDraftGroup] = []
+        for pair in pairs.values.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
+            if let front = pair.faces["D"],let back = pair.faces["V"] {
+                groups.append(WorkflowDraftGroup(files: [front,back],suggestedName: pair.name))
+            } else { remainder.append(contentsOf: pair.faces.values) }
+        }
+        return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
+    }
     func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true) throws -> WorkflowBatch {
         let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
-        guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage("请明确排除剩余未分组照片") }
+        guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage(inputMode == .psd ? "请补齐 D/V 配对或明确排除未配对 PSD" : "请明确排除剩余未分组照片") }
+        guard groups.allSatisfy({ $0.files.count == inputMode.filesPerSide * 2 }) else { throw WorkflowBridgeError.invalidImage("分组与输入方式不符") }
         let activeURLs = groups.filter { !$0.excluded }.flatMap(\.files)
         guard activeURLs.allSatisfy({ $0 != nil }),Set(activeURLs.compactMap { $0?.resolvingSymlinksInPath() }).count == activeURLs.count else { throw WorkflowBridgeError.invalidImage("照片缺失或在多个固定位置重复，请补拍替换或排除整组") }
         guard groups.contains(where: { !$0.excluded }) else { throw WorkflowBridgeError.invalidImage("至少保留一只标本") }
@@ -57,12 +92,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
                 }
             }
             func side(_ value: WorkflowSide,_ offset: Int) -> WorkflowSideTask {
-                var task = WorkflowSideTask(side: value,sources: WorkflowSources(first: files[offset],second: files[offset+1],third: files[offset+2]))
+                let sources = inputMode == .psd ? WorkflowSources(first: files[offset]) : WorkflowSources(first: files[offset],second: files[offset+1],third: files[offset+2])
+                var task = WorkflowSideTask(side: value,sources: sources)
                 if group.excluded { for stage in WorkflowStage.allCases { task[stage].state = .excluded; task[stage].exclusionReason = "建批次时排除" } }; return task
             }
-            return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,3),exclusionReason: group.excluded ? "建批次时排除" : nil)
+            return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,inputMode.filesPerSide),exclusionReason: group.excluded ? "建批次时排除" : nil)
         }
-        let batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,outputLocations: locations,checkAfterStack: checkStack,checkAfterMatte: checkMatte,checkGeometry: checkGeometry,check4K: check4K,specimens: specimens)
+        let batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,outputLocations: locations,checkAfterStack: inputMode == .photos && checkStack,checkAfterMatte: checkMatte,checkGeometry: checkGeometry,check4K: check4K,specimens: specimens)
         try batch.validate(); try batch.validateStart(); return batch
     }
 }
@@ -70,6 +106,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
 // MARK: - 界面状态与当前预览
 @MainActor final class PhotoWorkflowStore: ObservableObject {
     @Published var draft: WorkflowBatchDraft?
+    @Published var inputMode: WorkflowInputMode = .photos {
+        didSet { if inputMode != oldValue,let directory = draft?.directory { scan(directory) } }
+    }
     @Published var names = ""
     @Published var hdDirectory: URL?
     @Published var png4kDirectory: URL?
@@ -82,7 +121,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     @Published var checkGeometry = true
     @Published var check4K = true
-    var needsExportDirectories: Bool { !checkAfterStack && !checkAfterMatte && !checkGeometry && !check4K }
+    var needsExportDirectories: Bool { (inputMode == .psd || !checkAfterStack) && !checkAfterMatte && !checkGeometry && !check4K }
     var canStart: Bool { draft != nil && (!needsExportDirectories || (hdDirectory != nil && png4kDirectory != nil)) }
     @Published var batch: WorkflowBatch?
     @Published var selectedSpecimens: Set<UUID> = []
@@ -190,7 +229,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     // MARK: - 批次创建、打开与切换
     func scan(_ directory: URL) {
-        do { draft = try WorkflowBatchDraft.scan(directory: directory); error = nil } catch { self.error = error.localizedDescription }
+        do {
+            let scanned = try WorkflowBatchDraft.scan(directory: directory,inputMode: inputMode)
+            draft = scanned; names = inputMode == .psd ? scanned.groups.compactMap(\.suggestedName).joined(separator: "\n") : ""; error = nil
+        } catch { draft = nil; names = ""; self.error = error.localizedDescription }
     }
     func start() {
         guard let draft else { error = "请选择输入文件夹"; return }

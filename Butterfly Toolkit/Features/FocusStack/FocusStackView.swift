@@ -94,7 +94,7 @@ struct FocusStackView: View {
         VStack(spacing: 8) {
             Image(systemName: "square.3.layers.3d").font(.system(size: 54))
             Text("景深合成 PSD").font(.largeTitle).bold()
-            Text("每 6 张照片对应一只蝴蝶，前三张生成 F，后三张生成 U")
+            Text("每 6 张照片对应一只蝴蝶，前三张生成 D，后三张生成 V")
                 .foregroundStyle(.secondary)
         }
     }
@@ -137,7 +137,7 @@ struct FocusStackView: View {
                 Label("PSD 名称清单", systemImage: "list.bullet.rectangle")
                     .font(.headline)
                 Spacer()
-                Text("每行一只蝴蝶，不要填写 _F、_U 或 .psd")
+                Text("每行一只蝴蝶，不要填写 _D、_V 或 .psd")
                     .font(.caption).foregroundStyle(.secondary)
             }
             TextEditor(text: $namesText)

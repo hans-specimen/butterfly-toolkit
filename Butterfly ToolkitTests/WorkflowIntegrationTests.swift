@@ -183,7 +183,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         let image = try WorkflowAssetRendererTests.Fixture()
         defer { image.remove() }
         let renderer = WorkflowAssetRenderer(), store = WorkflowArtifactStore()
-        let foreign = f.batch.outputDirectory.appendingPathComponent("高清堆栈/sample0_F.jpg")
+        let foreign = f.batch.outputDirectory.appendingPathComponent("高清堆栈/sample0_D.jpg")
         var services = f.services
         services.render = { kind, roles, layout, source, watermark, output in
             if kind == .hd { try renderer.renderHD(roles: image.roles, destination: output) }
@@ -205,7 +205,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertEqual(b.specimens[0].front[.hd].state, .failed)
         XCTAssertEqual(b.specimens[0].front[.hd].error, WorkflowArtifactError.ownershipConflict.localizedDescription)
         XCTAssertEqual(b.specimens[0].back[.hd].state, .completed)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: foreign.deletingLastPathComponent().appendingPathComponent(".sample0_F.jpg.workflow.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: foreign.deletingLastPathComponent().appendingPathComponent(".sample0_D.jpg.workflow.json").path))
         XCTAssertEqual(try Data(contentsOf: foreign), bytes)
         XCTAssertFalse(b.specimens[0].front.artifacts.contains { $0.kind == .hd && $0.state == .completed })
         XCTAssertFalse(b.allSucceeded)

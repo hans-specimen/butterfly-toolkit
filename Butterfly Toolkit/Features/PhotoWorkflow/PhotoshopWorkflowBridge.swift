@@ -69,6 +69,32 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var documentPeak: Int?
     }
     // MARK: - 堆栈创建与保存输入
+    func adoptStack(source: WorkflowSourceFile, owner: UUID) async throws -> PSDSnapshot {
+        try await withLease("adoptStack", owner: owner, savedRead: false) {
+            let document = source.url.resolvingSymlinksInPath(), record = ownershipURL(document)
+            guard document.pathExtension.lowercased() == "psd", !source.fingerprint.isEmpty else { throw WorkflowBridgeError.invalidStructure }
+            let canonical = WorkflowSourceFile(url: document,fingerprint: source.fingerprint)
+            if FileManager.default.fileExists(atPath: record.path) {
+                let ownership = try JSONDecoder().decode(Ownership.self,from: Data(contentsOf: record))
+                guard ownership.owner == owner,ownership.sources == [canonical],ownership.initialStackVersion == source.fingerprint else {
+                    throw WorkflowBridgeError.ownershipConflict
+                }
+            }
+            guard try hash(document.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
+            // 接管前先检查用户的未保存修改和既有角色；不保存、关闭或重建用户文档。
+            let metadata = try await invoke(Self.inspectScript(document: document))
+            guard metadata.roles == nil,metadata.width > 0,metadata.height > 0 else { throw WorkflowBridgeError.invalidStructure }
+            guard try hash(document.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
+            if !FileManager.default.fileExists(atPath: record.path) {
+                let ownership = Ownership(owner: owner,sources: [canonical],initialStackVersion: source.fingerprint)
+                try JSONEncoder().encode(ownership).write(to: record,options: .withoutOverwriting)
+            }
+            // 首次回写前保留不可变原始 PSD；中断重试复用同一 owner 和保存版本。
+            let snapshot = try await capture(document: document,owner: owner)
+            guard snapshot.contentVersion == source.fingerprint else { throw WorkflowBridgeError.staleSource }
+            return snapshot
+        }
+    }
     func stackWithInput(job: FocusStackJob, owner: UUID) async throws -> WorkflowStackPreparation {
         try await prepareStack(job: job, owner: owner, prepareInput: true)
     }
@@ -199,7 +225,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                 throw WorkflowBridgeError.staleSource
             }
             try measure("pixel.validateMatte-including-read") {
-                try WorkflowRaster.validateMatte(original: readRaster(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
+                try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
             }
             // 先在独立副本中准备并校验，失败时不会改变工作 PSD 及其归属。
             let staged = try outputDirectory("install/\(UUID())", owner: snapshot.taskID).appendingPathComponent("result.psd")
@@ -712,10 +738,11 @@ extension PhotoshopWorkflowBridge {
             if(wfRoles(doc))throw new Error('WORKFLOW_STRUCTURE');
             copy=wfDuplicate(doc);app.activeDocument=copy;
             for(var i=0;i<copy.layers.length;i++)if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].remove();
-            copy.mergeVisibleLayers();var merged=copy.activeLayer;
+            // 透明辅助层让单层或单个可见组也能无损合并；只存在于可丢弃副本。
+            copy.artLayers.add();copy.mergeVisibleLayers();var merged=copy.activeLayer;
             app.activeDocument=doc;var old=[];for(var j=0;j<doc.layers.length;j++)old.push(doc.layers[j]);
             var original=doc.layerSets.add();original.name='原始堆栈';
-            for(var k=old.length-1;k>=0;k--)old[k].move(original,ElementPlacement.INSIDE);
+            for(var k=old.length-1;k>=0;k--){if(old[k].typename==='ArtLayer'&&old[k].isBackgroundLayer)old[k].isBackgroundLayer=false;old[k].move(original,ElementPlacement.INSIDE);}
             original.visible=false;
             var adjust=doc.layerSets.add();adjust.name='共同调整';
             app.activeDocument=copy;merged.duplicate(doc,ElementPlacement.PLACEATBEGINNING);

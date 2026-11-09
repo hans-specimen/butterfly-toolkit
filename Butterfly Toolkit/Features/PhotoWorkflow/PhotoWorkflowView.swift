@@ -26,12 +26,15 @@ struct PhotoWorkflowView: View {
     private var canvasBackground: Color { colorScheme == .dark ? Color(white: 0.13) : Color(nsColor: .textBackgroundColor) }
     private let queueWidth: CGFloat = 210
     private let inspectorWidth: CGFloat = 300
+    private func stageTitle(_ stage: WorkflowStage) -> String {
+        stage == .stack && store.currentTask?.sources.isPSD == true ? "已有 PSD" : stage.title
+    }
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading) {
                     Text("照片工作流").font(.title2.bold())
-                    Text("收藏标本 · 每只六张 · 正面 F / 反面 U").font(.caption).foregroundStyle(.secondary)
+                    Text("收藏标本 · 正面 D / 反面 V").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("打开批次清单…") { chooseFile(types: [.json]) { store.openBatch($0) } }.disabled(store.busy || store.manualTaskID != nil)
@@ -72,10 +75,10 @@ struct PhotoWorkflowView: View {
             Divider()
             HStack(spacing: 12) {
                 Image(systemName: "photo.stack").foregroundStyle(.secondary)
-                Text(store.draft.map { "\($0.groups.filter { !$0.excluded }.count) 只待处理 · 正反面各三张" } ?? "选择照片文件夹，开始建立收藏批次")
+                Text(store.draft.map { "\($0.groups.filter { !$0.excluded }.count) 只待处理 · \($0.inputMode == .psd ? "正反面各一份 PSD" : "正反面各三张")" } ?? "选择输入文件夹，开始建立收藏批次")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
-                Button(store.busy ? "正在准备批次…" : "开始处理") { store.start() }
+                Button(store.busy ? "正在准备批次…" : (store.inputMode == .psd ? "从 AI 抠图开始" : "开始处理")) { store.start() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(store.busy || !store.canStart)
             }.padding(.horizontal,24).padding(.vertical,14)
@@ -126,7 +129,7 @@ struct PhotoWorkflowView: View {
                     HStack(alignment: .top) {
                         VStack(alignment: .leading,spacing: 7) {
                             Text(draftName(index)).font(.title2.bold())
-                            Text("共 \(store.draft?.photoCount ?? 0) 张照片 · 核对分组与正反面").font(.callout).foregroundStyle(.secondary)
+                            Text("共 \(store.draft?.photoCount ?? 0) \(store.inputMode == .psd ? "份 PSD" : "张照片") · 核对分组与正反面").font(.callout).foregroundStyle(.secondary)
                         }
                         Spacer()
                         Text(group.excluded ? "已排除" : "待处理").font(.caption.weight(.medium)).padding(.horizontal,10).padding(.vertical,6)
@@ -134,17 +137,17 @@ struct PhotoWorkflowView: View {
                     }
                     ForEach(0..<2) { side in
                         VStack(alignment: .leading,spacing: 12) {
-                            HStack { Text(side == 0 ? "正面" : "反面").font(.headline); Spacer(); Text(side == 0 ? "F · 3 张原图" : "U · 3 张原图").font(.caption).foregroundStyle(.secondary) }
+                            HStack { Text(side == 0 ? "正面 D" : "反面 V").font(.headline); Spacer(); Text(store.inputMode == .psd ? "已合成 PSD" : "3 张原图").font(.caption).foregroundStyle(.secondary) }
                             HStack(alignment: .top,spacing: 12) {
-                                ForEach(0..<3) { offset in
-                                    // 每面固定三张；移除或替换仅影响该槽位，不重新排列其余照片。
-                                    let slot = side*3+offset
+                                ForEach(0..<store.inputMode.filesPerSide,id: \.self) { offset in
+                                    // 每面的槽位固定；移除或替换不会重新排列其他输入。
+                                    let slot = side*store.inputMode.filesPerSide+offset
                                     VStack(alignment: .leading,spacing: 8) {
                                         WorkflowFileThumbnail(url: group.files[slot]).aspectRatio(1.2,contentMode: .fit)
                                             .clipShape(RoundedRectangle(cornerRadius: 8))
                                         Text(group.files[slot]?.lastPathComponent ?? "缺图：需要替换").font(.caption).lineLimit(1).truncationMode(.middle)
                                         HStack(spacing: 10) {
-                                            Button("替换") { chooseFile(types: [.jpeg]) { store.draft?.groups[index].files[slot] = $0 } }
+                                            Button("替换") { chooseFile(types: store.inputMode == .psd ? [UTType(filenameExtension: "psd") ?? .data] : [.jpeg]) { store.draft?.groups[index].files[slot] = $0 } }
                                             Button("移除") { store.draft?.groups[index].files[slot] = nil }
                                         }.font(.caption).buttonStyle(.borderless)
                                     }.frame(maxWidth: .infinity)
@@ -161,29 +164,35 @@ struct PhotoWorkflowView: View {
                 } else {
                     VStack(spacing: 16) {
                         Image(systemName: "photo.on.rectangle.angled").font(.system(size: 42,weight: .light)).foregroundStyle(.tertiary)
-                        Text("导入第一批蝴蝶照片").font(.title3.weight(.semibold))
-                        Text("每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
+                        Text(store.inputMode == .psd ? "导入已合成的 PSD" : "导入第一批蝴蝶照片").font(.title3.weight(.semibold))
+                        Text(store.inputMode == .psd ? "按 文件名_D.psd / 文件名_V.psd 配对。\n自动准备临时 PNG，继续 AI 抠图和裁切矫正。" : "每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
                             .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("选择照片文件夹…",systemImage: "folder") { chooseFolder { store.scan($0) } }.controlSize(.large)
+                        Button("选择输入文件夹…",systemImage: "folder") { chooseFolder { store.scan($0) } }.controlSize(.large)
                     }.frame(maxWidth: .infinity).padding(.vertical,100)
                 }
                 if let draft = store.draft {
                     if !draft.remainder.isEmpty {
                         VStack(alignment: .leading,spacing: 8) {
-                            Toggle("明确排除剩余 \(draft.remainder.count) 张试拍",isOn: Binding(get: { store.draft?.ignoreRemainder ?? false },set: { store.draft?.ignoreRemainder = $0 }))
+                            Toggle(draft.inputMode == .psd ? "排除这 \(draft.remainder.count) 份未配对或后缀不明的 PSD" : "明确排除剩余 \(draft.remainder.count) 张试拍",isOn: Binding(get: { store.draft?.ignoreRemainder ?? false },set: { store.draft?.ignoreRemainder = $0 }))
                             Text(draft.remainder.map(\.lastPathComponent).joined(separator: "、")).font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if !draft.otherFiles.isEmpty { Text("其他格式未参与：\(draft.otherFiles.map(\.lastPathComponent).joined(separator: "、"))").font(.caption).foregroundStyle(.secondary) }
+                    if !draft.otherFiles.isEmpty { Text(draft.inputMode == .psd ? "\(draft.otherFiles.count) 个非 PSD 文件未参与处理" : "其他格式未参与：\(draft.otherFiles.map(\.lastPathComponent).joined(separator: "、"))").font(.caption).foregroundStyle(.secondary) }
                 }
             }.padding(24).frame(maxWidth: 1040).frame(maxWidth: .infinity,alignment: .topLeading)
         }.background(canvasBackground)
     }
     private var setupInspector: some View {
         VStack(alignment: .leading,spacing: 24) {
+            inspectorSection("开始阶段",icon: "play.circle") {
+                Picker("开始阶段",selection: $store.inputMode) {
+                    ForEach(WorkflowInputMode.allCases,id: \.self) { Text($0.title).tag($0) }
+                }.labelsHidden().pickerStyle(.menu)
+            }
+            Divider()
             inspectorSection("批次目录",icon: "folder") {
-                directoryControl("原始照片",url: store.draft?.directory,placeholder: "选择 JPG / JPEG 文件夹") { chooseFolder { store.scan($0) } }
-                Text("PSD 自动保存在原始照片文件夹。AI 临时 PNG 在蒙版回写完成后自动清理。").font(.caption).foregroundStyle(.secondary)
+                directoryControl(store.inputMode == .psd ? "已合成 PSD" : "原始照片",url: store.draft?.directory,placeholder: store.inputMode == .psd ? "选择包含 D/V 配对 PSD 的文件夹" : "选择 JPG / JPEG 文件夹") { chooseFolder { store.scan($0) } }
+                Text(store.inputMode == .psd ? "处理结果直接保存回原 PSD，首次写入前保留原始快照。临时 PNG 自动准备并在蒙版回写后清理。" : "PSD 自动保存在原始照片文件夹。AI 临时 PNG 在蒙版回写完成后自动清理。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             inspectorSection("名称清单",icon: "text.alignleft") {
@@ -191,7 +200,7 @@ struct PhotoWorkflowView: View {
                     .padding(8).frame(height: 112)
                     .background(Color(nsColor: .textBackgroundColor),in: RoundedRectangle(cornerRadius: 8))
                     .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary) }
-                Text("每只一行，与左侧顺序对应；排除整组时保留原行。").font(.caption).foregroundStyle(.secondary)
+                Text(store.inputMode == .psd ? "已从 PSD 文件名填入；改名仅影响导出名称，不改原 PSD 文件名。" : "每只一行，与左侧顺序对应；排除整组时保留原行。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             inspectorSection("检查点",icon: "checkmark.circle") { checkpoints }
@@ -222,7 +231,7 @@ struct PhotoWorkflowView: View {
     }
     private var checkpoints: some View {
         VStack(alignment: .leading,spacing: 12) {
-            Toggle("景深合成后检查",isOn: $store.checkAfterStack)
+            if store.inputMode == .photos { Toggle("景深合成后检查",isOn: $store.checkAfterStack) }
             Toggle("蒙版回写后检查",isOn: $store.checkAfterMatte)
             Toggle("构图后检查",isOn: $store.checkGeometry)
             Toggle("PNG4K 导出前检查",isOn: $store.check4K)
@@ -287,7 +296,7 @@ struct PhotoWorkflowView: View {
                         Button { store.stage = stage } label: {
                             HStack(spacing: 5) {
                                 Text("\(index+1)").font(.caption2.bold()).frame(width: 18,height: 18).background(store.stage == stage ? Color.accentColor : Color.secondary.opacity(0.14),in: Circle()).foregroundStyle(store.stage == stage ? .white : .secondary)
-                                Text(stage.title).font(.caption).fixedSize()
+                                Text(stageTitle(stage)).font(.caption).fixedSize()
                             }.padding(.horizontal,8).padding(.vertical,8)
                                 .background(store.stage == stage ? Color.accentColor.opacity(0.1) : .clear,in: RoundedRectangle(cornerRadius: 7))
                         }.buttonStyle(.plain)
@@ -296,7 +305,7 @@ struct PhotoWorkflowView: View {
             }
             Divider()
             HStack {
-                Text(store.stage == .png4k ? "PNG 4K" : store.stage.title).font(.headline)
+                Text(store.stage == .png4k ? "PNG 4K" : stageTitle(store.stage)).font(.headline)
                 Spacer()
                 Button { singleFace.toggle() } label: { Label(singleFace ? "正反面对照" : "单面放大",systemImage: singleFace ? "rectangle.split.2x1" : "arrow.up.left.and.arrow.down.right") }.buttonStyle(.borderless).font(.caption)
             }
@@ -306,7 +315,7 @@ struct PhotoWorkflowView: View {
                     if !singleFace || store.face == .back { facePreview(specimen.back) }
                 }.frame(maxWidth: .infinity,maxHeight: 560)
                 HStack(spacing: 10) {
-                    Picker("当前编辑面",selection: $store.face) { Text("正面 F").tag(WorkflowSide.front); Text("反面 U").tag(WorkflowSide.back) }
+                    Picker("当前编辑面",selection: $store.face) { Text("正面 D").tag(WorkflowSide.front); Text("反面 V").tag(WorkflowSide.back) }
                         .labelsHidden().pickerStyle(.segmented).frame(width: 148)
                     Spacer(minLength: 4)
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -398,7 +407,7 @@ struct PhotoWorkflowView: View {
     // MARK: - 阶段参数与人工编辑
     private var parameters: some View {
         VStack(alignment: .leading,spacing: 24) {
-            HStack { Text("参数与设置").font(.headline); Spacer(); Text(store.face == .front ? "正面 F" : "反面 U").font(.caption).foregroundStyle(Color.accentColor) }
+            HStack { Text("参数与设置").font(.headline); Spacer(); Text(store.face == .front ? "正面 D" : "反面 V").font(.caption).foregroundStyle(Color.accentColor) }
             Divider()
             switch store.stage {
             case .stack:

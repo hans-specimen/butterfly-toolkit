@@ -27,7 +27,7 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
         XCTAssertNotNil(candidate.stackWithInput); XCTAssertNotNil(candidate.validateStackInput)
     }
     func testStackExportRunsAfterSaveBeforeClose() throws {
-        let job = FocusStackJob(id: 0, sourceFiles: [], destinationURL: URL(fileURLWithPath: "/tmp/unused.psd"), butterflyName: "test", side: "F")
+        let job = FocusStackJob(id: 0, sourceFiles: [], destinationURL: URL(fileURLWithPath: "/tmp/unused.psd"), butterflyName: "test", side: "D")
         for hook in [nil, "events.push('png');", "events.push('png');throw new Error('PNG failed');"] as [String?] {
             let script = FocusStackProcessor.jsx(for: job, workflowPNGExportScript: hook)
             let start = try XCTUnwrap(script.range(of: "var psdOptions ="))
@@ -181,7 +181,7 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
                 if mode == "corrupt" { try Data("broken".utf8).write(to: png) }
                 if mode == "publication-conflict" { try Data("foreign".utf8).write(to: destination) }
             })
-            let job = FocusStackJob(id: 0, sourceFiles: sources, destinationURL: destination, butterflyName: "test", side: "F")
+            let job = FocusStackJob(id: 0, sourceFiles: sources, destinationURL: destination, butterflyName: "test", side: "D")
             if mode == "publication-conflict" {
                 do { _ = try await bridge.stackWithInput(job: job, owner: owner); XCTFail("Adopted foreign PSD") } catch {}
                 XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "foreign")
@@ -209,7 +209,7 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
         let evidence = try WorkflowPipelinePerformanceTests.isolatedEvidenceRoot(XCTUnwrap(env["WORKFLOW_STACK_PREP_EVIDENCE"]))
         guard !FileManager.default.fileExists(atPath: evidence.path) else { throw WorkflowBridgeError.ownershipConflict }
         try FileManager.default.createDirectory(at: evidence, withIntermediateDirectories: true)
-        let original = URL(fileURLWithPath: source), folder = evidence.appendingPathComponent("retained-22_U")
+        let original = URL(fileURLWithPath: source), folder = evidence.appendingPathComponent("retained-22_V")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let pair = try JSONSerialization.jsonObject(with: Data(contentsOf: original.appendingPathComponent("run-1.json"))) as! [String: Any]
         let candidate = URL(fileURLWithPath: (pair["fast"] as! [String: Any])["png"] as! String)
@@ -227,7 +227,7 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
             try FileManager.default.copyItem(at: original.appendingPathComponent("stack.psd"), to: job.destinationURL)
             try FileManager.default.copyItem(at: candidate, to: Self.candidatePath(XCTUnwrap(hook)))
         })
-        let result = try await bridge.stackWithInput(job: FocusStackJob(id: 0, sourceFiles: sources, destinationURL: folder.appendingPathComponent("stack.psd"), butterflyName: "retained", side: "U"), owner: UUID())
+        let result = try await bridge.stackWithInput(job: FocusStackJob(id: 0, sourceFiles: sources, destinationURL: folder.appendingPathComponent("stack.psd"), butterflyName: "retained", side: "V"), owner: UUID())
         XCTAssertNil(result.input, "Transparent candidate must not be adopted even though dimensions/ICC match")
         let input = try await bridge.exportStackPNG(snapshot: result.snapshot)
         let record: [String: Any] = ["legacy": ["png": expected.path], "fast": ["png": input.pngURL.path]]

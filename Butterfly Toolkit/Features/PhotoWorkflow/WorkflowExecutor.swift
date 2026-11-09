@@ -27,6 +27,7 @@ actor WorkflowExecutor {
         var validateInstalledMatte: @Sendable (RoleImages, StackPNG, MatteArtifact) async throws -> Void
 
         var validateStackInput: (@Sendable (PSDSnapshot, StackPNG) async throws -> Bool)? = nil
+        var adoptStack: (@Sendable (WorkflowSourceFile, UUID) async throws -> PSDSnapshot)? = nil
         var stackWithInput: (@Sendable (FocusStackJob, UUID) async throws -> WorkflowStackPreparation)? = nil
         var endInferenceSession: @Sendable () async -> Void = {}
 
@@ -70,10 +71,11 @@ actor WorkflowExecutor {
                     let expectedCutout = try WorkflowRaster.read(matte.cutoutURL), cutout = try WorkflowRaster.read(roles.cutoutPNG)
                     guard [original,base,expectedMask,mask,expectedCutout,cutout].allSatisfy({ $0.size == input.pixelSize && $0.orientation == 1 }),
                           original.pixels == base.pixels, original.profileData == base.profileData,
-                          zip(expectedMask.pixels,mask.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 1 }),
-                          zip(expectedCutout.pixels,cutout.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 4 }) else { throw WorkflowBridgeError.staleSource }
+                          zip(expectedMask.pixels,mask.pixels).allSatisfy({ abs(Int($0)-Int($1)) <= 1 }) else { throw WorkflowBridgeError.staleSource }
+                    // AI 使用白底输入，PSD 保留原透明度；分别核对两种像素规则，不能直接比较透明边缘。
+                    try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(input.pngURL),alpha: expectedMask,cutout: expectedCutout)
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
-                }.value },endInferenceSession: { await matte.shutdown() })
+                }.value },adoptStack: { try await bridge.adoptStack(source: $0,owner: $1) },endInferenceSession: { await matte.shutdown() })
             if prepareStackInput {
                 services.stackWithInput = { try await bridge.stackWithInput(job: $0, owner: $1) }
                 services.validateStackInput = { try await bridge.validateStackInput(snapshot: $0, input: $1) }
@@ -566,7 +568,7 @@ actor WorkflowExecutor {
                 let value = try batch(batchID: batchID)
                 let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
                 if before.stackAttemptURL == nil {
-                    let attempt = value.sourceDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
+                    let attempt = before.sources.isPSD ? before.sources.first.url : value.sourceDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
                     try value.validateOutputURL(attempt)
                     try mutateTask(batchID,id) { $0.stackAttemptURL = attempt }; try await persist(batchID)
                     before = try task(batchID,id)
@@ -575,7 +577,10 @@ actor WorkflowExecutor {
                 try value.validateOutputURL(url)
                 let saved: PSDSnapshot
                 var prepared: StackPNG?
-                if FileManager.default.fileExists(atPath: url.path) {
+                if before.sources.isPSD {
+                    guard let adopt = services.adoptStack else { throw WorkflowStateError.invalidTransition }
+                    saved = try await adopt(before.sources.first,id)
+                } else if FileManager.default.fileExists(atPath: url.path) {
                     saved = try await services.refresh(url,id,before.sources.files)
                 } else {
                     for source in before.sources.files {

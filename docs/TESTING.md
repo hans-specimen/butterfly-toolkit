@@ -54,6 +54,7 @@ python3 scripts/version.py check
 | 输出规则 | [WorkflowOutputTests](<../Butterfly ToolkitTests/WorkflowOutputTests.swift>)：PSD 位置、独立输出目录、四个检查点组合、PNG4K 结束及发布保护 |
 | 图片与发布 | [WorkflowAssetRendererTests](<../Butterfly ToolkitTests/WorkflowAssetRendererTests.swift>)：ICC、透明度、布局、归属凭据、原子发布和旧版本保留 |
 | Photoshop 桥接 | [WorkflowBridgeTests](<../Butterfly ToolkitTests/WorkflowBridgeTests.swift>)：文档归属、租约、快照、角色提取、蒙版事务与中断恢复 |
+| 已有 PSD 入口 | [WorkflowPSDImportTests](<../Butterfly ToolkitTests/WorkflowPSDImportTests.swift>)：D/V 配对、未配对排除、重复面、模式切换、单文件来源、接管保护、跳过堆栈与清单恢复 |
 | 预览与交互 | [WorkflowPreviewTests](<../Butterfly ToolkitTests/WorkflowPreviewTests.swift>)：异步预览、确认门槛、坐标、批次切换和细节图持有范围 |
 | 堆栈输入准备 | [WorkflowStackPreparationTests](<../Butterfly ToolkitTests/WorkflowStackPreparationTests.swift>)：可选预备 PNG、回退、保存顺序和恢复 |
 | 真实流水线测量 | [WorkflowPipelinePerformanceTests](<../Butterfly ToolkitTests/WorkflowPipelinePerformanceTests.swift>)：按需性能比较，以及默认执行的素材复制与证据目录保护 |
@@ -84,6 +85,7 @@ python3 scripts/version.py check
 | 测试入口 | 变量与关键条件 |
 |---|---|
 | AI worker 真实推理 | `WORKFLOW_WORKER_REAL_INPUT/EVIDENCE/ENGINE`；需要已配置好的 AI 引擎 |
+| 已有 PSD 真实流程 | `WORKFLOW_IMPORT_REAL_SOURCE/EVIDENCE/ENGINE`；仅复制输入到新证据目录，验证接管、自动 PNG、AI、回写、恢复校验和裁切；`WORKFLOW_IMPORT_FLATTEN=1` 额外验证单层 Background PSD |
 | 蒙版真实素材分析 | `TASK3_EVIDENCE_DIR`；还依赖 `/tmp/butterfly-task2-real/` 下的 `F/U-roles.json`、`F/U-saved.json` 及其引用文件 |
 | 渲染与发布计时 | `WORKFLOW_RENDER_BATCH/EVIDENCE`；批次须包含有效角色图像 |
 | 几何缓存计时 | `WORKFLOW_GEOMETRY_BATCH/EVIDENCE`；批次须包含角色图像与已保存几何方案 |

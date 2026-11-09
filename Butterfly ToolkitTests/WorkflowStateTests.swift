@@ -102,8 +102,8 @@ final class WorkflowStateTests: XCTestCase {
         XCTAssertEqual(changed.specimens[1], second)
         XCTAssertEqual(changed.specimens[1].front.sources.files.map(\.url.lastPathComponent), ["7.jpg", "8.jpg", "9.jpg"])
         XCTAssertEqual(changed.specimens[1].back.sources.files.map(\.url.lastPathComponent), ["10.jpg", "11.jpg", "12.jpg"])
-        XCTAssertEqual(WorkflowSide.front.fileSuffix, "F")
-        XCTAssertEqual(WorkflowSide.back.fileSuffix, "U")
+        XCTAssertEqual(WorkflowSide.front.fileSuffix, "D")
+        XCTAssertEqual(WorkflowSide.back.fileSuffix, "V")
     }
 
     // Output revisions, selected ownership and both sides are checked before any confirmation mutates state.
