@@ -4,6 +4,18 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class MaskGeometryProcessorTests: XCTestCase {
+    func testInvisibleMaskResidueDoesNotExpandSubjectButVisibleFineHairSurvives() throws {
+        let f = try Fixture(width: 100,height: 100,subject: CGRect(x: 30,y: 30,width: 40,height: 40),extras: { p in
+            for x in 0..<100 { p[x] = 64 }
+            for y in 20..<30 { p[y*100+50] = 2 }
+        },background: { p in for x in 0..<100 { p[x] = 0 } })
+        defer { f.remove() }
+        let before = try Data(contentsOf: f.input.maskURL)
+        let prepared = try MaskGeometryProcessor().prepare(input: f.input)
+        XCTAssertEqual(prepared.support.bounds,CGRect(x: 30,y: 20,width: 40,height: 50))
+        XCTAssertTrue(try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0))).isApplicable)
+        XCTAssertEqual(try Data(contentsOf: f.input.maskURL),before)
+    }
     func testExactFitRejectsOutsideExtentAndRotatedEmptyCorners() throws {
         let fixture = try Fixture(width: 100,height: 100,subject: CGRect(x: 35,y: 35,width: 30,height: 30))
         defer { fixture.remove() }

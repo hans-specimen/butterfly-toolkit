@@ -2,6 +2,8 @@
 
 import Foundation
 import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 
 nonisolated struct WorkflowStackPreparation: Sendable {
     let snapshot: PSDSnapshot
@@ -58,6 +60,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var height: Double
         var profile: String
         var roles: PSDRoleIdentifiers?
+        var finalRoles: FinalPSDIdentifiers?
         var summary: String
         var originX: Double?
         var originY: Double?
@@ -324,7 +327,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         }
     }
     private func extractUnlocked(_ snapshot: PSDSnapshot) async throws -> RoleImages {
-        guard snapshot.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
+        guard snapshot.roles?.isValid == true || snapshot.finalRoles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
         // 调用方已校验保存的 PSD，此处只复用身份与内容完全匹配的已校验像素。
         let receipt = workspace.appendingPathComponent("role-cache/\(snapshot.taskID)/\(snapshot.contentVersion).json")
         if let cache = try? JSONDecoder().decode(RoleCache.self, from: Data(contentsOf: receipt)),
@@ -333,19 +336,26 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             return cache.images
         }
         let folder = try outputDirectory("roles/\(snapshot.contentVersion)/\(UUID())", owner: snapshot.taskID)
-        let metadata = try await invoke(Self.rolesScript(document: snapshot.snapshotURL, folder: folder))
+        let metadata = try await invoke(snapshot.finalRoles != nil ? Self.finalRolesScript(document: snapshot.snapshotURL,folder: folder) : Self.rolesScript(document: snapshot.snapshotURL, folder: folder))
         let base = folder.appendingPathComponent("base.png"), cutout = folder.appendingPathComponent("cutout.png"), mask = folder.appendingPathComponent("mask.png")
+        if snapshot.finalRoles != nil {
+            guard metadata.finalRoles == snapshot.finalRoles else { throw WorkflowBridgeError.invalidStructure }
+            try Self.writeFinalAlpha(cutout: cutout,to: mask)
+        }
         let size = CGSize(width: metadata.extentWidth ?? 0, height: metadata.extentHeight ?? 0)
         guard size.width > 0, size.height > 0 else { throw WorkflowBridgeError.invalidStructure }
         let origin = CGPoint(x: metadata.originX ?? 0, y: metadata.originY ?? 0)
         let images = RoleImages(snapshotVersion: snapshot.contentVersion, basePNG: base, cutoutPNG: cutout, maskPNG: mask,
             pixelSize: size, coordinateOrigin: origin, editableExtent: CGRect(origin: origin, size: size),
-            cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize))
+            cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize),isFinalized: snapshot.finalRoles != nil)
         let fingerprints = try roleFingerprints(images)
         let baseRaster = try readRaster(base), cutoutRaster = try readRaster(cutout), maskRaster = try readRaster(mask)
         guard [baseRaster, cutoutRaster, maskRaster].allSatisfy({ $0.size == size }) else { throw WorkflowBridgeError.invalidImage("角色提取范围不一致") }
-        do { try measure("pixel.validateMatte") { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) } }
-        catch { throw WorkflowBridgeError.invalidStructure }
+        do {
+            if images.isFinalized == true { try WorkflowAssetRenderer.validateFinalPixels(base: baseRaster,cutout: cutoutRaster,mask: maskRaster) }
+            else { try measure("pixel.validateMatte") { try WorkflowRaster.validateMatte(original: baseRaster, alpha: maskRaster, cutout: cutoutRaster, respectSourceAlpha: true) } }
+        }
+        catch { if images.isFinalized == true { throw error }; throw WorkflowBridgeError.invalidStructure }
         guard try roleFingerprints(images) == fingerprints else { throw WorkflowBridgeError.staleSource }
         // 缓存写入为可选优化；凭据缺失或损坏时重新提取即可。
         if let data = try? JSONEncoder().encode(RoleCache(snapshot: snapshot, images: images, fingerprints: fingerprints)) {
@@ -358,19 +368,29 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         // 发布会改变工作路径，但不会改变已校验的不可变提取源。
         lhs.taskID == rhs.taskID && lhs.contentVersion == rhs.contentVersion &&
         lhs.snapshotURL == rhs.snapshotURL && lhs.pixelSize == rhs.pixelSize &&
-        lhs.roles == rhs.roles && lhs.structureSummary == rhs.structureSummary
+        lhs.roles == rhs.roles && lhs.finalRoles == rhs.finalRoles && lhs.structureSummary == rhs.structureSummary
     }
     private func roleFingerprints(_ images: RoleImages) throws -> [String] {
         try [images.basePNG, images.cutoutPNG, images.maskPNG].map { try hash($0.path) }
     }
     // MARK: - 快照捕获与源版本验证
-    private func capture(document: URL, owner: UUID) async throws -> PSDSnapshot {
+    func captureFinalPSD(document: URL, owner: UUID) async throws -> PSDSnapshot {
+        try await withLease("finalize",owner: owner,savedRead: true) {
+            try await capture(document: document,owner: owner,final: true)
+        }
+    }
+    private func capture(document: URL, owner: UUID, final: Bool = false) async throws -> PSDSnapshot {
         let started = observationStart()
         defer { report("capture", since: started) }
-        let metadata = try await invoke(Self.inspectScript(document: document))
+        let metadata = try await invoke(Self.inspectScript(document: document,final: final))
         let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(document)))
         guard ownership.owner == owner else { throw WorkflowBridgeError.ownershipConflict }
-        guard ownership.roles == metadata.roles, metadata.roles == nil || metadata.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
+        guard !final || ownership.pendingInstall == nil else { throw WorkflowBridgeError.invalidStructure }
+        if final {
+            guard metadata.finalRoles?.isValid == true,metadata.width > 0,metadata.height > 0 else { throw WorkflowBridgeError.invalidStructure }
+        } else {
+            guard ownership.roles == metadata.roles, metadata.roles == nil || metadata.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
+        }
         let before = try hash(document.path)
         let folder = try outputDirectory("snapshots", owner: owner)
         let temporary = folder.appendingPathComponent("\(UUID()).psd")
@@ -383,22 +403,25 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         // 保留的工作文档句柄不能代表磁盘读回，因此独立检查经过哈希校验的副本。
         let held = Self.openedDocument?.url == document.resolvingSymlinksInPath()
         let readback = held ? (existing ? immutable : temporary) : document
-        let second = try await invoke(Self.inspectScript(document: readback))
-        guard metadata.summary == second.summary, metadata.width == second.width, metadata.height == second.height,
+        let second = try await invoke(Self.inspectScript(document: readback,final: final))
+        guard metadata.summary == second.summary, metadata.width == second.width, metadata.height == second.height,metadata.roles == second.roles,metadata.finalRoles == second.finalRoles,
               try hash(document.path) == before else { throw WorkflowBridgeError.staleSource }
         if !existing {
             try FileManager.default.moveItem(at: temporary, to: immutable)
             try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: immutable.path)
         }
         return PSDSnapshot(taskID: owner, workingURL: document, snapshotURL: immutable, contentVersion: before,
-            pixelSize: CGSize(width: metadata.width, height: metadata.height), roles: metadata.roles, structureSummary: metadata.summary)
+            pixelSize: CGSize(width: metadata.width, height: metadata.height), roles: metadata.roles, structureSummary: metadata.summary,finalRoles: metadata.finalRoles)
     }
     private func verify(_ snapshot: PSDSnapshot) async throws {
-        let saved = try await invoke(Self.inspectScript(document: snapshot.workingURL))
-        guard saved.roles == snapshot.roles, saved.width == snapshot.pixelSize.width,
-              saved.height == snapshot.pixelSize.height, saved.summary == snapshot.structureSummary else { throw WorkflowBridgeError.invalidStructure }
+        let saved = try await invoke(Self.inspectScript(document: snapshot.workingURL,final: snapshot.finalRoles != nil))
+        guard saved.roles == snapshot.roles,saved.finalRoles == snapshot.finalRoles, saved.width == snapshot.pixelSize.width,
+              saved.height == snapshot.pixelSize.height, saved.summary == snapshot.structureSummary else {
+            throw snapshot.finalRoles != nil ? WorkflowBridgeError.staleSource : WorkflowBridgeError.invalidStructure
+        }
         let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(snapshot.workingURL)))
-        guard ownership.owner == snapshot.taskID, ownership.roles == snapshot.roles,
+        guard ownership.owner == snapshot.taskID, ownership.pendingInstall == nil,
+              (snapshot.finalRoles?.isValid == true || ownership.roles == snapshot.roles),
               try hash(snapshot.workingURL.path) == snapshot.contentVersion,
               (try hash(snapshot.snapshotURL.path)) == snapshot.contentVersion else { throw WorkflowBridgeError.staleSource }
     }
@@ -652,6 +675,31 @@ extension PhotoshopWorkflowBridge {
         for(var k=0;k<4;k++) if(Math.abs(b[k]-c[k])>0.1) throw new Error('WORKFLOW_STRUCTURE');
         return {original:original,adjust:adjust,base:base,cutout:cutout,ids:{originalStackGroup:String(original.id),adjustmentGroup:String(adjust.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id),mask:String(cutout.id)+':userMask'}};
     }
+    function wfFinalRoles(doc) {
+        var group=null,base=null,cutout=null,n=0,b=0;
+        for(var i=0;i<doc.layers.length;i++)if(doc.layers[i].name==='共同调整'){group=doc.layers[i];n++;}
+        if(n!==1 || group.typename!=='LayerSet')throw new Error('需要唯一的“共同调整”图层组');
+        for(var j=0;j<group.layers.length;j++) {
+            var layer=group.layers[j];
+            if(layer.name==='底图'){base=layer;b++;}
+            else if(!cutout && layer.visible)cutout=layer;
+        }
+        if(b!==1 || base.typename!=='ArtLayer' || base.kind!==LayerKind.NORMAL)throw new Error('共同调整中需要唯一的像素图层“底图”');
+        if(!cutout || cutout.typename!=='ArtLayer' || cutout.kind!==LayerKind.NORMAL)throw new Error('共同调整中最上方可见图层必须是最终透明像素图层');
+        if(base.grouped || cutout.grouped)throw new Error('请先将剪贴蒙版落实到导出像素图层');
+        if(wfHasMask(group))throw new Error('请将共同调整组的蒙版落实到导出图层后再刷新');
+        return {adjust:group,base:base,cutout:cutout,ids:{adjustmentGroup:String(group.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id)}};
+    }
+    function wfFinalMetadata(doc) {
+        var r=wfFinalRoles(doc);
+        return {width:doc.width.as('px'),height:doc.height.as('px'),profile:doc.colorProfileName,finalRoles:r.ids,summary:wfSummary(doc)};
+    }
+    function wfSummary(doc) {
+        var summary='';
+        function visit(parent) {for(var i=0;i<parent.layers.length;i++) {
+            var l=parent.layers[i];summary+=l.id+':'+l.name+':'+l.typename+':'+wfHasMask(l)+':'+l.visible+';';if(l.typename==='LayerSet')visit(l);
+        }}visit(doc);return summary;
+    }
     function wfMetadata(doc) {
         var roles=wfRoles(doc),summary='';
         function visit(parent) { for(var i=0;i<parent.layers.length;i++) {
@@ -695,9 +743,9 @@ extension PhotoshopWorkflowBridge {
     }
     function wfHideAll(doc) {for(var i=0;i<doc.layers.length;i++)doc.layers[i].visible=false;}
     """#
-    private static func inspectScript(document: URL) -> String {
+    private static func inspectScript(document: URL, final: Bool = false) -> String {
         """
-        var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path)));try{return wfJSON(wfMetadata(o.doc));}finally{wfClose(o);}
+        var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path)));try{return wfJSON(\(final ? "wfFinalMetadata" : "wfMetadata")(o.doc));}finally{wfClose(o);}
         """
     }
     private static func closeForPublicationScript(document: URL) -> String {
@@ -760,6 +808,34 @@ extension PhotoshopWorkflowBridge {
         """
     }
     // 在临时副本上展开隐藏像素，并回传相对当前 PSD 的像素原点和可编辑范围。
+    // 人工定稿读取仅在副本切换可见性，保留当前画布与用户原文件。
+    private static func finalRolesScript(document: URL, folder: URL) -> String {
+        """
+        var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null;
+        try {
+            var meta=wfFinalMetadata(o.doc);
+            copy=wfDuplicate(o.doc);app.activeDocument=copy;var r=wfFinalRoles(copy);
+            wfHideAll(copy);r.adjust.visible=true;
+            for(var i=0;i<r.adjust.layers.length;i++)r.adjust.layers[i].visible=false;
+            r.base.visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("base.png").path)));
+            r.base.visible=false;r.cutout.visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
+            meta.originX=0;meta.originY=0;meta.extentWidth=meta.width;meta.extentHeight=meta.height;return wfJSON(meta);
+        }finally{if(copy)wfCloseDocument(copy);wfClose(o);}
+        """
+    }
+    private static func writeFinalAlpha(cutout: URL,to destination: URL) throws {
+        let raster = try WorkflowRaster.read(cutout),w = Int(raster.size.width),h = Int(raster.size.height)
+        var bytes = raster.pixels
+        for i in stride(from: 0,to: bytes.count,by: 4) {
+            let a = bytes[i+3]; bytes[i] = a; bytes[i+1] = a; bytes[i+2] = a; bytes[i+3] = 255
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let image = CGImage(width: w,height: h,bitsPerComponent: 8,bitsPerPixel: 32,bytesPerRow: w*4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),provider: provider,decode: nil,shouldInterpolate: false,intent: .defaultIntent),
+              let out = CGImageDestinationCreateWithURL(destination as CFURL,UTType.png.identifier as CFString,1,nil) else { throw WorkflowBridgeError.invalidStructure }
+        CGImageDestinationAddImage(out,image,nil)
+        guard CGImageDestinationFinalize(out) else { throw WorkflowBridgeError.invalidStructure }
+    }
     private static func rolesScript(document: URL, folder: URL) -> String {
         """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null,mask=null;

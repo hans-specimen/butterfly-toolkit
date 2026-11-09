@@ -36,11 +36,12 @@ nonisolated struct WorkflowAssetRenderer: Sendable {
         let decodedCutout = try decode(roles.cutoutPNG),cutout = decodedCutout.raster
         let base = try decode(roles.basePNG).raster
         guard [mask,cutout,base].allSatisfy({ $0.size == roles.pixelSize && $0.orientation == 1 }) else { throw invalid("角色尺寸或方向不一致") }
+        if roles.isFinalized == true { try Self.validateFinalPixels(base: base,cutout: cutout,mask: mask) }
         var values = [UInt8](repeating: 0,count: mask.pixels.count/4)
         for i in values.indices {
             let p = i*4, a = Int(mask.pixels[p])
             guard mask.pixels[p+3] == 255,abs(a-Int(mask.pixels[p+1])) <= 1,abs(a-Int(mask.pixels[p+2])) <= 1,
-                  abs((a*Int(base.pixels[p+3])+127)/255-Int(cutout.pixels[p+3])) <= 1 else {
+                  abs((roles.isFinalized == true ? a : (a*Int(base.pixels[p+3])+127)/255)-Int(cutout.pixels[p+3])) <= 1 else {
                 throw invalid("最新蒙版与抠图角色不一致，请刷新保存版本")
             }
             values[i] = cutout.pixels[p+3]
@@ -50,6 +51,23 @@ nonisolated struct WorkflowAssetRenderer: Sendable {
         let source = decodedCutout.image
         guard let crop = source.cropping(to: support.bounds) else { throw invalid("无法裁取完整主体") }
         try write(square(crop,layout: layout,white: false),to: destination)
+    }
+
+    /// 最终图层可以独立修色或重绘，不再与底图逐 RGB 比较，但尺寸、ICC 和实际 Alpha 必须一致。
+    static func validateFinalPixels(base: WorkflowRaster,cutout: WorkflowRaster,mask: WorkflowRaster) throws {
+        guard base.size == cutout.size,cutout.size == mask.size,
+              [base,cutout,mask].allSatisfy({ $0.orientation == 1 }),
+              base.hasProfile,cutout.hasProfile,base.profileData == cutout.profileData else {
+            throw WorkflowBridgeError.invalidImage("最终底图与透明图的尺寸、方向或 ICC 不一致")
+        }
+        var visible = false,transparent = false
+        for i in stride(from: 0,to: mask.pixels.count,by: 4) {
+            let a = mask.pixels[i]
+            guard mask.pixels[i+3] == 255,mask.pixels[i+1] == a,mask.pixels[i+2] == a,
+                  abs(Int(a)-Int(cutout.pixels[i+3])) <= 1 else { throw WorkflowBridgeError.invalidImage("最终透明图的 Alpha 不一致") }
+            visible = visible || a > 0; transparent = transparent || a == 0
+        }
+        guard visible,transparent else { throw WorkflowBridgeError.invalidImage("最上方图层为空或没有透明背景，请检查最终透明图层") }
     }
 
     // MARK: - 已确认透明图的派生渲染

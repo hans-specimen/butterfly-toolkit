@@ -8,11 +8,13 @@ actor WorkflowGeometryCache {
     // MARK: - 缓存身份与容量
     typealias Prepare = @Sendable (RoleImages) async throws -> PreparedMaskGeometry
     private struct Key: Hashable {
+        let finalized: Bool
         let version: String
         let mask: String
         let base: String
         let coordinates: [Double]
         init(_ source: RoleImages) {
+            finalized = source.isFinalized == true
             version = source.snapshotVersion
             mask = source.maskPNG.standardizedFileURL.resolvingSymlinksInPath().path
             base = source.basePNG.standardizedFileURL.resolvingSymlinksInPath().path
@@ -45,7 +47,14 @@ actor WorkflowGeometryCache {
 
     init(maximumEntries: Int = 4,maximumBytes: Int = 512 * 1024 * 1024,
          prepare: @escaping Prepare = { source in
-             try MaskGeometryProcessor().prepare(input: MaskGeometryInput(sourceVersion: source.snapshotVersion,
+             if source.isFinalized == true {
+                 let raster = try WorkflowRaster.read(source.cutoutPNG)
+                 guard raster.size == source.pixelSize,raster.orientation == 1 else { throw WorkflowBridgeError.invalidStructure }
+                 let alpha = stride(from: 3,to: raster.pixels.count,by: 4).map { raster.pixels[$0] }
+                 return try SpecimenGeometry.prepare(input: GeometryImageInput(sourceVersion: source.snapshotVersion,
+                     sourcePixelSize: source.pixelSize,coordinateOrigin: source.coordinateOrigin,cropViewport: source.cropViewport),mask: alpha)
+             }
+             return try MaskGeometryProcessor().prepare(input: MaskGeometryInput(sourceVersion: source.snapshotVersion,
                  sourcePixelSize: source.pixelSize,maskURL: source.maskPNG,validBackgroundAlphaURL: source.basePNG,
                  coordinateOrigin: source.coordinateOrigin,cropViewport: source.cropViewport))
          }) {
@@ -86,6 +95,13 @@ actor WorkflowGeometryCache {
         // 取消某个等待者不会取消其他预览或确认操作共享的准备任务。
         try Task.checkCancellation()
         let solution = try await Task.detached(priority: .userInitiated) {
+            if source.isFinalized == true {
+                return GeometrySolution(sourceVersion: source.snapshotVersion,angleDegrees: 0,
+                    rotationPivot: CGPoint(x: source.cropViewport.midX,y: source.cropViewport.midY),subjectBounds: analysis.support.bounds,
+                    sourceCropRect: source.cropViewport,outputSize: source.cropViewport.size,
+                    actualMargins: WorkflowMargins(left: 0,top: 0,right: 0,bottom: 0),isApplicable: true,
+                    reason: analysis.support.detachedDetailCount > 0 ? "最终透明图含分离细节，请检查 4K 预览" : nil)
+            }
             if let savedCandidate { return try analysis.validate(solution: savedCandidate) }
             return try analysis.analyze(request: request)
         }.value

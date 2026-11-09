@@ -101,6 +101,7 @@ nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable 
     var roleImages: RoleImages?
     var squareLayout: SquareLayout = .png4k
     var artifacts: [WorkflowArtifact] = []
+    var historicalArtifacts: [WorkflowArtifact]?
 
     subscript(stage: WorkflowStage) -> WorkflowStageRecord {
         get { records[stage] ?? WorkflowStageRecord(stage: stage) }
@@ -140,12 +141,15 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var presets: WorkflowPresets = WorkflowPresets()
     var revision: Int = 0
     var isPaused: Bool = false
+    /// nil 保持旧批次行为；新流程必须经过人工定稿才可导出。
+    var manualFinalization: Bool?
 
     var sideTasks: [WorkflowSideTask] { specimens.flatMap { [$0.front, $0.back] } }
     var activeTasks: [WorkflowSideTask] { specimens.filter { !$0.isExcluded }.flatMap { [$0.front, $0.back] } }
     /// 从各面的持久记录推导阶段，使已确认的部分标本可以独立推进。
     var currentStage: WorkflowStage? {
-        WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
+        let stage = WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
+        return manualFinalization == true && stage == .hd ? .png4k : stage
     }
     var allSucceeded: Bool {
         !specimens.isEmpty && !specimens.contains(where: \.isExcluded) &&
@@ -153,7 +157,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
     func task(id: UUID) -> WorkflowSideTask? { sideTasks.first { $0.id == id } }
 
-    var hasCheckpoints: Bool { checkAfterStack || checkAfterMatte || checkGeometry != false || check4K != false }
+    var hasCheckpoints: Bool { manualFinalization == true || checkAfterStack || checkAfterMatte || checkGeometry != false || check4K != false }
     func validateStart() throws {
         if !hasCheckpoints && (exportDirectory(for: .hd) == nil || exportDirectory(for: .png4k) == nil) {
             throw WorkflowBridgeError.invalidImage("取消全部检查点时，请先选择堆栈原图和 PNG4K 输出文件夹")
@@ -161,6 +165,10 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
 
     func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
+        if manualFinalization == true {
+            guard kind == .hd || kind == .png4k else { return nil }
+            return sourceDirectory.appendingPathComponent(sourceDirectory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
+        }
         if let outputLocations {
             return kind == .hd ? outputLocations.hd : kind == .png4k ? outputLocations.png4k : nil
         }
@@ -194,16 +202,18 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
 
     func validateArtifactURL(_ url: URL, kind: WorkflowAssetKind) throws {
         guard let root = exportDirectory(for: kind), Self.isContained(url, in: root),
-              outputLocations != nil || Self.isContained(url, in: outputDirectory) else {
+              manualFinalization != true || Self.isContained(root,in: sourceDirectory),
+              manualFinalization == true || outputLocations != nil || Self.isContained(url, in: outputDirectory) else {
             throw WorkflowStateError.invalidManifest("Export destination escapes its selected directory")
         }
     }
 
     func validateOutputURL(_ url: URL) throws {
         if Self.isContained(url, in: outputDirectory) { return }
-        if outputLocations != nil {
+        if manualFinalization == true || outputLocations != nil {
             for kind in [WorkflowAssetKind.hd, .png4k] {
-                if let root = exportDirectory(for: kind), Self.isContained(url, in: root) { return }
+                if let root = exportDirectory(for: kind), Self.isContained(url, in: root),
+                   manualFinalization != true || Self.isContained(root,in: sourceDirectory) { return }
             }
         }
         // 原图旁的 PSD 必须严格使用冻结后的标本名和正反面后缀。
@@ -243,7 +253,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
             for task in [specimen.front, specimen.back] {
                 if let attempt = task.stackAttemptURL { try validateOutputURL(attempt) }
                 for artifact in task.artifacts {
-                    if outputLocations != nil && artifact.kind.stage != .derivatives { try validateArtifactURL(artifact.url, kind: artifact.kind) }
+                    if (manualFinalization == true || outputLocations != nil) && artifact.kind.stage != .derivatives { try validateArtifactURL(artifact.url, kind: artifact.kind) }
                     else { try validateOutputURL(artifact.url) }
                 }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
@@ -273,9 +283,16 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                     }
                 }
                 if task[.matte].state == .completed || task[.matte].state == .waitingReview {
-                    guard let snapshot = task.snapshot, snapshot.taskID == task.id, snapshot.roles?.isValid == true,
+                    guard let snapshot = task.snapshot, snapshot.taskID == task.id,
+                          (snapshot.roles?.isValid == true || (manualFinalization == true && snapshot.finalRoles?.isValid == true)),
                           snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0 else {
                         throw WorkflowStateError.invalidManifest("Matte requires a saved PSD with role identities")
+                    }
+                }
+                if manualFinalization == true && task[.geometry].state == .completed {
+                    guard task.snapshot?.finalRoles?.isValid == true,task.roleImages?.isFinalized == true,
+                          task[.geometry].confirmedVersion == task.snapshot?.contentVersion else {
+                        throw WorkflowStateError.invalidManifest("Final export requires confirmation of the saved final PSD")
                     }
                 }
                 guard task.artifacts.allSatisfy({ $0.ownerTaskID == task.id }) else {
@@ -318,6 +335,7 @@ nonisolated struct PSDSnapshot: Codable, Equatable, Sendable {
     /// 仅完成堆栈的快照可以没有角色标识，抠图阶段完成后则必须具备。
     var roles: PSDRoleIdentifiers?
     var structureSummary: String
+    var finalRoles: FinalPSDIdentifiers?
 }
 
 nonisolated struct StackPNG: Codable, Equatable, Sendable {
@@ -341,6 +359,17 @@ nonisolated struct MatteArtifact: Codable, Equatable, Sendable {
     var pixelSize: CGSize
 }
 
+/// 人工定稿仅锁定最终导出来源，允许替换图层和应用蒙版。
+nonisolated struct FinalPSDIdentifiers: Codable, Equatable, Sendable {
+    var adjustmentGroup: String
+    var baseLayer: String
+    var cutoutLayer: String
+    var isValid: Bool {
+        let ids = [adjustmentGroup,baseLayer,cutoutLayer]
+        return ids.allSatisfy { !$0.isEmpty } && Set(ids).count == 3
+    }
+}
+
 // 角色图像覆盖完整可编辑范围；可见裁切框与像素数组原点分别保存，不能混用。
 nonisolated struct RoleImages: Codable, Equatable, Sendable {
     var snapshotVersion: String
@@ -351,6 +380,8 @@ nonisolated struct RoleImages: Codable, Equatable, Sendable {
     var coordinateOrigin: CGPoint
     var editableExtent: CGRect
     var cropViewport: CGRect
+    /// 最终透明图可独立修饰；maskPNG 为其实际 Alpha 的灰度图。
+    var isFinalized: Bool?
 }
 
 nonisolated struct SquareLayout: Codable, Equatable, Sendable {

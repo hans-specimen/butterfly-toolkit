@@ -49,7 +49,9 @@ nonisolated struct MaskGeometryProcessor: Sendable {
                   abs(Int(mask.pixels[p])-Int(mask.pixels[p+2])) <= 1 else {
                 throw WorkflowBridgeError.invalidImage("需要不透明 RGB 灰度蒙版，不能用透明结果代替")
             }
-            values[i] = mask.pixels[p]; alpha[i] = background.pixels[p+3]
+            alpha[i] = background.pixels[p+3]
+            // 几何只分析实际可见像素；透明堆栈边缘上的蒙版残留不属于主体。
+            values[i] = UInt8((Int(mask.pixels[p])*Int(alpha[i])+127)/255)
         }
         return try SpecimenGeometry.prepare(input: GeometryImageInput(sourceVersion: input.sourceVersion,
             sourcePixelSize: input.sourcePixelSize,coordinateOrigin: input.coordinateOrigin,cropViewport: input.cropViewport),

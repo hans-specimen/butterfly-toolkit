@@ -73,8 +73,8 @@ import XCTest
         XCTAssertEqual(store.draft?.groups.first?.files.count,2)
         XCTAssertEqual(store.names,"蝶")
         store.checkAfterStack = true; store.checkAfterMatte = false; store.checkGeometry = false; store.check4K = false
-        XCTAssertTrue(store.needsExportDirectories)
-        XCTAssertFalse(store.canStart)
+        XCTAssertFalse(store.needsExportDirectories)
+        XCTAssertTrue(store.canStart)
     }
     func testAdoptPreservesOriginalAndSnapshotAndRejectsForeignOwnerOrChangedSource() async throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }

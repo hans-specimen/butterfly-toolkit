@@ -5,6 +5,24 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class WorkflowAssetRendererTests: XCTestCase {
+    func testFinalLayerAllowsIndependentRGBButRetainsStrictAlphaAndICCChecks() throws {
+        let f = try Fixture(); defer { f.remove() }
+        var pixels = try WorkflowRaster.read(f.roles.cutoutPNG).pixels
+        for i in stride(from: 0,to: pixels.count,by: 4) where pixels[i+3] > 0 {
+            pixels[i] = 0; pixels[i+1] = pixels[i+3]; pixels[i+2] = 0
+        }
+        let p3 = CGColorSpace(name: CGColorSpace.displayP3)!
+        try Self.write(f.roles.basePNG,width: 100,height: 100,pixels: WorkflowRaster.read(f.roles.basePNG).pixels,colorSpace: p3)
+        try Self.write(f.roles.cutoutPNG,width: 100,height: 100,pixels: pixels,colorSpace: p3)
+        var roles = f.roles; roles.isFinalized = true
+        try WorkflowAssetRenderer().render4K(roles: roles,layout: .png4k,destination: f.url("final.png"))
+        XCTAssertEqual(try WorkflowRaster.read(f.url("final.png")).size,CGSize(width: 4096,height: 4096))
+        let base = try WorkflowRaster.read(roles.basePNG),cutout = try WorkflowRaster.read(roles.cutoutPNG),mask = try WorkflowRaster.read(roles.maskPNG)
+        XCTAssertNoThrow(try WorkflowAssetRenderer.validateFinalPixels(base: base,cutout: cutout,mask: mask))
+        XCTAssertThrowsError(try WorkflowAssetRenderer.validateFinalPixels(base: base,cutout: base,mask: mask))
+        try Self.write(roles.cutoutPNG,width: 100,height: 100,pixels: pixels,colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        XCTAssertThrowsError(try WorkflowAssetRenderer.validateFinalPixels(base: base,cutout: WorkflowRaster.read(roles.cutoutPNG),mask: mask))
+    }
     func testRenderDecodesEachRoleOnce() throws {
         let f = try Fixture(); defer { f.remove() }
         let probe = WorkflowDecodeProbe(),renderer = WorkflowAssetRenderer(decode: probe.decode)
