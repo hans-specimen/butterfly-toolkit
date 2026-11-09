@@ -42,7 +42,8 @@ final class WorkflowBridgeTests: XCTestCase {
             let result = context.evaluateScript(script.replacingOccurrences(of: "#target photoshop", with: "").replacingOccurrences(of: anchor, with: anchor + overrides))
             if let error = context.exception?.toString() {
                 if error.contains("WORKFLOW_UNSAVED") { throw WorkflowBridgeError.unsavedDocument }
-                throw WorkflowBridgeError.staleSource
+                if error.contains("WORKFLOW_STALE_DOCUMENT") { throw WorkflowBridgeError.staleSource }
+                throw WorkflowBridgeError.photoshop(error)
             }
             return result?.toString() ?? ""
         }

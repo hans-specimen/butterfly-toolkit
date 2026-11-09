@@ -1,4 +1,4 @@
-// 清除远离可信主体、完全由微弱 Alpha 组成的分离残留；保留连通边缘与临近细毛。
+// 清除远离可信主体、整体 Alpha 微弱的分离残留；保留连通边缘与临近细毛。
 import Foundation
 import CoreGraphics
 
@@ -9,6 +9,7 @@ nonisolated enum MaskResidueCleanup {
         }
         struct Component {
             var strong = 0
+            var count = 0, totalAlpha = 0, peak: UInt8 = 0
             var bounds = CGRect.null
         }
         var labels = [Int32](repeating: 0,count: values.count),components = [Component()]
@@ -21,6 +22,7 @@ nonisolated enum MaskResidueCleanup {
                 let i = queue[head]; head += 1
                 if head % 65536 == 0 { try Task.checkCancellation() }
                 let x = i%width,y = i/width
+                component.count += 1; component.totalAlpha += Int(values[i]); component.peak = max(component.peak,values[i])
                 if values[i] >= 16 {
                     component.strong += 1
                     minX = min(minX,x); minY = min(minY,y); maxX = max(maxX,x+1); maxY = max(maxY,y+1)
@@ -42,7 +44,12 @@ nonisolated enum MaskResidueCleanup {
         let bounds = components.filter { $0.strong >= minimum }.reduce(CGRect.null) { $0.union($1.bounds) }
         let halo = max(3,ceil(Double(max(width,height))*0.01))
         let protected = bounds.insetBy(dx: -halo,dy: -halo)
-        var keep = components.map { $0.strong > 0 }
+        // 小片雾状残留不能仅靠一两个超过 16 的像素成为主体；明显细节仍交给严格裁切检查。
+        let tinyLimit = max(64,largest/10000)
+        var keep = components.map { component in
+            let tinyHaze = component.count <= tinyLimit && component.peak < 32 && component.totalAlpha <= component.count*8
+            return component.strong > 0 && !tinyHaze
+        }
         // 使用实际像素判断临近关系，不能让一个包围主体的大残留框蒙混过关。
         for i in values.indices where values[i] > 0 && !keep[Int(labels[i])] {
             if protected.contains(CGPoint(x: i%width,y: i/width)) { keep[Int(labels[i])] = true }

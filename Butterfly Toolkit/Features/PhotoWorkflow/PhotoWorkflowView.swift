@@ -528,7 +528,7 @@ struct PhotoWorkflowView: View {
             if store.usesFinalization {
                 Text("可反复打开修改。最终读取「共同调整」里的「底图」和最上方可见透明像素图层；其余备份图层不参与导出。").font(.caption).foregroundStyle(.secondary)
                 Button("刷新保存结果") { store.refreshSaved() }.disabled(!store.canOpenPSD || (store.manualTaskID != nil && store.manualTaskID != store.currentTask?.id))
-                Text("请先在 Photoshop 保存。刷新不会重新抠图、旋转或裁切。").font(.caption).foregroundStyle(.secondary)
+                Text("可直接修改「透明成品」。如需修改蒙版，显示「抠图」备份并隐藏旧成品；修改后复制备份、应用蒙版，将副本置顶显示，隐藏备份。保存后刷新，不会自动覆盖人工修改。").font(.caption).foregroundStyle(.secondary)
             } else if store.manualTaskID != nil {
                 Text("自动队列已保留给人工编辑。请先在 PS 保存，再分类刷新。").font(.caption).foregroundStyle(.orange)
                 Picker("这次保存改变了",selection: $store.manualChange) { Text("仅蒙版").tag(WorkflowPSDChange.maskOnly); Text("角度／画布").tag(WorkflowPSDChange.geometry); Text("堆栈内容").tag(WorkflowPSDChange.stackContent) }

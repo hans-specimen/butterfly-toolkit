@@ -28,6 +28,8 @@ actor WorkflowExecutor {
 
         var validateStackInput: (@Sendable (PSDSnapshot, StackPNG) async throws -> Bool)? = nil
         var finalize: (@Sendable (URL, UUID) async throws -> PSDSnapshot)? = nil
+        var installForFinalization: (@Sendable (PSDSnapshot, MatteArtifact) async throws -> PSDSnapshot)? = nil
+        var applyForFinalization: (@Sendable (PSDSnapshot, GeometrySolution) async throws -> PSDSnapshot)? = nil
         var adoptStack: (@Sendable (WorkflowSourceFile, UUID) async throws -> PSDSnapshot)? = nil
         var stackWithInput: (@Sendable (FocusStackJob, UUID) async throws -> WorkflowStackPreparation)? = nil
         var endInferenceSession: @Sendable () async -> Void = {}
@@ -78,6 +80,8 @@ actor WorkflowExecutor {
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
                 }.value },adoptStack: { try await bridge.adoptStack(source: $0,owner: $1) },endInferenceSession: { await matte.shutdown() })
             services.finalize = { try await bridge.captureFinalPSD(document: $0,owner: $1) }
+            services.installForFinalization = { try await bridge.installMatte(snapshot: $0,matte: $1,createFinishedLayer: true) }
+            services.applyForFinalization = { try await bridge.applyGeometry(snapshot: $0,solution: $1,createFinishedLayer: true) }
             if prepareStackInput {
                 services.stackWithInput = { try await bridge.stackWithInput(job: $0, owner: $1) }
                 services.validateStackInput = { try await bridge.validateStackInput(snapshot: $0, input: $1) }
@@ -764,6 +768,8 @@ actor WorkflowExecutor {
                         try mutateTask(batchID,id) { $0.matteArtifact = matte }; try await persist(batchID)
                     }
                     try check(batchID,before,stage: stage)
+                    // 旧流程继续编辑原蒙版；只有人工定稿流程自动生成应用蒙版的成品层。
+                    let install = try batch(batchID: batchID).manualFinalization == true ? (services.installForFinalization ?? services.install) : services.install
                     if before.matteArtifact != nil {
                         let current = try await services.refresh(snapshot.workingURL,id,nil)
                         try check(batchID,before,stage: stage)
@@ -773,8 +779,8 @@ actor WorkflowExecutor {
                             try await services.validateInstalledMatte(roles,input,matte)
                             try check(batchID,before,stage: stage)
                             saved = current
-                        } else { saved = try await services.install(snapshot,matte) }
-                    } else { saved = try await services.install(snapshot,matte) }
+                        } else { saved = try await install(snapshot,matte) }
+                    } else { saved = try await install(snapshot,matte) }
                 }
                 try check(batchID,before,stage: stage)
                 guard saved.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
@@ -808,7 +814,7 @@ actor WorkflowExecutor {
                 if try batch(batchID: batchID).manualFinalization == true,solution.isApplicable {
                     try mutateTask(batchID,id) { $0.geometryApplySourceVersion = saved.contentVersion }
                     try await persist(batchID)
-                    let applied = try await services.apply(saved,solution)
+                    let applied = try await (services.applyForFinalization ?? services.apply)(saved,solution)
                     try check(batchID,before,stage: stage)
                     let extracted = try await services.extract(applied)
                     try check(batchID,before,stage: stage)

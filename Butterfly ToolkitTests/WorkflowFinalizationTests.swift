@@ -3,6 +3,30 @@ import XCTest
 @testable import Butterfly_Toolkit
 
 final class WorkflowFinalizationTests: XCTestCase {
+    func testFinishedLayerPreparationIsLimitedToFinalizationBatches() async throws {
+        for finalizing in [false,true] {
+            let f = try ExecutorFixture(checks: false)
+            defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+            var batch = f.batch; batch.manualFinalization = finalizing
+            var services = finalServices(f)
+            let install = services.install,apply = services.apply
+            services.installForFinalization = { snapshot,matte in
+                var saved = try await install(snapshot,matte); saved.structureSummary = "finished-layer"; return saved
+            }
+            services.applyForFinalization = { snapshot,solution in
+                var saved = try await apply(snapshot,solution); saved.structureSummary = "finished-layer"; return saved
+            }
+            let executor = WorkflowExecutor(services: services)
+            try await executor.register(batch: batch,manifestURL: f.manifest)
+            try await executor.runPending(batchID: batch.id)
+            let result = try await executor.batch(batchID: batch.id)
+            for task in result.activeTasks {
+                XCTAssertEqual(task.snapshot?.structureSummary == "finished-layer",finalizing)
+                XCTAssertNotEqual(task[.matte].state,.failed)
+            }
+        }
+    }
+
     func testAppliedGeometryMovesWingTipsIntoSavedCanvasCoordinates() async throws {
         let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch; batch.manualFinalization = true

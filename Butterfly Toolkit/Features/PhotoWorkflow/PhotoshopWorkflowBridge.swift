@@ -208,7 +208,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         }
     }
     // MARK: - 蒙版事务与发布恢复
-    func installMatte(snapshot: PSDSnapshot, matte: MatteArtifact) async throws -> PSDSnapshot {
+    func installMatte(snapshot: PSDSnapshot, matte: MatteArtifact, createFinishedLayer: Bool = false) async throws -> PSDSnapshot {
         try await withLease("install", owner: snapshot.taskID, savedRead: false) {
             let record = ownershipURL(snapshot.workingURL)
             var ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
@@ -237,7 +237,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try JSONEncoder().encode(ownership).write(to: ownershipURL(staged), options: .withoutOverwriting)
             let originalOwnership = ownership
             let prepared = try await withOpenDocument(at: staged) {
-                let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL))
+                let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL, createFinishedLayer: createFinishedLayer))
                 guard let roles = metadata.roles, roles.isValid else { throw WorkflowBridgeError.invalidStructure }
                 var stagedOwnership = originalOwnership; stagedOwnership.roles = roles
                 try JSONEncoder().encode(stagedOwnership).write(to: ownershipURL(staged), options: .atomic)
@@ -311,14 +311,14 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             return try await extractUnlocked(snapshot)
         }
     }
-    func applyGeometry(snapshot: PSDSnapshot, solution: GeometrySolution) async throws -> PSDSnapshot {
+    func applyGeometry(snapshot: PSDSnapshot, solution: GeometrySolution, createFinishedLayer: Bool = false) async throws -> PSDSnapshot {
         try await withLease("geometry", owner: snapshot.taskID, savedRead: false) {
             try await withOpenDocument(at: snapshot.workingURL) {
                 try await verify(snapshot)
                 guard solution.sourceVersion == snapshot.contentVersion, solution.isApplicable,
                       solution.angleDegrees.isFinite, solution.sourceCropRect.width > 0, solution.sourceCropRect.height > 0,
                       solution.sourceCropRect.size == solution.outputSize, snapshot.roles != nil else { throw WorkflowBridgeError.staleSource }
-                _ = try await invoke(Self.geometryScript(document: snapshot.workingURL, solution: solution))
+                _ = try await invoke(Self.geometryScript(document: snapshot.workingURL, solution: solution, createFinishedLayer: createFinishedLayer))
                 let saved = try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
                 guard saved.pixelSize == solution.outputSize else { throw WorkflowBridgeError.invalidImage("裁切读回尺寸不一致") }
                 _ = try await extractUnlocked(saved)
@@ -658,22 +658,35 @@ extension PhotoshopWorkflowBridge {
         var b=d.getObjectValue(key);return [b.getUnitDoubleValue(stringIDToTypeID('left')),b.getUnitDoubleValue(stringIDToTypeID('top')),b.getUnitDoubleValue(stringIDToTypeID('right')),b.getUnitDoubleValue(stringIDToTypeID('bottom'))];
     }
     function wfRoles(doc) {
-        var original=null,adjust=null,base=null,cutout=null,count=0;
+        var original=null,adjust=null,base=null,cutout=null,finished=null,count=0;
         for(var i=0;i<doc.layers.length;i++) {
             var l=doc.layers[i];
             if(l.name==='原始堆栈' && l.typename==='LayerSet') { original=l;count++; }
             if(l.name==='共同调整' && l.typename==='LayerSet') { adjust=l;count++; }
         }
         if(count===0) return null;
-        if(count!==2 || !original || !adjust || doc.layers.length!==2 || adjust.layers.length!==2) throw new Error('WORKFLOW_STRUCTURE');
+        if(count!==2 || !original || !adjust || doc.layers.length!==2 || (adjust.layers.length!==2 && adjust.layers.length!==3)) throw new Error('WORKFLOW_STRUCTURE');
         for(var j=0;j<adjust.layers.length;j++) {
             var a=adjust.layers[j]; if(a.name==='底图' && a.typename==='ArtLayer') base=a;
             if(a.name==='抠图' && a.typename==='ArtLayer') cutout=a;
+            if(a.name==='透明成品' && a.typename==='ArtLayer') finished=a;
         }
+        if((adjust.layers.length===3 && !finished) || (finished && (wfHasMask(finished) || finished.kind!==LayerKind.NORMAL || finished.grouped)))throw new Error('WORKFLOW_STRUCTURE');
         if(!base || !cutout || wfHasMask(base) || !wfHasMask(cutout)) throw new Error('WORKFLOW_STRUCTURE');
         var b=wfBounds(base),c=wfBounds(cutout);
         for(var k=0;k<4;k++) if(Math.abs(b[k]-c[k])>0.1) throw new Error('WORKFLOW_STRUCTURE');
-        return {original:original,adjust:adjust,base:base,cutout:cutout,ids:{originalStackGroup:String(original.id),adjustmentGroup:String(adjust.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id),mask:String(cutout.id)+':userMask'}};
+        return {original:original,adjust:adjust,base:base,cutout:cutout,finished:finished,ids:{originalStackGroup:String(original.id),adjustmentGroup:String(adjust.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id),mask:String(cutout.id)+':userMask'}};
+    }
+    // 自动阶段生成紧边界成品；保留原蒙版和完整 RGB 供人工恢复，不在人工刷新时重建。
+    function wfMakeFinished(doc,roles) {
+        var finished=roles.cutout.duplicate();finished.name='透明成品';
+        // PLACEBEFORE 明确保证成品在蒙版备份上方，最终导出读取首个可见像素层。
+        finished.move(roles.cutout,ElementPlacement.PLACEBEFORE);doc.activeLayer=finished;
+        var ref=new ActionReference();ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
+        var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),ref);desc.putBoolean(charIDToTypeID('Aply'),true);
+        executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
+        if(roles.finished)roles.finished.remove();
+        roles.base.visible=false;roles.cutout.visible=false;finished.visible=true;doc.activeLayer=finished;
     }
     function wfFinalRoles(doc) {
         var group=null,base=null,cutout=null,n=0,b=0;
@@ -768,7 +781,7 @@ extension PhotoshopWorkflowBridge {
         """
         var copy=null;
         try {copy=wfDuplicate(\(document));app.activeDocument=copy;var r=wfRoles(copy);
-            if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;}
+            if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;if(r.finished)r.finished.visible=false;}
             else {for(var i=0;i<copy.layers.length;i++) if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].visible=false;}
             wfStackPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
         }finally{if(copy)wfCloseDocument(copy);}
@@ -778,7 +791,7 @@ extension PhotoshopWorkflowBridge {
         "var o=wfOpen(" + quote(document.resolvingSymlinksInPath().path) + ");try{" +
         stackPNGBody(document: "o.doc", output: output) + "}finally{wfClose(o);}"
     }
-    private static func installScript(document: URL, alpha: URL) -> String {
+    private static func installScript(document: URL, alpha: URL, createFinishedLayer: Bool) -> String {
         """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null,maskDoc=null,doc=o.doc;
         var dialogs=app.displayDialogs;app.displayDialogs=DialogModes.NO;
@@ -803,6 +816,7 @@ extension PhotoshopWorkflowBridge {
             ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));make.putReference(charIDToTypeID('At  '),ref);
             make.putEnumerated(charIDToTypeID('Usng'),charIDToTypeID('UsrM'),charIDToTypeID('RvlS'));executeAction(charIDToTypeID('Mk  '),make,DialogModes.NO);
             doc.selection.deselect();imported.remove();wfSelectRGB();
+            if(\(createFinishedLayer ? "true" : "false"))wfMakeFinished(doc,wfRoles(doc));
             wfSave(doc);return wfJSON(wfMetadata(doc));
         }finally{if(maskDoc)wfCloseDocument(maskDoc);if(copy)wfCloseDocument(copy);app.displayDialogs=dialogs;wfClose(o);}
         """
@@ -847,9 +861,9 @@ extension PhotoshopWorkflowBridge {
             // 仅在可丢弃的副本上展开隐藏像素，不裁切任务 PSD。
             copy.resizeCanvas(UnitValue(right-left,'px'),UnitValue(bottom-top,'px'),AnchorPosition.TOPLEFT);
             r.adjust.translate(UnitValue(-left,'px'),UnitValue(-top,'px'));
-            wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;
+            wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;if(r.finished)r.finished.visible=false;
             wfRolePNG(copy,\(quote(folder.appendingPathComponent("base.png").path)));
-            r.base.visible=false;r.cutout.visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
+            r.base.visible=false;(r.finished||r.cutout).visible=true;wfRolePNG(copy,\(quote(folder.appendingPathComponent("cutout.png").path)));
             wfMaskToSelection(r.cutout);
             mask=wfMaskDocument(copy);
             var black=new SolidColor();black.rgb.red=0;black.rgb.green=0;black.rgb.blue=0;mask.selection.selectAll();mask.selection.fill(black);mask.selection.deselect();
@@ -863,12 +877,16 @@ extension PhotoshopWorkflowBridge {
         """
     }
     // 共同调整组先绕自身中心旋转，再平移补偿为指定支点；裁切保留框外可编辑像素。
-    private static func geometryScript(document: URL, solution: GeometrySolution) -> String {
+    private static func geometryScript(document: URL, solution: GeometrySolution, createFinishedLayer: Bool) -> String {
         let rect = solution.sourceCropRect
         return """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),doc=o.doc;
         try {
             var roles=wfRoles(doc);if(!roles)throw new Error('WORKFLOW_STRUCTURE');
+            // 仍以完整底图与蒙版层计算旋转，避免成品的紧边界改变 Photoshop 组旋转中心。
+            var makeFinished=\(createFinishedLayer ? "true" : "false") || !!roles.finished;
+            if(roles.finished){roles.finished.remove();roles.finished=null;}
+            if(makeFinished)roles.cutout.visible=true;
             var bounds=wfBounds(roles.base),cx=(bounds[0]+bounds[2])/2,cy=(bounds[1]+bounds[3])/2;
             var px=\(solution.rotationPivot.x),py=\(solution.rotationPivot.y),angle=\(solution.angleDegrees),radians=angle*Math.PI/180;
             if(angle!==0){
@@ -882,6 +900,7 @@ extension PhotoshopWorkflowBridge {
             r.putUnitDouble(charIDToTypeID('Btom'),charIDToTypeID('#Pxl'),\(rect.maxY));r.putUnitDouble(charIDToTypeID('Rght'),charIDToTypeID('#Pxl'),\(rect.maxX));
             d.putObject(charIDToTypeID('T   '),charIDToTypeID('Rctn'),r);d.putUnitDouble(charIDToTypeID('Angl'),charIDToTypeID('#Ang'),0);
             d.putBoolean(charIDToTypeID('Dlt '),false);executeAction(charIDToTypeID('Crop'),d,DialogModes.NO);
+            if(makeFinished)wfMakeFinished(doc,roles);
             wfSave(doc);return wfJSON(wfMetadata(doc));
         }finally{wfClose(o);}
         """

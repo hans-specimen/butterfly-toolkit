@@ -4,6 +4,22 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class MaskGeometryProcessorTests: XCTestCase {
+    func testTinyRemoteHazeWithBrighterSpecksIsRemovedButDetailsSurvive() throws {
+        var values = [UInt8](repeating: 0,count: 200*200)
+        for y in 60..<140 { for x in 60..<140 { values[y*200+x] = 255 } }
+        // 33_V 的关键特征：60 像素残留中仅两个略高于 16，其余几乎透明。
+        for y in 5..<25 { for x in 197..<200 { values[y*200+x] = 1 } }
+        values[10*200+198] = 20; values[10*200+199] = 22
+        for y in 40..<60 { values[y*200+100] = 1 } // 与主体连接的触角
+        for y in 65..<72 { values[y*200+57] = 2 } // 主体附近的分离细毛
+        values[180*200+180] = 128; values[181*200+180] = 64 // 远处可见细节保留检查
+        for x in 10..<100 { values[180*200+x] = 20 } // 成片半透明细节不能按小残留删除
+        var expected = values
+        for y in 5..<25 { for x in 197..<200 { expected[y*200+x] = 0 } }
+        XCTAssertEqual(try MaskResidueCleanup.clean(values,width: 200,height: 200),expected)
+        XCTAssertEqual(try MaskResidueCleanup.clean(expected,width: 200,height: 200),expected)
+    }
+
     func testRemoteFaintResidueDoesNotExpandCropOnOpaqueBackground() throws {
         let f = try Fixture(width: 200,height: 200,subject: CGRect(x: 60,y: 60,width: 80,height: 80),extras: { p in
             for x in 0..<200 { p[195*200+x] = 2 }

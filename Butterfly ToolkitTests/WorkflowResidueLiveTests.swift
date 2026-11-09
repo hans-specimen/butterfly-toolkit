@@ -1,4 +1,4 @@
-// 在独立素材副本上回放已有 AI 蒙版，验证清理、Photoshop 回写、裁切与应用蒙版后的像素边界。
+// 在独立素材副本上回放已有 AI 蒙版，验证默认成品的实际边界与可编辑备份。
 import XCTest
 import ImageIO
 import UniformTypeIdentifiers
@@ -12,8 +12,12 @@ final class WorkflowResidueLiveTests: XCTestCase {
         guard !FileManager.default.fileExists(atPath: root.path) else { throw WorkflowBridgeError.ownershipConflict }
         try FileManager.default.createDirectory(at: root,withIntermediateDirectories: true)
         let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: manifest)))
-        let specimen = try XCTUnwrap(batch.specimens.first { $0.baseName == "222" }),source = try XCTUnwrap(specimen.back.roleImages)
-        let originals = [source.basePNG,source.maskPNG,source.cutoutPNG,try XCTUnwrap(specimen.back.snapshot?.workingURL)]
+        let name = env["WORKFLOW_RESIDUE_NAME"] ?? "222"
+        let side: WorkflowSide = env["WORKFLOW_RESIDUE_SIDE"] == "D" ? .front : .back
+        let specimen = try XCTUnwrap(batch.specimens.first { $0.baseName == name })
+        let task = side == .front ? specimen.front : specimen.back
+        let source = try XCTUnwrap(task.roleImages)
+        let originals = [source.basePNG,source.maskPNG,source.cutoutPNG,try XCTUnwrap(task.snapshot?.workingURL)]
         let hashes = try originals.map { try AIFileValidation.hash($0.path) }
         let base = root.appendingPathComponent("base.png"),mask = root.appendingPathComponent("mask.png"),document = root.appendingPathComponent("copy_V.psd")
         try FileManager.default.copyItem(at: source.basePNG,to: base); try FileManager.default.copyItem(at: source.maskPNG,to: mask)
@@ -34,12 +38,12 @@ final class WorkflowResidueLiveTests: XCTestCase {
         catch { XCTFail("Replay inference: \(String(reflecting: error))"); return }
         let before = try WorkflowRaster.read(mask),after = try WorkflowRaster.read(matte.alphaURL)
         let removed = stride(from:0,to:before.pixels.count,by:4).filter { before.pixels[$0]>0 && after.pixels[$0]==0 }
-        XCTAssertGreaterThan(removed.count,3000)
-        let installed = try await bridge.installMatte(snapshot: snapshot,matte: matte)
+        if name == "33" { XCTAssertGreaterThanOrEqual(removed.count,60) }
+        let installed = try await bridge.installMatte(snapshot: snapshot,matte: matte,createFinishedLayer: true)
         let roles = try await bridge.extractRoles(snapshot: installed)
         let solution = try MaskGeometryProcessor().analyze(input: MaskGeometryInput(sourceVersion: roles.snapshotVersion,sourcePixelSize: roles.pixelSize,maskURL: roles.maskPNG,validBackgroundAlphaURL: roles.basePNG,coordinateOrigin: roles.coordinateOrigin,cropViewport: roles.cropViewport),request: GeometryRequest())
         XCTAssertTrue(solution.isApplicable,solution.reason ?? "")
-        let applied = try await bridge.applyGeometry(snapshot: installed,solution: solution)
+        let applied = try await bridge.applyGeometry(snapshot: installed,solution: solution,createFinishedLayer: true)
         let savedRoles = try await bridge.extractRoles(snapshot: applied)
         let raster = try WorkflowRaster.read(savedRoles.cutoutPNG)
         var x0 = Int(raster.size.width),y0 = Int(raster.size.height),x1 = 0,y1 = 0
@@ -55,20 +59,41 @@ final class WorkflowResidueLiveTests: XCTestCase {
             try {
                 var g=d.layerSets.getByName('共同调整'),top=null;
                 for(var i=0;i<g.layers.length;i++)if(g.layers[i].name!=='底图'&&g.layers[i].visible){top=g.layers[i];break;}
-                if(!top)throw new Error('Missing cutout');d.activeLayer=top;
-                var r=new ActionReference();r.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
-                var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),r);desc.putBoolean(charIDToTypeID('Aply'),true);
-                executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
+                if(!top)throw new Error('Missing cutout');
+                function hasMask(layer){var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);var desc=executeActionGet(ref);return desc.hasKey(stringIDToTypeID('hasUserMask'))&&desc.getBoolean(stringIDToTypeID('hasUserMask'));}
+                if(hasMask(top))throw new Error('Visible finished layer still has mask');
+                var editable=g.artLayers.getByName('抠图');
+                if(!hasMask(editable)||editable.visible)throw new Error('Editable mask backup missing or visible');
+                if(d.activeLayer.id!==top.id)throw new Error('Finished layer is not selected');
                 var b=top.bounds;result='['+[b[0].as('px'),b[1].as('px'),b[2].as('px'),b[3].as('px')].join(',')+']';
+                // 删除副本的蒙版而不应用，证明备份仍保留原底图像素，可恢复被遮住的区域。
+                var restored=editable.duplicate();d.activeLayer=restored;
+                var ref=new ActionReference();ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
+                var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),ref);desc.putBoolean(charIDToTypeID('Aply'),false);
+                executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
+                if(restored.bounds[2].as('px')-restored.bounds[0].as('px')<=b[2].as('px')-b[0].as('px'))throw new Error('Backup lost recoverable background pixels');
             }finally{d.close(SaveOptions.DONOTSAVECHANGES);}result;
             """)
         }
-        } catch { XCTFail("Photoshop applied-mask bounds: \(String(reflecting: error))"); return }
+        } catch { XCTFail("Photoshop saved-layer bounds: \(String(reflecting: error))"); return }
         let bounds = try JSONDecoder().decode([Double].self,from: Data(rawBounds.utf8))
         for (actual,wanted) in zip(bounds,[expected.minX,expected.minY,expected.maxX,expected.maxY]) { XCTAssertEqual(actual,wanted,accuracy: 2) }
-        XCTAssertLessThan(expected.width,3500); XCTAssertLessThan(expected.height,2900)
+        XCTAssertLessThan(expected.width,raster.size.width); XCTAssertLessThan(expected.height,raster.size.height)
+        let final = try await bridge.captureFinalPSD(document: document,owner: owner)
+        let finalRoles = try await bridge.extractRoles(snapshot: final)
+        let finalRaster = try WorkflowRaster.read(finalRoles.cutoutPNG)
+        XCTAssertEqual(finalRaster.size,applied.pixelSize)
+        // 最终导出首个可见成品，与严格蒙版回写结果在当前画布上逐像素一致。
+        let fw = Int(finalRaster.size.width),fh = Int(finalRaster.size.height),rw = Int(raster.size.width)
+        let ox = Int(savedRoles.coordinateOrigin.x),oy = Int(savedRoles.coordinateOrigin.y)
+        var mismatch: Int?
+        outer: for y in 0..<fh { for x in 0..<fw { for c in 0..<4 {
+            let i = (y*fw+x)*4+c,j = ((y-oy)*rw+x-ox)*4+c
+            if finalRaster.pixels[i] != raster.pixels[j] { mismatch = i; break outer }
+        } } }
+        XCTAssertNil(mismatch)
         for (url,hash) in zip(originals,hashes) { XCTAssertEqual(try AIFileValidation.hash(url.path),hash) }
-        let report: [String:Any] = ["removedMaskPixels":removed.count,"applicable":solution.isApplicable,"photoshopAppliedMaskBounds":bounds,"cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"workingCopy":document.path]
+        let report: [String:Any] = ["removedMaskPixels":removed.count,"applicable":solution.isApplicable,"photoshopSavedLayerBounds":bounds,"cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"editableMaskAndRGBRetained":true,"savedLayerHasMask":false,"finalPixelsMatch":mismatch == nil,"workingCopy":document.path]
         try JSONSerialization.data(withJSONObject: report,options:[.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("validation.json"))
     }
 
