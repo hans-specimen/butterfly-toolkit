@@ -60,29 +60,36 @@ nonisolated struct WorkflowMatteService: Sendable {
         guard try AIFileValidation.hash(alphaPath) == alphaHash, (try AIFileValidation.hash(cutoutPath)) == cutoutHash,
               (try AIFileValidation.hash(input.pngURL.path)) == input.fingerprint else { throw WorkflowBridgeError.staleSource }
         // 先验证外部结果，再生成独立清理产物；不覆盖引擎结果或人工 PSD。
-        var values = stride(from: 0,to: alpha.pixels.count,by: 4).map { alpha.pixels[$0] }
+        let values = stride(from: 0,to: alpha.pixels.count,by: 4).map { alpha.pixels[$0] }
         let source = try WorkflowRaster.read(input.pngURL)
         guard source.size == alpha.size,source.pixels.count == alpha.pixels.count else { throw WorkflowBridgeError.staleSource }
-        for i in values.indices where source.pixels[i*4+3] == 0 { values[i] = 0 }
-        let cleaned = try MaskResidueCleanup.clean(values,width: Int(alpha.size.width),height: Int(alpha.size.height))
-        if cleaned != stride(from: 0,to: alpha.pixels.count,by: 4).map({ alpha.pixels[$0] }) {
+        // 按实际合成后的可见度分类；保留区域仍写原蒙版，避免回写时重复乘底图 Alpha。
+        let effective = values.indices.map { UInt8((Int(values[$0])*Int(source.pixels[$0*4+3])+127)/255) }
+        let analysis = try MaskResidueCleanup.analyze(effective,width: Int(alpha.size.width),height: Int(alpha.size.height))
+        let cleaned = values.indices.map { analysis.alpha[$0] == 0 ? UInt8(0) : values[$0] }
+        do {
             let folder = workspace.appendingPathComponent("AI/matte-cleaned/\(UUID())",isDirectory: true)
             try FileManager.default.createDirectory(at: folder,withIntermediateDirectories: true)
             do {
-                let cleanAlpha = folder.appendingPathComponent("alpha.png"),cleanCutout = folder.appendingPathComponent("cutout.png")
-                try WorkflowRaster.writeCleanedMatte(alpha: cleaned,originalAlpha: alpha,cutoutURL: cutoutURL,alphaURL: cleanAlpha,outputURL: cleanCutout)
-                try WorkflowRaster.validateMatte(original: original,alpha: WorkflowRaster.read(cleanAlpha),cutout: WorkflowRaster.read(cleanCutout))
+                let reportURL = folder.appendingPathComponent("cleanup-report.json")
+                try JSONEncoder().encode(analysis.report).write(to: reportURL,options: .atomic)
+                let changed = cleaned != stride(from: 0,to: alpha.pixels.count,by: 4).map { alpha.pixels[$0] }
+                let cleanAlpha = changed ? folder.appendingPathComponent("alpha.png") : alphaURL
+                let cleanCutout = changed ? folder.appendingPathComponent("cutout.png") : cutoutURL
+                if changed {
+                    try WorkflowRaster.writeCleanedMatte(alpha: cleaned,originalAlpha: alpha,cutoutURL: cutoutURL,alphaURL: cleanAlpha,outputURL: cleanCutout)
+                    try WorkflowRaster.validateMatte(original: original,alpha: WorkflowRaster.read(cleanAlpha),cutout: WorkflowRaster.read(cleanCutout))
+                }
                 guard try AIFileValidation.hash(alphaPath) == alphaHash,try AIFileValidation.hash(cutoutPath) == cutoutHash,
                       try AIFileValidation.hash(input.pngURL.path) == input.fingerprint else { throw WorkflowBridgeError.staleSource }
                 try Task.checkCancellation()
                 return MatteArtifact(inputPNGFingerprint: input.fingerprint,alphaURL: cleanAlpha,
                     alphaFingerprint: try AIFileValidation.hash(cleanAlpha.path),cutoutURL: cleanCutout,
-                    cutoutFingerprint: try AIFileValidation.hash(cleanCutout.path),orientation: 1,pixelSize: input.pixelSize)
+                    cutoutFingerprint: try AIFileValidation.hash(cleanCutout.path),orientation: 1,pixelSize: input.pixelSize,
+                    cleanupReportURL: reportURL,cleanupReportFingerprint: try AIFileValidation.hash(reportURL.path),
+                    cleanupAlgorithmVersion: analysis.report.algorithmVersion)
             } catch { try? FileManager.default.removeItem(at: folder); throw error }
         }
-        return MatteArtifact(inputPNGFingerprint: input.fingerprint, alphaURL: alphaURL,
-            alphaFingerprint: alphaHash, cutoutURL: cutoutURL,
-            cutoutFingerprint: cutoutHash, orientation: 1, pixelSize: input.pixelSize)
     }
 }
 

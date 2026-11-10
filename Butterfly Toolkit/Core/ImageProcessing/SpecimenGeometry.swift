@@ -77,60 +77,51 @@ nonisolated struct MeaningfulMaskSupport: Sendable {
     fileprivate var estimatedStorageBytes: Int { pixels.count + wingPixels.count + (rowMin.count + rowMax.count) * MemoryLayout<Int>.stride }
 
     init(values: [UInt8],width: Int,height: Int,origin: CGPoint) throws {
-        let values = try MaskResidueCleanup.clean(values,width: width,height: height)
-        self.width = width; self.height = height; coordinateOrigin = origin
-        var labels = [Int32](repeating: 0,count: values.count),components = [MaskComponent()]
-        var queue = [Int](); queue.reserveCapacity(values.count / 4)
-        // 通过强像素筛选连通区域，保留其中所有大于零的像素，包括 alpha 为 1 的细毛。
-        for start in values.indices where values[start] > 0 && labels[start] == 0 {
-            let label = Int32(components.count); var component = MaskComponent(),head = 0
-            queue.removeAll(keepingCapacity: true); queue.append(start); labels[start] = label
-            while head < queue.count {
-                let index = queue[head]; head += 1
-                if head % 65536 == 0 { try Task.checkCancellation() }
-                let x = index % width,y = index / width
-                component.count += 1
-                if values[index] >= 16 { component.strong += 1 }
-                let dx = Double(x),dy = Double(y)
-                component.x0 = min(component.x0,x); component.x1 = max(component.x1,x+1)
-                component.y0 = min(component.y0,y); component.y1 = max(component.y1,y+1)
-                component.sx += dx; component.sy += dy
-                component.sxx += dx*dx; component.syy += dy*dy; component.sxy += dx*dy
-                for ny in max(0,y-1)...min(height-1,y+1) {
-                    for nx in max(0,x-1)...min(width-1,x+1) {
-                        let next = ny*width+nx
-                        if labels[next] == 0 && values[next] > 0 { labels[next] = label; queue.append(next) }
-                    }
-                }
-            }
-            components.append(component)
+        // 此入口也处理人工保存和旧批次：完整范围必须包含每个实际非零 Alpha，不能再暗中清理。
+        let core = try MaskResidueCleanup.trustedCore(values,width: width,height: height)
+        let hasCore = core.contains(1)
+        guard hasCore || values.lazy.filter({ $0 > 0 }).prefix(16).count == 16 else {
+            throw GeometryProcessingError.invalidImage("蒙版没有可靠主体")
         }
-        guard let largest = components.map(\.strong).max(),largest >= 16 else { throw GeometryProcessingError.invalidImage("蒙版没有可靠主体") }
-        let minimum = max(16,largest / 1000)
-        let wingKept = components.map { $0.strong >= minimum }
-        // 完整边界额外保留可信的分离细节，翅顶估算仍使用较严格的噪点过滤。
-        let kept = components.map { $0.strong >= minimum || $0.isPlausibleDetail }
-        componentCount = kept.filter { $0 }.count
-        wingComponentCount = wingKept.filter { $0 }.count
-        detachedDetailCount = componentCount-wingComponentCount
-        var result = [UInt8](repeating: 0,count: values.count),wing = result
-        var wingMinX = width,wingMinY = height,wingMaxX = 0,wingMaxY = 0
+        self.width = width; self.height = height; coordinateOrigin = origin
+        var visited = [UInt8](repeating: 0,count: values.count),queue = [Int32]()
+        var count = 0,wingCount = 0
+        for start in values.indices {
+            if start%65536 == 0 { try Task.checkCancellation() }
+            guard values[start] > 0,visited[start] == 0 else { continue }
+            count += 1; var hasCore = false,head = 0
+            queue.removeAll(keepingCapacity: true); queue.append(Int32(start)); visited[start] = 1
+            while head < queue.count {
+                let i = Int(queue[head]); head += 1
+                if head%65536 == 0 { try Task.checkCancellation() }
+                hasCore = hasCore || core[i] > 0
+                let x = i%width,y = i/width
+                for ny in max(0,y-1)...min(height-1,y+1) { for nx in max(0,x-1)...min(width-1,x+1) {
+                    let next = ny*width+nx
+                    if values[next] > 0,visited[next] == 0 { visited[next] = 1; queue.append(Int32(next)) }
+                } }
+            }
+            if hasCore { wingCount += 1 }
+        }
+        componentCount = count; wingComponentCount = wingCount; detachedDetailCount = count-wingCount
         var rowsMin = [Int](repeating: width,count: height),rowsMax = [Int](repeating: -1,count: height)
         var minX = width,minY = height,maxX = 0,maxY = 0
-        for i in values.indices where kept[Int(labels[i])] {
-            result[i] = 1
-            let x = i % width,y = i / width
-            if wingKept[Int(labels[i])] {
-                wing[i] = 1
+        var wingMinX = width,wingMinY = height,wingMaxX = 0,wingMaxY = 0
+        for i in values.indices {
+            if i%65536 == 0 { try Task.checkCancellation() }
+            guard values[i] > 0 else { continue }
+            let x = i%width,y = i/width
+            if core[i] > 0 {
                 wingMinX = min(wingMinX,x); wingMinY = min(wingMinY,y)
                 wingMaxX = max(wingMaxX,x+1); wingMaxY = max(wingMaxY,y+1)
             }
             rowsMin[y] = min(rowsMin[y],x); rowsMax[y] = max(rowsMax[y],x)
-            minX = min(minX,x); maxX = max(maxX,x+1); minY = min(minY,y); maxY = max(maxY,y+1)
+            minX = min(minX,x); minY = min(minY,y); maxX = max(maxX,x+1); maxY = max(maxY,y+1)
         }
-        pixels = result; wingPixels = wing; rowMin = rowsMin; rowMax = rowsMax
-        wingBounds = CGRect(x: origin.x+Double(wingMinX),y: origin.y+Double(wingMinY),width: Double(wingMaxX-wingMinX),height: Double(wingMaxY-wingMinY))
+        pixels = visited; wingPixels = core; rowMin = rowsMin; rowMax = rowsMax
         bounds = CGRect(x: origin.x+Double(minX),y: origin.y+Double(minY),width: Double(maxX-minX),height: Double(maxY-minY))
+        // 人工半透明成品仍能布局导出；无强核心时方向估计自然回退为原角度。
+        wingBounds = hasCore ? CGRect(x: origin.x+Double(wingMinX),y: origin.y+Double(wingMinY),width: Double(wingMaxX-wingMinX),height: Double(wingMaxY-wingMinY)) : bounds
     }
 
     func rotatedBounds(angle: Double,pivot: CGPoint) -> CGRect {
@@ -245,7 +236,7 @@ nonisolated struct PreparedMaskGeometry: Sendable {
             let margins = WorkflowMargins(left: (b.minX-crop.minX)/crop.width,top: (b.minY-crop.minY)/crop.height,
                                           right: (crop.maxX-b.maxX)/crop.width,bottom: (crop.maxY-b.maxY)/crop.height)
             let insufficient = applicable && min(margins.left,margins.top,margins.right,margins.bottom) < request.targetMargin-1/min(crop.width,crop.height)
-            let paddingWarning = insufficient && !(reason?.contains("留白不足") ?? false) ? "留白不足：已保留完整主体与真实背景" : nil
+            let paddingWarning = insufficient && !(reason?.contains("留白不足") ?? false) ? "留白不足：完整主体已保留，原图有效背景不足以达到目标留白" : nil
             let details = [reason,paddingWarning].compactMap { $0 }
             let detail = details.isEmpty ? nil : details.joined(separator: "；")
             return GeometrySolution(sourceVersion: input.sourceVersion,angleDegrees: applicable ? angle : 0,rotationPivot: pivot,
@@ -286,7 +277,7 @@ nonisolated struct PreparedMaskGeometry: Sendable {
             let mid = (a+b)/2
             if let candidate = try crop(mid) { a = mid; best = candidate } else { b = mid }
         }
-        return solution(crop: best,applicable: true,reason: [review,"留白不足：已保留完整主体与真实背景"].compactMap { $0 }.joined(separator: "；"))
+        return solution(crop: best,applicable: true,reason: [review,"留白不足：完整主体已保留，原图有效背景不足以达到目标留白"].compactMap { $0 }.joined(separator: "；"))
     }
 
     /// 精确校验已保存的构图，不重新估算翅顶或另选裁切框。
@@ -344,25 +335,6 @@ nonisolated struct PreparedMaskGeometry: Sendable {
 }
 
 // MARK: - 连通细节与背景几何
-/// 保守判断分离细节是否可信，不承担解剖分类或 alpha 清理。
-private nonisolated struct MaskComponent {
-    var count = 0,strong = 0
-    var x0 = Int.max,y0 = Int.max,x1 = 0,y1 = 0
-    var sx = 0.0,sy = 0.0,sxx = 0.0,syy = 0.0,sxy = 0.0
-    var isPlausibleDetail: Bool {
-        guard count >= 2 else { return false } // 分析时仍将孤立单像素视为噪点。
-        if strong >= 2 { return true }
-        let n = Double(count),cx = sx/n,cy = sy/n
-        let vx = max(0,sxx/n-cx*cx),vy = max(0,syy/n-cy*cy),covariance = sxy/n-cx*cy
-        let difference = sqrt((vx-vy)*(vx-vy)+4*covariance*covariance)
-        let major = (vx+vy+difference)/2,minor = max(0,(vx+vy-difference)/2)
-        let elongated = major >= 9*max(0.25,minor)
-        // 弯曲或环状细毛在 PCA 中可能近似各向同性，但仍仅占边界框很小的面积。
-        let sparse = max(x1-x0,y1-y0) >= 3 && Double(count) <= Double((x1-x0)*(y1-y0))*0.35
-        return elongated || sparse
-    }
-}
-
 private nonisolated struct GeometryRotation {
     let c: Double,s: Double,pivot: CGPoint
     init(degrees: Double,pivot: CGPoint) {

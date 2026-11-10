@@ -5,6 +5,27 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class WorkflowAssetRendererTests: XCTestCase {
+    func testManualTranslucentFinishedLayerExportsWithoutReliableAICore() throws {
+        let f = try Fixture(); defer { f.remove() }
+        var mask = try WorkflowRaster.read(f.roles.maskPNG).pixels
+        var cutout = try WorkflowRaster.read(f.roles.cutoutPNG).pixels
+        for i in stride(from: 0,to: mask.count,by: 4) where mask[i] > 0 {
+            for c in 0..<3 { mask[i+c] = 100; cutout[i+c] = UInt8(Int(cutout[i+c])*100/255) }
+            cutout[i+3] = 100
+        }
+        try Self.write(f.roles.maskPNG,width: 100,height: 100,pixels: mask)
+        let color = CGColorSpace(name: CGColorSpace.displayP3)!
+        try Self.write(f.roles.basePNG,width: 100,height: 100,pixels: WorkflowRaster.read(f.roles.basePNG).pixels,colorSpace: color)
+        try Self.write(f.roles.cutoutPNG,width: 100,height: 100,pixels: cutout,colorSpace: color)
+        var roles = f.roles; roles.isFinalized = true
+        let renderer = WorkflowAssetRenderer(),output = f.url("translucent.png")
+        try renderer.render4K(roles: roles,layout: .png4k,destination: output)
+        let raster = try WorkflowRaster.read(output)
+        XCTAssertEqual(raster.size,CGSize(width: 4096,height: 4096))
+        XCTAssertEqual(stride(from: 3,to: raster.pixels.count,by: 4).map { raster.pixels[$0] }.max(),100)
+        try renderer.renderFootage(source4K: output,destination: f.url("footage.png"))
+        XCTAssertGreaterThan(try WorkflowRaster.read(f.url("footage.png")).size.width,3000)
+    }
     func testFinalLayerAllowsIndependentRGBButRetainsStrictAlphaAndICCChecks() throws {
         let f = try Fixture(); defer { f.remove() }
         var pixels = try WorkflowRaster.read(f.roles.cutoutPNG).pixels
@@ -115,7 +136,7 @@ final class WorkflowAssetRendererTests: XCTestCase {
         let hair = stride(from: 0,to: r.pixels.count,by: 4).filter { r.pixels[$0+3] > 0 && r.pixels[$0] == r.pixels[$0+3] }
         XCTAssertFalse(hair.isEmpty)
     }
-    func testLayoutRetainsDetachedDetailButDoesNotFitIsolatedCornerNoise() throws {
+    func testLayoutIncludesEverySavedAlphaPixelIncludingIsolatedCorner() throws {
         let f = try Fixture(); defer { f.remove() }
         var mask = try WorkflowRaster.read(f.roles.maskPNG).pixels
         var cutout = try WorkflowRaster.read(f.roles.cutoutPNG).pixels
@@ -128,7 +149,7 @@ final class WorkflowAssetRendererTests: XCTestCase {
         try Self.write(f.roles.cutoutPNG,width: 100,height: 100,pixels: cutout)
         try WorkflowAssetRenderer().render4K(roles: f.roles,layout: .png4k,destination: f.url("detached.png"))
         let r = try WorkflowRaster.read(f.url("detached.png"))
-        assertBounds(bounds(r,alpha: true),CGRect(x: 256,y: 554.6666667,width: 3584,height: 2986.6666667))
+        assertBounds(bounds(r,alpha: true,minimumAlpha: 0),CGRect(x: 256,y: 489.7391304,width: 3584,height: 3116.5217391))
     }
     func testHDUsesBaseRoleAndCurrentViewportAtNegativeOrigin() throws {
         let f = try Fixture(); defer { f.remove() }
@@ -351,12 +372,12 @@ final class WorkflowAssetRendererTests: XCTestCase {
         guard let actual else { XCTFail("Missing subject",file: file,line: line); return }
         for (a,e) in [(actual.minX,expected.minX),(actual.minY,expected.minY),(actual.maxX,expected.maxX),(actual.maxY,expected.maxY)] { XCTAssertEqual(a,e,accuracy: 1,file: file,line: line) }
     }
-    private func bounds(_ raster: WorkflowRaster,alpha: Bool) -> CGRect? {
+    private func bounds(_ raster: WorkflowRaster,alpha: Bool,minimumAlpha: UInt8 = 2) -> CGRect? {
         let w = Int(raster.size.width),h = Int(raster.size.height)
         var x0 = w,y0 = h,x1 = 0,y1 = 0
         for y in 0..<h { for x in 0..<w {
             let i = (y*w+x)*4
-            if alpha ? raster.pixels[i+3] > 2 : raster.pixels[i..<i+3].contains(where: { $0 < 250 }) {
+            if alpha ? raster.pixels[i+3] > minimumAlpha : raster.pixels[i..<i+3].contains(where: { $0 < 250 }) {
                 x0 = min(x0,x); y0 = min(y0,y); x1 = max(x1,x+1); y1 = max(y1,y+1)
             }
         } }

@@ -12,10 +12,19 @@ final class WorkflowResidueLiveTests: XCTestCase {
         guard !FileManager.default.fileExists(atPath: root.path) else { throw WorkflowBridgeError.ownershipConflict }
         try FileManager.default.createDirectory(at: root,withIntermediateDirectories: true)
         let batch = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: URL(fileURLWithPath: manifest)))
-        let name = env["WORKFLOW_RESIDUE_NAME"] ?? "222"
-        let side: WorkflowSide = env["WORKFLOW_RESIDUE_SIDE"] == "D" ? .front : .back
-        let specimen = try XCTUnwrap(batch.specimens.first { $0.baseName == name })
-        let task = side == .front ? specimen.front : specimen.back
+        let requestedName = env["WORKFLOW_RESIDUE_NAME"],requestedSide = env["WORKFLOW_RESIDUE_SIDE"]
+        let specimens = batch.specimens.filter { requestedName == nil || $0.baseName == requestedName || $0.baseName.hasPrefix(requestedName!+"_") }
+        XCTAssertFalse(specimens.isEmpty)
+        for specimen in specimens {
+            for task in [specimen.front,specimen.back] where requestedSide == nil || task.side.fileSuffix == requestedSide {
+                let directory = root.appendingPathComponent(specimen.baseName+"_"+task.side.fileSuffix)
+                try FileManager.default.createDirectory(at: directory,withIntermediateDirectories: true)
+                try await replay(task: task,root: directory)
+            }
+        }
+    }
+
+    private func replay(task: WorkflowSideTask,root: URL) async throws {
         let source = try XCTUnwrap(task.roleImages)
         let originals = [source.basePNG,source.maskPNG,source.cutoutPNG,try XCTUnwrap(task.snapshot?.workingURL)]
         let hashes = try originals.map { try AIFileValidation.hash($0.path) }
@@ -38,11 +47,17 @@ final class WorkflowResidueLiveTests: XCTestCase {
         catch { XCTFail("Replay inference: \(String(reflecting: error))"); return }
         let before = try WorkflowRaster.read(mask),after = try WorkflowRaster.read(matte.alphaURL)
         let removed = stride(from:0,to:before.pixels.count,by:4).filter { before.pixels[$0]>0 && after.pixels[$0]==0 }
-        if name == "33" { XCTAssertGreaterThanOrEqual(removed.count,60) }
+        let cleanup = try XCTUnwrap(matte.validatedCleanupReport())
+        XCTAssertEqual(cleanup.removedPixelCount,removed.count)
+        XCTAssertTrue(stride(from: 0,to: after.pixels.count,by: 4).allSatisfy { after.pixels[$0] == 0 || after.pixels[$0] == before.pixels[$0] },"Retained alpha must be unchanged")
+        try JSONEncoder().encode(cleanup).write(to: root.appendingPathComponent("cleanup-report.json"))
         let installed = try await bridge.installMatte(snapshot: snapshot,matte: matte,createFinishedLayer: true)
         let roles = try await bridge.extractRoles(snapshot: installed)
         let solution = try MaskGeometryProcessor().analyze(input: MaskGeometryInput(sourceVersion: roles.snapshotVersion,sourcePixelSize: roles.pixelSize,maskURL: roles.maskPNG,validBackgroundAlphaURL: roles.basePNG,coordinateOrigin: roles.coordinateOrigin,cropViewport: roles.cropViewport),request: GeometryRequest())
-        XCTAssertTrue(solution.isApplicable,solution.reason ?? "")
+        guard solution.isApplicable else {
+            try JSONEncoder().encode(solution).write(to: root.appendingPathComponent("unapplied-geometry.json"))
+            XCTFail("Automatic crop unapplied: \(solution.reason ?? "") at \(root.lastPathComponent)"); return
+        }
         let applied = try await bridge.applyGeometry(snapshot: installed,solution: solution,createFinishedLayer: true)
         let savedRoles = try await bridge.extractRoles(snapshot: applied)
         let raster = try WorkflowRaster.read(savedRoles.cutoutPNG)
@@ -92,9 +107,24 @@ final class WorkflowResidueLiveTests: XCTestCase {
             if finalRaster.pixels[i] != raster.pixels[j] { mismatch = i; break outer }
         } } }
         XCTAssertNil(mismatch)
+        let output4K = root.appendingPathComponent("final-4096.png")
+        try WorkflowAssetRenderer().render4K(roles: finalRoles,layout: .png4k,destination: output4K)
+        XCTAssertEqual(try WorkflowRaster.read(output4K).size,CGSize(width: 4096,height: 4096))
         for (url,hash) in zip(originals,hashes) { XCTAssertEqual(try AIFileValidation.hash(url.path),hash) }
-        let report: [String:Any] = ["removedMaskPixels":removed.count,"applicable":solution.isApplicable,"photoshopSavedLayerBounds":bounds,"cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"editableMaskAndRGBRetained":true,"savedLayerHasMask":false,"finalPixelsMatch":mismatch == nil,"workingCopy":document.path]
+        let fixture: [String:Any] = ["sourceHash":hashes[1],"pixelSize":[before.size.width,before.size.height],"originalBatchCoordinateOrigin":[source.coordinateOrigin.x,source.coordinateOrigin.y],"replayCoordinateOrigin":[0,0],"originalMask":mask.path,"cleanedMask":matte.alphaURL.path,"removedPixelCount":removed.count,"review":"pending visual review"]
+        try JSONSerialization.data(withJSONObject: fixture,options:[.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("fixture-index.json"))
+        let report: [String:Any] = ["removedMaskPixels":removed.count,"originalAlphaBounds":Self.alphaBounds(before,mask: true),"cleanedAlphaBounds":Self.alphaBounds(after,mask: true),"savedAlphaBoundsRaster":Self.alphaBounds(raster,mask: false),"sourceHashes":hashes,"sourceFiles":originals.map(\.path),"cleanupAlgorithmVersion":cleanup.algorithmVersion,"modelInferenceRun":false,"angleDegrees":solution.angleDegrees,"margins":[solution.actualMargins.left,solution.actualMargins.top,solution.actualMargins.right,solution.actualMargins.bottom],"exportSize":[4096,4096],"applicable":solution.isApplicable,"photoshopSavedLayerBounds":bounds,"cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"editableMaskAndRGBRetained":true,"savedLayerHasMask":false,"finalPixelsMatch":mismatch == nil,"workingCopy":document.path]
         try JSONSerialization.data(withJSONObject: report,options:[.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("validation.json"))
+    }
+
+    private static func alphaBounds(_ raster: WorkflowRaster,mask: Bool) -> [Int] {
+        let width = Int(raster.size.width),height = Int(raster.size.height),channel = mask ? 0 : 3
+        var x0 = width,y0 = height,x1 = 0,y1 = 0
+        for i in 0..<width*height where raster.pixels[i*4+channel] > 0 {
+            let x = i%width,y = i/width
+            x0 = min(x0,x); y0 = min(y0,y); x1 = max(x1,x+1); y1 = max(y1,y+1)
+        }
+        return x1 > x0 ? [x0,y0,x1-x0,y1-y0] : [0,0,0,0]
     }
 
     private static func makeReplay(input: URL,mask: URL,output: URL) throws {

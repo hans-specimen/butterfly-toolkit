@@ -578,7 +578,7 @@ actor WorkflowExecutor {
             try await persist(batchID)
             do {
                 try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                let saved = try await services.apply(snapshot,solution)
+                let saved = try await services.apply(snapshot,solution).carryingCleanup(from: snapshot,geometry: solution)
                 try checkSelection(batchID,expected,stage: .geometry,presets: presets)
                 // 几何写入中断后禁止盲目重试，避免再次叠加旋转或裁切。
                 let roles = try await services.extract(saved)
@@ -738,7 +738,7 @@ actor WorkflowExecutor {
                 if matteStep == .infer { try await inferPreparedMatte(batchID: batchID, before: before); break }
                 if matteStep == .install && before.snapshot?.roles == nil { try Self.validatePreparedMatte(before) }
                 guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
-                let saved: PSDSnapshot
+                var saved: PSDSnapshot
                 if snapshot.roles != nil {
                     _ = try await services.extract(snapshot); saved = snapshot
                 } else {
@@ -768,6 +768,7 @@ actor WorkflowExecutor {
                         try mutateTask(batchID,id) { $0.matteArtifact = matte }; try await persist(batchID)
                     }
                     try check(batchID,before,stage: stage)
+                    _ = try matte.validatedCleanupReport()
                     // 旧流程继续编辑原蒙版；只有人工定稿流程自动生成应用蒙版的成品层。
                     let install = try batch(batchID: batchID).manualFinalization == true ? (services.installForFinalization ?? services.install) : services.install
                     if before.matteArtifact != nil {
@@ -781,6 +782,7 @@ actor WorkflowExecutor {
                             saved = current
                         } else { saved = try await install(snapshot,matte) }
                     } else { saved = try await install(snapshot,matte) }
+                    saved = saved.attachingCleanup(from: matte)
                 }
                 try check(batchID,before,stage: stage)
                 guard saved.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
@@ -814,7 +816,7 @@ actor WorkflowExecutor {
                 if try batch(batchID: batchID).manualFinalization == true,solution.isApplicable {
                     try mutateTask(batchID,id) { $0.geometryApplySourceVersion = saved.contentVersion }
                     try await persist(batchID)
-                    let applied = try await (services.applyForFinalization ?? services.apply)(saved,solution)
+                    let applied = try await (services.applyForFinalization ?? services.apply)(saved,solution).carryingCleanup(from: saved,geometry: solution)
                     try check(batchID,before,stage: stage)
                     let extracted = try await services.extract(applied)
                     try check(batchID,before,stage: stage)

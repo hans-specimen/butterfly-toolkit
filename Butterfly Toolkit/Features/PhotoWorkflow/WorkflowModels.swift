@@ -336,6 +336,12 @@ nonisolated struct PSDSnapshot: Codable, Equatable, Sendable {
     var roles: PSDRoleIdentifiers?
     var structureSummary: String
     var finalRoles: FinalPSDIdentifiers?
+    var cleanupReportURL: URL?
+    var cleanupReportFingerprint: String?
+    var cleanupAlgorithmVersion: Int?
+    /// 报告只对应此自动保存版本；人工保存后失效。
+    var cleanupSnapshotVersion: String?
+    var cleanupGeometry: GeometrySolution?
 }
 
 nonisolated struct StackPNG: Codable, Equatable, Sendable {
@@ -357,6 +363,9 @@ nonisolated struct MatteArtifact: Codable, Equatable, Sendable {
     var cutoutFingerprint: String
     var orientation: Int
     var pixelSize: CGSize
+    var cleanupReportURL: URL?
+    var cleanupReportFingerprint: String?
+    var cleanupAlgorithmVersion: Int?
 }
 
 /// 人工定稿仅锁定最终导出来源，允许替换图层和应用蒙版。

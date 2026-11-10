@@ -9,6 +9,15 @@ final class WorkflowFinalizationTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
             var batch = f.batch; batch.manualFinalization = finalizing
             var services = finalServices(f)
+            let infer = services.infer
+            services.infer = { input in
+                var matte = try await infer(input)
+                let report = MaskCleanupReport(algorithmVersion: 1,removedPixelCount: 0,regions: [],pixelSize: input.pixelSize)
+                let url = f.batch.outputDirectory.appendingPathComponent("cleanup-\(UUID()).json")
+                try JSONEncoder().encode(report).write(to: url)
+                matte.cleanupReportURL = url; matte.cleanupReportFingerprint = try AIFileValidation.hash(url.path); matte.cleanupAlgorithmVersion = 1
+                return matte
+            }
             let install = services.install,apply = services.apply
             services.installForFinalization = { snapshot,matte in
                 var saved = try await install(snapshot,matte); saved.structureSummary = "finished-layer"; return saved
@@ -23,6 +32,19 @@ final class WorkflowFinalizationTests: XCTestCase {
             for task in result.activeTasks {
                 XCTAssertEqual(task.snapshot?.structureSummary == "finished-layer",finalizing)
                 XCTAssertNotEqual(task[.matte].state,.failed)
+                XCTAssertNotNil(task.snapshot?.cleanupReportURL)
+                XCTAssertEqual(task.snapshot?.cleanupSnapshotVersion,task.snapshot?.contentVersion)
+                XCTAssertNotNil(try task.snapshot?.validatedCleanupReport())
+            }
+            if finalizing {
+                let id = batch.specimens[0].front.id
+                try await executor.refreshFinalPSD(batchID: batch.id,taskID: id)
+                let refreshed = try await executor.batch(batchID: batch.id)
+                XCTAssertNil(try refreshed.task(id: id)?.snapshot?.validatedCleanupReport())
+                let calls = await f.probe.values()
+                XCTAssertEqual(calls.filter { $0 == "ai" }.count,2)
+                XCTAssertEqual(calls.filter { $0 == "install" }.count,2)
+                XCTAssertEqual(calls.filter { $0 == "apply-save" }.count,2)
             }
         }
     }

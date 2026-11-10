@@ -4,7 +4,18 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 final class MaskGeometryProcessorTests: XCTestCase {
-    func testTinyRemoteHazeWithBrighterSpecksIsRemovedButDetailsSurvive() throws {
+    func testCropContainsAllRetainedAlphaIncludingManualFaintEdits() throws {
+        var values = [UInt8](repeating: 0,count: 400*400)
+        for y in 100..<280 { for x in 100..<300 { values[y*400+x] = 255 } }
+        values[30*400+30] = 1
+        let prepared = try SpecimenGeometry.prepare(input: GeometryImageInput(sourceVersion: "manual-save",sourcePixelSize: CGSize(width: 400,height: 400),coordinateOrigin: .zero,cropViewport: CGRect(x: 0,y: 0,width: 400,height: 400)),mask: values)
+        XCTAssertEqual(prepared.support.bounds,CGRect(x: 30,y: 30,width: 270,height: 250))
+        XCTAssertEqual(prepared.support.pixels[30*400+30],1)
+        let solution = try prepared.analyze(request: GeometryRequest(targetMargin: 0,angleStrategy: .manual(degrees: 0)))
+        XCTAssertTrue(solution.sourceCropRect.contains(CGPoint(x: 30,y: 30)))
+    }
+
+    func testShortThinRemoteFragmentAndOtherDetailsAreConservativelyRetained() throws {
         var values = [UInt8](repeating: 0,count: 200*200)
         for y in 60..<140 { for x in 60..<140 { values[y*200+x] = 255 } }
         // 33_V 的关键特征：60 像素残留中仅两个略高于 16，其余几乎透明。
@@ -14,13 +25,12 @@ final class MaskGeometryProcessorTests: XCTestCase {
         for y in 65..<72 { values[y*200+57] = 2 } // 主体附近的分离细毛
         values[180*200+180] = 128; values[181*200+180] = 64 // 远处可见细节保留检查
         for x in 10..<100 { values[180*200+x] = 20 } // 成片半透明细节不能按小残留删除
-        var expected = values
-        for y in 5..<25 { for x in 197..<200 { expected[y*200+x] = 0 } }
+        let expected = values // 短而细的分离片段不能单凭低 Alpha 自动删掉。
         XCTAssertEqual(try MaskResidueCleanup.clean(values,width: 200,height: 200),expected)
         XCTAssertEqual(try MaskResidueCleanup.clean(expected,width: 200,height: 200),expected)
     }
 
-    func testRemoteFaintResidueDoesNotExpandCropOnOpaqueBackground() throws {
+    func testSavedRemoteFaintPixelsRemainInCropUntilExplicitCleanup() throws {
         let f = try Fixture(width: 200,height: 200,subject: CGRect(x: 60,y: 60,width: 80,height: 80),extras: { p in
             for x in 0..<200 { p[195*200+x] = 2 }
             for y in 40..<60 { p[y*200+100] = 1 } // 连通触角保持原样
@@ -28,7 +38,7 @@ final class MaskGeometryProcessorTests: XCTestCase {
         })
         defer { f.remove() }
         let prepared = try MaskGeometryProcessor().prepare(input: f.input)
-        XCTAssertEqual(prepared.support.bounds,CGRect(x: 57,y: 40,width: 83,height: 100))
+        XCTAssertEqual(prepared.support.bounds,CGRect(x: 0,y: 40,width: 200,height: 156))
         XCTAssertTrue(try prepared.analyze(request: GeometryRequest(angleStrategy: .manual(degrees: 0))).isApplicable)
     }
     func testInvisibleMaskResidueDoesNotExpandSubjectButVisibleFineHairSurvives() throws {
@@ -141,9 +151,9 @@ final class MaskGeometryProcessorTests: XCTestCase {
             p[0] = 1; p[399*400+399] = 255
         }); defer { f.remove() }
         let support = try MaskGeometryProcessor().prepare(input: f.input).support
-        XCTAssertEqual(support.bounds,CGRect(x: 70,y: 100,width: 230,height: 240))
+        XCTAssertEqual(support.bounds,CGRect(x: 0,y: 0,width: 400,height: 400))
         XCTAssertEqual(support.pixels[150*400+70],1); XCTAssertEqual(support.pixels[339*400+200],1)
-        XCTAssertEqual(support.pixels[0],0); XCTAssertEqual(support.pixels[399*400+399],0)
+        XCTAssertEqual(support.pixels[0],1); XCTAssertEqual(support.pixels[399*400+399],1)
     }
     func testDetachedOpaqueWeakAndDiagonalDetailsRemainInCompleteBounds() throws {
         // Each small fragment is below the previous size threshold; no full-subject crop may drop it.
@@ -157,7 +167,9 @@ final class MaskGeometryProcessorTests: XCTestCase {
                 return (Int(round(88+14*cos(angle))),Int(round(88+14*sin(angle))))
             },1,CGRect(x: 74,y: 74,width: 226,height: 206))
         ]
-        for (detail,alpha,bounds) in cases {
+        for (detail,alpha,detailBounds) in cases {
+            let bounds = CGRect(x: 0,y: 0,width: 400,height: 400)
+            XCTAssertTrue(bounds.contains(detailBounds))
             let f = try Fixture(width: 400,height: 400,subject: CGRect(x: 100,y: 100,width: 200,height: 180),extras: { p in
                 for (x,y) in detail { p[y*400+x] = alpha }
                 p[0] = 1; p[1] = 1; p[399*400+399] = 255
@@ -165,9 +177,9 @@ final class MaskGeometryProcessorTests: XCTestCase {
             }); defer { f.remove() }
             let prepared = try MaskGeometryProcessor().prepare(input: f.input)
             XCTAssertEqual(prepared.support.bounds,bounds)
-            XCTAssertEqual(prepared.support.componentCount,2)
+            XCTAssertEqual(prepared.support.componentCount,5)
             for (x,y) in detail { XCTAssertEqual(prepared.support.pixels[y*400+x],1) }
-            XCTAssertEqual(prepared.support.pixels[0],0); XCTAssertEqual(prepared.support.pixels[399*400+399],0)
+            XCTAssertEqual(prepared.support.pixels[0],1); XCTAssertEqual(prepared.support.pixels[399*400+399],1)
             let s = try prepared.analyze(request: GeometryRequest(targetMargin: 0,angleStrategy: .manual(degrees: 0)))
             XCTAssertTrue(s.isApplicable); XCTAssertEqual(s.sourceCropRect,bounds)
             XCTAssertNotNil(s.reason,"Detached uncertain detail must remain visible to reviewers")

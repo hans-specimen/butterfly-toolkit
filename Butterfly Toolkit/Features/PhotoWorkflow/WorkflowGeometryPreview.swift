@@ -97,6 +97,7 @@ struct WorkflowGeometryPreview: View {
     var background: String
     var showSafeFrame = true
     var savedCanvasOnly = false
+    var cleanupRegions: [CGRect] = []
     var interactionStarted: TimeInterval?
     var onSourcePoint: (CGPoint) -> Void = { _ in }
     var onMoveChanged: (CGSize) -> Void = { _ in }
@@ -143,6 +144,10 @@ struct WorkflowGeometryPreview: View {
                         pixels.translateBy(x: pivot.x,y: pivot.y); pixels.rotate(by: .degrees(solution.angleDegrees)); pixels.translateBy(x: -pivot.x,y: -pivot.y)
                     }
                     pixels.draw(Image(decorative: image,scale: 1),in: map.viewRect(CGRect(origin: source.coordinateOrigin,size: source.pixelSize)))
+                    // 诊断叠加只画在预览中，跟随相同坐标变换，不写入 PSD 或导出像素。
+                    for region in cleanupRegions {
+                        pixels.stroke(Path(map.viewRect(region)),with: .color(.orange),style: StrokeStyle(lineWidth: 2,dash: [5,3]))
+                    }
                     if let solution {
                         ctx.stroke(Path(map.viewRect(solution.subjectBounds)),with: .color(.green),lineWidth: 1)
                         ctx.stroke(Path(map.viewRect(solution.sourceCropRect)),with: .color(solution.isApplicable ? .orange : .red),lineWidth: 2)

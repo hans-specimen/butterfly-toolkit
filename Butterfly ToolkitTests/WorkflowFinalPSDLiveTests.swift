@@ -67,9 +67,12 @@ final class WorkflowFinalPSDLiveTests: XCTestCase {
                 for(var i=0;i<g.layers.length;i++)if(g.layers[i].name!=='底图'&&g.layers[i].visible){top=g.layers[i];break;}
                 if(!top)throw new Error('Missing fixture cutout');
                 var finished=top.duplicate();finished.move(top,ElementPlacement.PLACEBEFORE);finished.name='人工最终透明图';d.activeLayer=finished;
-                var ref=new ActionReference();ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
-                var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),ref);desc.putBoolean(charIDToTypeID('Aply'),true);
-                executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
+                var lr=new ActionReference();lr.putIdentifier(charIDToTypeID('Lyr '),finished.id);var ld=executeActionGet(lr);
+                if(ld.hasKey(stringIDToTypeID('hasUserMask'))&&ld.getBoolean(stringIDToTypeID('hasUserMask'))){
+                    var ref=new ActionReference();ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
+                    var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),ref);desc.putBoolean(charIDToTypeID('Aply'),true);
+                    executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
+                }
                 // 留下可见的旧蒙版层，导出仍必须只读取最上面的最终图层。
                 top.visible=true;g.artLayers.getByName('底图').visible=false;
                 d.save();
@@ -85,6 +88,32 @@ final class WorkflowFinalPSDLiveTests: XCTestCase {
         XCTAssertEqual(after.size,CGSize(width: 4096,height: 4096)); XCTAssertEqual(before.pixels,after.pixels)
         do { _ = try await bridge.extractRoles(snapshot: masked); XCTFail("Stale PSD accepted") }
         catch { XCTAssertEqual(error as? WorkflowBridgeError,.staleSource) }
+
+        // 在测试副本擦除主体中心像素并裁切画布，刷新和导出不得重建成品覆盖这些修改。
+        _ = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
+            try await PhotoshopWorkflowBridge.execute("""
+            var d=app.open(new File(\(path)));
+            try {
+                var g=d.layerSets.getByName('共同调整'),layer=g.artLayers.getByName('人工最终透明图');d.activeLayer=layer;
+                var w=d.width.as('px'),h=d.height.as('px'),cx=Math.floor(w/2),cy=Math.floor(h/2);
+                d.selection.select([[cx-3,cy-3],[cx+3,cy-3],[cx+3,cy+3],[cx-3,cy+3]]);
+                d.selection.clear();d.selection.deselect();
+                d.crop([UnitValue(5,'px'),UnitValue(5,'px'),UnitValue(w-5,'px'),UnitValue(h-5,'px')]);
+                d.save();
+            } finally { d.close(SaveOptions.DONOTSAVECHANGES); }
+            """)
+        }
+        let editedHash = try AIFileValidation.hash(document.path)
+        let edited = try await bridge.captureFinalPSD(document: document,owner: owner)
+        let editedRoles = try await bridge.extractRoles(snapshot: edited)
+        XCTAssertEqual(edited.pixelSize,CGSize(width: applied.pixelSize.width-10,height: applied.pixelSize.height-10))
+        let editedRaster = try WorkflowRaster.read(editedRoles.cutoutPNG)
+        let center = (Int(editedRaster.size.height)/2*Int(editedRaster.size.width)+Int(editedRaster.size.width)/2)*4+3
+        XCTAssertEqual(editedRaster.pixels[center],0)
+        try renderer.render4K(roles: editedRoles,layout: .png4k,destination: root.appendingPathComponent("manually-edited-4k.png"))
+        try renderer.renderHD(roles: editedRoles,destination: root.appendingPathComponent("manually-cropped-base.jpg"))
+        XCTAssertEqual(try WorkflowRaster.read(root.appendingPathComponent("manually-edited-4k.png")).size,CGSize(width: 4096,height: 4096))
+        XCTAssertEqual(try AIFileValidation.hash(document.path),editedHash)
         let savedHash = try AIFileValidation.hash(document.path)
         _ = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
             try await PhotoshopWorkflowBridge.execute("var d=app.open(new File(\(path)));d.layerSets.getByName('共同调整').name='未保存修改';")
@@ -96,7 +125,7 @@ final class WorkflowFinalPSDLiveTests: XCTestCase {
         }
         XCTAssertEqual(try AIFileValidation.hash(document.path),savedHash)
         XCTAssertEqual(try AIFileValidation.hash(source.path),sourceHash)
-        let result: [String:Any] = ["sourceUnchanged":true,"maskedAndAppliedPixelsEqual":true,"pngWidth":4096,"pngHeight":4096,"savedVersionChecked":true,"unsavedRejected":true,"workingPSD":document.path]
+        let result: [String:Any] = ["sourceUnchanged":true,"maskedAndAppliedPixelsEqual":true,"pngWidth":4096,"pngHeight":4096,"manualPixelsAndCropPreserved":true,"savedVersionChecked":true,"unsavedRejected":true,"workingPSD":document.path]
         try JSONSerialization.data(withJSONObject: result,options: [.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("validation.json"))
     }
 }

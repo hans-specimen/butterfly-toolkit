@@ -87,8 +87,8 @@ python3 scripts/version.py check
 |---|---|
 | AI worker 真实推理 | `WORKFLOW_WORKER_REAL_INPUT/EVIDENCE/ENGINE`；需要已配置好的 AI 引擎 |
 | 已有 PSD 真实流程 | `WORKFLOW_IMPORT_REAL_SOURCE/EVIDENCE/ENGINE`；仅复制输入到新证据目录，验证接管、自动 PNG、AI、回写、恢复校验和裁切；`WORKFLOW_IMPORT_FLATTEN=1` 额外验证单层 Background PSD |
-| 人工定稿真实 PSD | `WORKFLOW_FINAL_SOURCE/EVIDENCE`，使用 WorkflowFinalPSDLiveTests 验证独立副本的保留／应用蒙版、4K 像素一致、双输出及未保存／旧版本保护。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 只读指定旧批次并复制受影响蒙版分析；新证据目录必须不存在 |
-| 微弱残留回写与裁切 | `WORKFLOW_RESIDUE_BATCH/EVIDENCE`，WorkflowResidueLiveTests 只读批次的蒙版与底图（默认 `222_V`，可用 `WORKFLOW_RESIDUE_NAME` 和 `WORKFLOW_RESIDUE_SIDE=D/V` 指定），在新目录建立 PSD 副本，回放已有蒙版经过生产清理、回写、裁切，直接核对默认选中成品的已保存图层边界、可恢复的蒙版备份及最终导出像素；不运行模型或修改原批次 |
+| 人工定稿真实 PSD | `WORKFLOW_FINAL_SOURCE/EVIDENCE`，使用 WorkflowFinalPSDLiveTests 验证独立副本的保留／应用蒙版、4K 像素一致、人工像素擦除与裁切保存后刷新／双输出，以及未保存／旧版本保护。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 只读指定旧批次并复制受影响蒙版分析；新证据目录必须不存在 |
+| 微弱残留回写与裁切 | `WORKFLOW_RESIDUE_BATCH/EVIDENCE`，WorkflowResidueLiveTests 只读批次的蒙版与底图（默认串行枚举整批两面，可用 `WORKFLOW_RESIDUE_NAME`（完整名称或编号前缀）和 `WORKFLOW_RESIDUE_SIDE=D/V` 缩小范围），在新目录建立 PSD 副本，回放已有蒙版经过生产清理、回写、裁切，直接核对默认选中成品的已保存图层边界、可恢复的蒙版备份及最终导出像素；不运行模型或修改原批次 |
 | 蒙版真实素材分析 | `TASK3_EVIDENCE_DIR`；还依赖 `/tmp/butterfly-task2-real/` 下的 `F/U-roles.json`、`F/U-saved.json` 及其引用文件 |
 | 渲染与发布计时 | `WORKFLOW_RENDER_BATCH/EVIDENCE`；批次须包含有效角色图像 |
 | 几何缓存计时 | `WORKFLOW_GEOMETRY_BATCH/EVIDENCE`；批次须包含角色图像与已保存几何方案 |
@@ -116,3 +116,9 @@ python3 scripts/version.py check
 - 真实素材几何、预览、渲染计时各自测量不同范围；它们不等于整批耗时、屏幕呈现延迟或人工画质验收。
 - 记录实际执行命令、选择的测试、失败和跳过原因，以及证据目录。构建、自动测试、真实环境运行和人工画质确认应分别报告。
 - 影响 AI 协议或进行候选择优交付时，还须在所选外部引擎环境运行 `scripts/test_toolkit_bridge.py` 全套回归；本仓库的版本工具测试不能替代引擎测试，具体入口以该引擎当前文档为准。
+
+### 残留清理回归
+
+`MaskResidueCleanupTests` 覆盖大淡斑、夹杂亮点的边带、实际轮廓距离、多主体、贴边与分离触角、半透明翅片、弱连接、取消和幂等性。`WorkflowCleanupReportTests` 覆盖旧记录解码、报告哈希、保存版本及首次自动裁切的位置变换；人工保存与 4K 输出同时由 Finalization、Geometry 和 AssetRenderer 测试验证。
+
+`WorkflowResidueLiveTests` 对每面单独建立证据子目录，保存清理报告、源文件哈希、裁切角度与留白、已保存透明成品边界、背景可恢复性及 4096 方形输出。`fixture-index.json` 记录原始和清理蒙版供逐项视觉核对。自动断言通过不等于细节质量已获用户认可。不要并行执行多个 Photoshop 真实入口。

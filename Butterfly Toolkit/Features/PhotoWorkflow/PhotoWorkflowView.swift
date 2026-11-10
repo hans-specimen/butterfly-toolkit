@@ -21,6 +21,8 @@ struct PhotoWorkflowView: View {
     @ObservedObject var store: PhotoWorkflowStore
     @State private var selectedDraftID: UUID?
     @State private var singleFace = false
+    @State private var cleanupReports: [UUID: (version: String,report: MaskCleanupReport?)] = [:]
+    @State private var showCleanupRegions = false
     @Environment(\.colorScheme) private var colorScheme
     private var panelBackground: Color { colorScheme == .dark ? Color(white: 0.16) : Color(nsColor: .windowBackgroundColor) }
     private var canvasBackground: Color { colorScheme == .dark ? Color(white: 0.13) : Color(nsColor: .textBackgroundColor) }
@@ -333,6 +335,41 @@ struct PhotoWorkflowView: View {
             } else { ContentUnavailableView("请选择标本",systemImage: "photo").frame(maxHeight: .infinity) }
         }.padding(24).background(canvasBackground)
     }
+    private func cleanupReport(for task: WorkflowSideTask) -> MaskCleanupReport? {
+        guard let snapshot = task.snapshot,snapshot.cleanupSnapshotVersion == snapshot.contentVersion,
+              cleanupReports[task.id]?.version == snapshot.contentVersion else { return nil }
+        return cleanupReports[task.id]?.report
+    }
+    private func cleanupRegions(for task: WorkflowSideTask) -> [CGRect] {
+        guard let report = cleanupReport(for: task),let snapshot = task.snapshot else { return [] }
+        return report.regions.filter { $0.decision == .uncertain }.map { snapshot.cleanupDisplayBounds($0.bounds) }
+    }
+    @ViewBuilder private func cleanupSummary(for task: WorkflowSideTask) -> some View {
+        let report = cleanupReport(for: task)
+        if let solution = task.geometrySolution {
+            let applied = store.usesFinalization || task[.geometry].state == .completed
+            Text(applied || !solution.isApplicable ? WorkflowCleanupStatus.title(solution: solution,report: report,targetMargin: task.geometryRequest.targetMargin) : "裁切方案待确认")
+                .font(.caption).foregroundStyle(solution.isApplicable ? Color.secondary : Color.primary)
+        }
+        if let report,let snapshot = task.snapshot {
+            let regions = report.regions.filter { $0.decision != .retainedDetail }
+            if !regions.isEmpty {
+                DisclosureGroup("蒙版清理详情 · 已清理 \(report.removedPixelCount) 像素") {
+                    VStack(alignment: .leading,spacing: 6) {
+                        if regions.contains(where: { $0.decision == .uncertain }) {
+                            Toggle("标出待检查区域",isOn: $showCleanupRegions).toggleStyle(.checkbox)
+                        }
+                        ForEach(Array(regions.enumerated()),id: \.offset) { _,region in
+                            Text(WorkflowCleanupStatus.message(region: region,bounds: snapshot.cleanupDisplayBounds(region.bounds),size: snapshot.pixelSize))
+                                .foregroundStyle(region.decision == .uncertain ? Color.primary : Color.secondary)
+                        }
+                    }.padding(.top,4)
+                }.font(.caption)
+            }
+        } else if let cached = cleanupReports[task.id],cached.version == task.snapshot?.contentVersion,task.snapshot?.cleanupReportURL != nil {
+            Text("清理报告暂不可用，请以当前 PSD 为准").font(.caption).foregroundStyle(.secondary)
+        }
+    }
     private func facePreview(_ task: WorkflowSideTask) -> some View {
         let active = store.face == task.side
         return VStack(alignment: .leading,spacing: 10) {
@@ -349,6 +386,7 @@ struct PhotoWorkflowView: View {
                         solution: active ? store.currentPreviewSolution : store.solutions[task.id] ?? task.geometrySolution,
                         square: store.stage == .png4k ? (active ? store.currentPreviewLayout : store.layouts[task.id] ?? task.squareLayout) : nil,
                         zoom: store.zoom,background: store.previewBackground,showSafeFrame: store.showSafeFrame,savedCanvasOnly: store.usesFinalization,
+                        cleanupRegions: showCleanupRegions ? cleanupRegions(for: task) : [],
                         interactionStarted: store.previewInteractionStarted[task.id],onSourcePoint: store.pickTip,onMoveChanged: store.updateMove,onMoveEnded: store.commitMove)
                         .allowsHitTesting(active)
                         .overlay(alignment: .topLeading) {
@@ -359,6 +397,15 @@ struct PhotoWorkflowView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 9))
                 .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(active ? Color.accentColor.opacity(0.65) : Color.secondary.opacity(0.2),lineWidth: active ? 2 : 1) }
                 .overlay { if !active { Color.clear.contentShape(Rectangle()).onTapGesture { store.face = task.side } } }
+            cleanupSummary(for: task)
+                .task(id: task.snapshot) {
+                    guard let snapshot = task.snapshot,snapshot.cleanupSnapshotVersion == snapshot.contentVersion else {
+                        cleanupReports[task.id] = nil; return
+                    }
+                    let report = await Task.detached(priority: .utility) { try? snapshot.validatedCleanupReport() }.value
+                    guard !Task.isCancelled else { return }
+                    cleanupReports[task.id] = (snapshot.contentVersion,report)
+                }
             Text("\(store.currentSpecimen?.baseName ?? "")_\(task.side.fileSuffix)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
             if store.stage == .stack || store.stage == .matte {
                 HStack(spacing: 6) {

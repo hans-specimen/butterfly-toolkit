@@ -534,25 +534,31 @@ final class WorkflowBridgeTests: XCTestCase {
         let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         XCTAssertEqual(files, ["owned.psd"], "No snapshot may be created during an unsaved edit")
     }
+    func testCleanupUsesEffectiveVisibilityWithoutMultiplyingRetainedMaskTwice() async throws {
+        try await assertResidueCleanup(standardSRGB: false,partialSource: true)
+    }
     func testInferenceClearsRemoteFaintAlphaAndCutoutBeforeWriteback() async throws {
         try await assertResidueCleanup(standardSRGB: false)
     }
     func testStandardSRGBMatteCleanupPreservesEmbeddedICC() async throws {
         try await assertResidueCleanup(standardSRGB: true)
     }
-    private func assertResidueCleanup(standardSRGB: Bool) async throws {
+    private func assertResidueCleanup(standardSRGB: Bool,partialSource: Bool = false) async throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let source = directory.appendingPathComponent("input.png"),alpha = directory.appendingPathComponent("alpha.png"),cutout = directory.appendingPathComponent("cutout.png")
         var values = [UInt8](repeating: 0,count: 10000)
         for y in 30..<70 { for x in 30..<70 { values[y*100+x] = 255 } }
         for y in 20..<30 { values[y*100+50] = 1 }
-        for x in 0..<100 { values[95*100+x] = 2 }
+        for y in 97..<100 { for x in 0..<100 { values[y*100+x] = 2 } }
+        if partialSource { values[5050] = 1; values[5051] = 128 }
         if standardSRGB {
             // 固定白色夹具只含标准 sRGB ICC，无用户照片；ImageIO 再编码会将该 ICC 简写为 sRGB 块。
             let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures/srgb-matte-input.png")
             try FileManager.default.copyItem(at: fixture,to: source)
         } else {
-            try png(source,width: 100,height: 100,pixels: Array(repeating: [UInt8](repeating: 255,count: 4),count: 10000).flatMap { $0 })
+            var inputPixels = [UInt8](repeating: 255,count: 40000)
+            if partialSource { inputPixels[5050*4+3] = 1; inputPixels[5051*4+3] = 128 }
+            try png(source,width: 100,height: 100,pixels: inputPixels)
         }
         try png(alpha,width: 100,height: 100,pixels: values.flatMap { [$0,$0,$0,255] },colorSpaceName: CGColorSpace.sRGB)
         try png(cutout,width: 100,height: 100,pixels: values.flatMap { [255,255,255,$0] },colorSpaceName: standardSRGB ? CGColorSpace.sRGB : CGColorSpace.adobeRGB1998)
@@ -562,10 +568,16 @@ final class WorkflowBridgeTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: ["inputSha256":input.fingerprint]).write(to: directory.appendingPathComponent("result.json"))
         let event = AIEvent(event: "completed",input: source.path,prediction: cutout.path,predictionAlpha: alpha.path)
         let result = try await WorkflowMatteService(engine: directory,workspace: directory,run: { _ in event }).infer(input: input)
+        let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(result)) as? [String:Any])
+        XCTAssertNotNil(encoded["cleanupReportURL"],"Every automatic result needs a bound diagnostic report")
         let a = try WorkflowRaster.read(result.alphaURL),c = try WorkflowRaster.read(result.cutoutURL)
-        XCTAssertEqual(a.pixels[9500*4],0); XCTAssertEqual(c.pixels[9500*4+3],0)
+        XCTAssertEqual(a.pixels[9900*4],0); XCTAssertEqual(c.pixels[9900*4+3],0)
         XCTAssertTrue(c.hasProfile); XCTAssertEqual(c.profileData,try WorkflowRaster.read(source).profileData)
         XCTAssertEqual(a.pixels[2050*4],1); XCTAssertEqual(c.pixels[2050*4+3],1)
+        if partialSource {
+            XCTAssertEqual(a.pixels[5050*4],0); XCTAssertEqual(c.pixels[5050*4+3],0)
+            XCTAssertEqual(a.pixels[5051*4],128); XCTAssertEqual(c.pixels[5051*4+3],128)
+        }
         try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(source),alpha: a,cutout: c)
         XCTAssertEqual(try Data(contentsOf: alpha),rawAlpha); XCTAssertEqual(try Data(contentsOf: cutout),rawCutout)
         XCTAssertEqual(try AIFileValidation.hash(result.alphaURL.path),result.alphaFingerprint)
@@ -1275,7 +1287,11 @@ final class WorkflowBridgeTests: XCTestCase {
         let color = CGColorSpace(name: colorSpaceName)!
         let provider = CGDataProvider(data: Data(pixels) as CFData)!
         let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4, space: color, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
-        let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+        // 负例反复替换同一路径；原子换文件，避免已解码图像的映射被就地覆盖。
+        let temporary = url.deletingLastPathComponent().appendingPathComponent("fixture-\(UUID()).png")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let destination = CGImageDestinationCreateWithURL(temporary as CFURL, UTType.png.identifier as CFString, 1, nil)!
         CGImageDestinationAddImage(destination, image, nil); XCTAssertTrue(CGImageDestinationFinalize(destination))
+        try Data(contentsOf: temporary).write(to: url,options: .atomic)
     }
 }
