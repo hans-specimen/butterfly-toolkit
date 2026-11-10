@@ -11,6 +11,11 @@ nonisolated enum WorkflowStage: String, Codable, CaseIterable, Sendable {
     static let processingStages: [Self] = [.stack, .matte, .geometry, .hd, .png4k]
 }
 
+nonisolated enum WorkflowMatteProvider: String, Codable, CaseIterable, Sendable {
+    case photoshop, aiEngine
+    var title: String { self == .photoshop ? "Photoshop 智能识别" : "AI 引擎" }
+}
+
 nonisolated enum WorkflowSide: String, Codable, CaseIterable, Sendable {
     case front, back
     var fileSuffix: String { self == .front ? "D" : "V" }
@@ -143,6 +148,13 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     var isPaused: Bool = false
     /// nil 保持旧批次行为；新流程必须经过人工定稿才可导出。
     var manualFinalization: Bool?
+    /// 缺字段的旧批次继续使用外部引擎及原 PSD 位置。
+    var matteProvider: WorkflowMatteProvider?
+    var psdSubdirectory: Bool?
+    var effectiveMatteProvider: WorkflowMatteProvider { matteProvider ?? .aiEngine }
+    var generatedPSDDirectory: URL {
+        psdSubdirectory == true ? sourceDirectory.appendingPathComponent(sourceDirectory.lastPathComponent + "_psd", isDirectory: true) : sourceDirectory
+    }
 
     var sideTasks: [WorkflowSideTask] { specimens.flatMap { [$0.front, $0.back] } }
     var activeTasks: [WorkflowSideTask] { specimens.filter { !$0.isExcluded }.flatMap { [$0.front, $0.back] } }
@@ -216,10 +228,10 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                    manualFinalization != true || Self.isContained(root,in: sourceDirectory) { return }
             }
         }
-        // 原图旁的 PSD 必须严格使用冻结后的标本名和正反面后缀。
+        // PSD 必须严格使用批次冻结的目录、标本名和正反面后缀。
         let allowed = specimens.flatMap { specimen in
             WorkflowSide.allCases.flatMap { side in
-                [side.fileSuffix,side.legacyFileSuffix].map { sourceDirectory.appendingPathComponent("\(specimen.baseName)_\($0).psd") }
+                [side.fileSuffix,side.legacyFileSuffix].map { generatedPSDDirectory.appendingPathComponent("\(specimen.baseName)_\($0).psd") }
             }
         }
         let imported = sideTasks.filter { $0.sources.isPSD }.map { $0.sources.first.url.standardizedFileURL }

@@ -71,7 +71,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
         return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
     }
-    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true,manualFinalization: Bool = false) throws -> WorkflowBatch {
+    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true,manualFinalization: Bool = false,matteProvider: WorkflowMatteProvider = .photoshop) throws -> WorkflowBatch {
         let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
         guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage(inputMode == .psd ? "请补齐 D/V 配对或明确排除未配对 PSD" : "请明确排除剩余未分组照片") }
@@ -99,6 +99,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,inputMode.filesPerSide),exclusionReason: group.excluded ? "建批次时排除" : nil)
         }
         var batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,outputLocations: locations,checkAfterStack: inputMode == .photos && checkStack,checkAfterMatte: checkMatte,checkGeometry: checkGeometry,check4K: check4K,specimens: specimens)
+        batch.matteProvider = matteProvider; batch.psdSubdirectory = true
         if manualFinalization { batch.manualFinalization = true; batch.checkAfterStack = false; batch.checkAfterMatte = false; batch.checkGeometry = true; batch.check4K = true }
         try batch.validate(); try batch.validateStart(); return batch
     }
@@ -113,6 +114,15 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var names = ""
     @Published var hdDirectory: URL?
     @Published var png4kDirectory: URL?
+    @Published var matteProvider: WorkflowMatteProvider = .photoshop
+    var effectiveMatteProvider: WorkflowMatteProvider { batch?.effectiveMatteProvider ?? matteProvider }
+    var workingPSDDirectory: URL? {
+        if let task = currentTask {
+            if let saved = task.snapshot { return saved.workingURL.deletingLastPathComponent() }
+            if task.sources.isPSD { return task.sources.first.url.deletingLastPathComponent() }
+        }
+        return batch?.generatedPSDDirectory
+    }
     @Published var enginePath = UserDefaults.standard.string(forKey: "aiEnginePath") ?? ""
     @Published var checkAfterStack = UserDefaults.standard.object(forKey: "workflowCheckStack") as? Bool ?? true {
         didSet { UserDefaults.standard.set(checkAfterStack,forKey: "workflowCheckStack") }
@@ -258,10 +268,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let outputDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Butterfly Toolkit/PhotoWorkflow/\(UUID().uuidString)", isDirectory: true)
         let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
-        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K
+        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K,provider = matteProvider
         launch { [self] in
-            guard FileManager.default.fileExists(atPath: URL(fileURLWithPath: enginePath).appendingPathComponent("scripts/toolkit_bridge.py").path) else { throw WorkflowBridgeError.invalidImage("请选择 butterfly-matte 引擎目录；仅本批次使用，不会改变 AI 工作区设置") }
-            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK,manualFinalization: true) }.value
+            guard provider != .aiEngine || FileManager.default.fileExists(atPath: URL(fileURLWithPath: enginePath).appendingPathComponent("scripts/toolkit_bridge.py").path) else { throw WorkflowBridgeError.invalidImage("请选择 butterfly-matte 引擎目录；仅本批次使用，不会改变 AI 工作区设置") }
+            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK,manualFinalization: true,matteProvider: provider) }.value
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)

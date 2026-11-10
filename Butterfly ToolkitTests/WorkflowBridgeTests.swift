@@ -730,6 +730,12 @@ final class WorkflowBridgeTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshot.snapshotURL),Data("initial-stack".utf8))
     }
     func testRecordedMattePublicationRecoversAfterPSDWasSavedBeforeOwnershipFinalization() async throws {
+        try await verifyRecordedMaskRecovery(photoshop: false)
+    }
+    func testRecordedPhotoshopSelectionRecoversWithoutAIArtifacts() async throws {
+        try await verifyRecordedMaskRecovery(photoshop: true)
+    }
+    private func verifyRecordedMaskRecovery(photoshop: Bool) async throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let document = directory.appendingPathComponent("owned.psd"),source = directory.appendingPathComponent("source.psd"),owner = UUID()
         let version = "9d022835c729988271c49048470eb33895c616efa58078153841079ae5f24fb3"
@@ -745,7 +751,9 @@ final class WorkflowBridgeTests: XCTestCase {
         try png(mask,width:2,height:2,pixels:[255,255,255,255,0,0,0,255,255,255,255,255,0,0,0,255])
         try png(cutout,width:2,height:2,pixels:[255,0,0,255,0,0,0,0,0,0,255,255,0,0,0,0])
         let matte = try MatteArtifact(inputPNGFingerprint:"input",alphaURL:mask,alphaFingerprint:AIFileValidation.hash(mask.path),cutoutURL:cutout,cutoutFingerprint:AIFileValidation.hash(cutout.path),orientation:1,pixelSize:CGSize(width:2,height:2))
-        let transaction: [String: Any] = ["sourceVersion":try AIFileValidation.hash(source.path),"result":try JSONSerialization.jsonObject(with:JSONEncoder().encode(prepared)),"matte":try JSONSerialization.jsonObject(with:JSONEncoder().encode(matte))]
+        var transaction: [String: Any] = ["sourceVersion":try AIFileValidation.hash(source.path),"result":try JSONSerialization.jsonObject(with:JSONEncoder().encode(prepared))]
+        if photoshop { transaction["photoshopSelection"] = true }
+        else { transaction["matte"] = try JSONSerialization.jsonObject(with:JSONEncoder().encode(matte)) }
         let ownership: [String: Any] = ["owner":owner.uuidString,"pendingInstall":transaction]
         let record = document.appendingPathExtension("workflow-owner.json")
         try JSONSerialization.data(withJSONObject:ownership).write(to:record)
@@ -792,9 +800,16 @@ final class WorkflowBridgeTests: XCTestCase {
         let stillPending = try JSONSerialization.jsonObject(with:Data(contentsOf:record)) as! [String:Any]
         XCTAssertNotNil(stillPending["pendingInstall"])
         await lease.endManualEditing(owner:owner)
-        let resumed = try await bridge.installMatte(snapshot:unchanged,matte:matte)
+        let resumed = try await (photoshop ? bridge.selectSubject(snapshot: unchanged) : bridge.installMatte(snapshot:unchanged,matte:matte))
         XCTAssertEqual(resumed.roles,roles);XCTAssertEqual(resumed.contentVersion,prepared.contentVersion)
         _ = try await bridge.extractRoles(snapshot:resumed)
+        if photoshop {
+            // The process can stop after clearing pendingInstall but before the batch saves its snapshot.
+            let reopened = try await bridge.selectSubject(snapshot: unchanged)
+            XCTAssertEqual(reopened.contentVersion, resumed.contentVersion)
+            try Data("manual-save-after-publish".utf8).write(to: document)
+            await rejects { _ = try await bridge.selectSubject(snapshot: unchanged) }
+        }
         let operations = await calls.values()
         XCTAssertEqual(operations,[1],"Both publication checkpoints reuse the prepared extraction and never reinstall")
     }

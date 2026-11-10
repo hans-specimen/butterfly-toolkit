@@ -41,7 +41,12 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     private struct InstallTransaction: Codable, Sendable {
         var sourceVersion: String
         var result: PSDSnapshot
-        var matte: MatteArtifact
+        var matte: MatteArtifact?
+        var photoshopSelection: Bool?
+    }
+    private struct SubjectPublication: Codable, Sendable {
+        var sourceVersion: String
+        var resultVersion: String
     }
     private struct Ownership: Codable, Sendable {
         var owner: UUID
@@ -49,6 +54,7 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         var sources: [WorkflowSourceFile]?
         var initialStackVersion: String?
         var pendingInstall: InstallTransaction?
+        var subjectPublication: SubjectPublication?
     }
     private struct RoleCache: Codable {
         var snapshot: PSDSnapshot
@@ -209,26 +215,45 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     }
     // MARK: - 蒙版事务与发布恢复
     func installMatte(snapshot: PSDSnapshot, matte: MatteArtifact, createFinishedLayer: Bool = false) async throws -> PSDSnapshot {
+        try await install(snapshot: snapshot, matte: matte, createFinishedLayer: createFinishedLayer)
+    }
+    func selectSubject(snapshot: PSDSnapshot) async throws -> PSDSnapshot {
+        try await install(snapshot: snapshot, matte: nil, createFinishedLayer: false)
+    }
+    private func install(snapshot: PSDSnapshot, matte: MatteArtifact?, createFinishedLayer: Bool) async throws -> PSDSnapshot {
         try await withLease("install", owner: snapshot.taskID, savedRead: false) {
             let record = ownershipURL(snapshot.workingURL)
             var ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: record))
             if let pending = ownership.pendingInstall {
                 guard ownership.owner == snapshot.taskID, pending.sourceVersion == snapshot.contentVersion,
-                      pending.matte == matte else { throw WorkflowBridgeError.staleSource }
+                      pending.matte == matte, matte != nil || pending.photoshopSelection == true else { throw WorkflowBridgeError.staleSource }
                 guard let saved = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true, captureResult: true) else { throw WorkflowBridgeError.invalidStructure }
                 return saved
             }
-            try await verify(snapshot)
-            guard snapshot.roles == nil, matte.pixelSize == snapshot.pixelSize, matte.orientation == 1,
-                  try hash(matte.alphaURL.path) == matte.alphaFingerprint,
-                  try hash(matte.cutoutURL.path) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
-            let inputDirectory = workspace.appendingPathComponent("data/processed/\(snapshot.taskID.uuidString)")
-            let inputs = (try? FileManager.default.contentsOfDirectory(at: inputDirectory, includingPropertiesForKeys: nil)) ?? []
-            guard let inputURL = inputs.first(where: { $0.lastPathComponent.hasPrefix(snapshot.contentVersion) && (try? hash($0.path)) == matte.inputPNGFingerprint }) else {
-                throw WorkflowBridgeError.staleSource
+            // PSD 发布成功后清单仍可能保留旧快照；只能复用此次发布的确切结果。
+            if matte == nil, let published = ownership.subjectPublication {
+                guard ownership.owner == snapshot.taskID, published.sourceVersion == snapshot.contentVersion,
+                      try hash(snapshot.snapshotURL.path) == published.sourceVersion,
+                      try hash(snapshot.workingURL.path) == published.resultVersion else { throw WorkflowBridgeError.staleSource }
+                let saved = try await capture(document: snapshot.workingURL, owner: snapshot.taskID)
+                guard saved.contentVersion == published.resultVersion else { throw WorkflowBridgeError.staleSource }
+                try await validateSubjectMask(saved)
+                return saved
             }
-            try measure("pixel.validateMatte-including-read") {
-                try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
+            try await verify(snapshot)
+            guard snapshot.roles == nil else { throw WorkflowBridgeError.invalidStructure }
+            if let matte {
+                guard matte.pixelSize == snapshot.pixelSize, matte.orientation == 1,
+                      try hash(matte.alphaURL.path) == matte.alphaFingerprint,
+                      try hash(matte.cutoutURL.path) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+                let inputDirectory = workspace.appendingPathComponent("data/processed/\(snapshot.taskID.uuidString)")
+                let inputs = (try? FileManager.default.contentsOfDirectory(at: inputDirectory, includingPropertiesForKeys: nil)) ?? []
+                guard let inputURL = inputs.first(where: { $0.lastPathComponent.hasPrefix(snapshot.contentVersion) && (try? hash($0.path)) == matte.inputPNGFingerprint }) else {
+                    throw WorkflowBridgeError.staleSource
+                }
+                try measure("pixel.validateMatte-including-read") {
+                    try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(inputURL), alpha: readRaster(matte.alphaURL), cutout: readRaster(matte.cutoutURL))
+                }
             }
             // 先在独立副本中准备并校验，失败时不会改变工作 PSD 及其归属。
             let staged = try outputDirectory("install/\(UUID())", owner: snapshot.taskID).appendingPathComponent("result.psd")
@@ -237,15 +262,16 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try JSONEncoder().encode(ownership).write(to: ownershipURL(staged), options: .withoutOverwriting)
             let originalOwnership = ownership
             let prepared = try await withOpenDocument(at: staged) {
-                let metadata = try await invoke(Self.installScript(document: staged, alpha: matte.alphaURL, createFinishedLayer: createFinishedLayer))
+                let metadata = try await invoke(Self.installScript(document: staged, alpha: matte?.alphaURL, createFinishedLayer: createFinishedLayer))
                 guard let roles = metadata.roles, roles.isValid else { throw WorkflowBridgeError.invalidStructure }
                 var stagedOwnership = originalOwnership; stagedOwnership.roles = roles
                 try JSONEncoder().encode(stagedOwnership).write(to: ownershipURL(staged), options: .atomic)
                 return try await capture(document: staged, owner: snapshot.taskID)
             }
-            try await validateInstalledMask(prepared, matte: matte)
+            if let matte { try await validateInstalledMask(prepared, matte: matte) }
+            else { try await validateSubjectMask(prepared) }
             try await verify(snapshot)
-            ownership.pendingInstall = InstallTransaction(sourceVersion: snapshot.contentVersion, result: prepared, matte: matte)
+            ownership.pendingInstall = InstallTransaction(sourceVersion: snapshot.contentVersion, result: prepared, matte: matte, photoshopSelection: matte == nil ? true : nil)
             try JSONEncoder().encode(ownership).write(to: record, options: .atomic)
             try await installCheckpoint(.prepared)
             guard let saved = try await recoverInstall(document: snapshot.workingURL, owner: snapshot.taskID, allowPublication: true, captureResult: true) else { throw WorkflowBridgeError.invalidStructure }
@@ -259,10 +285,14 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
         guard ownership.owner == owner else { throw WorkflowBridgeError.ownershipConflict }
         guard let pending = ownership.pendingInstall else { return nil }
         guard ownership.roles == nil, pending.result.taskID == owner, pending.result.roles?.isValid == true,
-              pending.result.pixelSize == pending.matte.pixelSize,
-              try hash(pending.result.snapshotURL.path) == pending.result.contentVersion,
-              (try hash(pending.matte.alphaURL.path)) == pending.matte.alphaFingerprint,
-              (try hash(pending.matte.cutoutURL.path)) == pending.matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+              try hash(pending.result.snapshotURL.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
+        if let matte = pending.matte {
+            guard pending.result.pixelSize == matte.pixelSize,
+                  try hash(matte.alphaURL.path) == matte.alphaFingerprint,
+                  try hash(matte.cutoutURL.path) == matte.cutoutFingerprint else { throw WorkflowBridgeError.staleSource }
+        } else {
+            guard pending.photoshopSelection == true else { throw WorkflowBridgeError.staleSource }
+        }
         let current = try hash(document.path)
         if current == pending.sourceVersion {
             // 人工编辑期间读取保存结果，不得触发自动 PSD 写入发布。
@@ -286,13 +316,28 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
                   metadata.width == pending.result.pixelSize.width, metadata.height == pending.result.pixelSize.height,
                   try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.invalidStructure }
             var published = pending.result; published.workingURL = document
-            try await validateInstalledMask(published, matte: pending.matte)
+            if let matte = pending.matte { try await validateInstalledMask(published, matte: matte) }
+            else { try await validateSubjectMask(published) }
             guard try hash(document.path) == pending.result.contentVersion else { throw WorkflowBridgeError.staleSource }
             var completedOwnership = previousOwnership
             completedOwnership.roles = pending.result.roles; completedOwnership.pendingInstall = nil
+            if pending.photoshopSelection == true {
+                completedOwnership.subjectPublication = SubjectPublication(sourceVersion: pending.sourceVersion, resultVersion: pending.result.contentVersion)
+            }
             try JSONEncoder().encode(completedOwnership).write(to: record, options: .atomic)
             return captureResult ? try await capture(document: document, owner: owner) : nil
         }
+    }
+
+    /// 只验证原生蒙版及成像一致性，不清理或改写 Photoshop 选择的任何像素。
+    private func validateSubjectMask(_ snapshot: PSDSnapshot) async throws {
+        let roles = try await extractUnlocked(snapshot)
+        let mask = try readRaster(roles.maskPNG)
+        guard stride(from: 0, to: mask.pixels.count, by: 4).contains(where: { mask.pixels[$0] > 0 }) else {
+            throw WorkflowBridgeError.invalidImage("Photoshop 未识别到主体，请检查合成底图")
+        }
+        try WorkflowRaster.validateMatte(original: readRaster(roles.basePNG), alpha: mask,
+            cutout: readRaster(roles.cutoutPNG), respectSourceAlpha: true)
     }
 
     private func validateInstalledMask(_ snapshot: PSDSnapshot, matte: MatteArtifact) async throws {
@@ -791,8 +836,24 @@ extension PhotoshopWorkflowBridge {
         "var o=wfOpen(" + quote(document.resolvingSymlinksInPath().path) + ");try{" +
         stackPNGBody(document: "o.doc", output: output) + "}finally{wfClose(o);}"
     }
-    private static func installScript(document: URL, alpha: URL, createFinishedLayer: Bool) -> String {
+    // 在当前合成像素层上识别，空选区不能退化为全白蒙版。
+    static let selectSubjectSelectionScript = """
+        wfSelectRGB();doc.selection.deselect();
+        var subject=new ActionDescriptor();subject.putBoolean(stringIDToTypeID('sampleAllLayers'),false);
+        executeAction(stringIDToTypeID('autoCutout'),subject,DialogModes.NO);
+        try { var subjectBounds=doc.selection.bounds; }
+        catch(e) { throw new Error('Photoshop 未识别到主体，请检查合成底图'); }
         """
+    private static func installScript(document: URL, alpha: URL?, createFinishedLayer: Bool) -> String {
+        let selection: String
+        if let alpha {
+            selection = """
+            maskDoc=wfOpenFile(new File(\(quote(alpha.path))));var imported=maskDoc.channels[0].duplicate(doc);
+            wfCloseDocument(maskDoc);maskDoc=null;
+            app.activeDocument=doc;doc.activeLayer=cutout;doc.selection.load(imported);
+            """
+        } else { selection = selectSubjectSelectionScript }
+        return """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),copy=null,maskDoc=null,doc=o.doc;
         var dialogs=app.displayDialogs;app.displayDialogs=DialogModes.NO;
         try {
@@ -809,13 +870,11 @@ extension PhotoshopWorkflowBridge {
             app.activeDocument=copy;merged.duplicate(doc,ElementPlacement.PLACEATBEGINNING);
             app.activeDocument=doc;var base=doc.activeLayer;base.name='底图';base.move(adjust,ElementPlacement.INSIDE);
             var cutout=base.duplicate();cutout.name='抠图';base.visible=false;cutout.visible=true;doc.activeLayer=cutout;
-            maskDoc=wfOpenFile(new File(\(quote(alpha.path))));var imported=maskDoc.channels[0].duplicate(doc);
-            wfCloseDocument(maskDoc);maskDoc=null;
-            app.activeDocument=doc;doc.activeLayer=cutout;doc.selection.load(imported);
+            \(selection)
             var make=new ActionDescriptor(),ref=new ActionReference();make.putClass(charIDToTypeID('Nw  '),charIDToTypeID('Chnl'));
             ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));make.putReference(charIDToTypeID('At  '),ref);
             make.putEnumerated(charIDToTypeID('Usng'),charIDToTypeID('UsrM'),charIDToTypeID('RvlS'));executeAction(charIDToTypeID('Mk  '),make,DialogModes.NO);
-            doc.selection.deselect();imported.remove();wfSelectRGB();
+            doc.selection.deselect();if(typeof imported!=='undefined')imported.remove();wfSelectRGB();
             if(\(createFinishedLayer ? "true" : "false"))wfMakeFinished(doc,wfRoles(doc));
             wfSave(doc);return wfJSON(wfMetadata(doc));
         }finally{if(maskDoc)wfCloseDocument(maskDoc);if(copy)wfCloseDocument(copy);app.displayDialogs=dialogs;wfClose(o);}

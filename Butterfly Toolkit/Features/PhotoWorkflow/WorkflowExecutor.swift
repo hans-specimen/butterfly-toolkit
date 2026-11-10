@@ -26,6 +26,7 @@ actor WorkflowExecutor {
         var contentFingerprint: @Sendable (RoleImages) async throws -> String
         var validateInstalledMatte: @Sendable (RoleImages, StackPNG, MatteArtifact) async throws -> Void
 
+        var selectSubject: (@Sendable (PSDSnapshot) async throws -> PSDSnapshot)? = nil
         var validateStackInput: (@Sendable (PSDSnapshot, StackPNG) async throws -> Bool)? = nil
         var finalize: (@Sendable (URL, UUID) async throws -> PSDSnapshot)? = nil
         var installForFinalization: (@Sendable (PSDSnapshot, MatteArtifact) async throws -> PSDSnapshot)? = nil
@@ -79,6 +80,7 @@ actor WorkflowExecutor {
                     try WorkflowRaster.validateMatte(original: WorkflowRaster.readMatteInput(input.pngURL),alpha: expectedMask,cutout: expectedCutout)
                     try WorkflowRaster.validateMatte(original: base,alpha: mask,cutout: cutout,respectSourceAlpha: true)
                 }.value },adoptStack: { try await bridge.adoptStack(source: $0,owner: $1) },endInferenceSession: { await matte.shutdown() })
+            services.selectSubject = { try await bridge.selectSubject(snapshot: $0) }
             services.finalize = { try await bridge.captureFinalPSD(document: $0,owner: $1) }
             services.installForFinalization = { try await bridge.installMatte(snapshot: $0,matte: $1,createFinishedLayer: true) }
             services.applyForFinalization = { try await bridge.applyGeometry(snapshot: $0,solution: $1,createFinishedLayer: true) }
@@ -369,7 +371,7 @@ actor WorkflowExecutor {
                     let ids = value.activeTasks.filter { $0[stage].state == .pending && eligible($0,stage: stage,batch: value) }.map(\.id)
                     if !ids.isEmpty {
                         let limit = stage == .matte ? matteLimit : (stage == .hd || stage == .png4k ? exportLimit : 1)
-                        if stage == .matte && matteScheduling == .phased { try await runPhasedMatte(batchID: batchID) }
+                        if stage == .matte && matteScheduling == .phased && value.effectiveMatteProvider == .aiEngine { try await runPhasedMatte(batchID: batchID) }
                         else { try await runStageTasks(batchID: batchID,stage: stage,taskIDs: ids,limit: limit) }
                         advanced = true
                     }
@@ -702,7 +704,7 @@ actor WorkflowExecutor {
                 let value = try batch(batchID: batchID)
                 let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
                 if before.stackAttemptURL == nil {
-                    let attempt = before.sources.isPSD ? before.sources.first.url : value.sourceDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
+                    let attempt = before.sources.isPSD ? before.sources.first.url : value.generatedPSDDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
                     try value.validateOutputURL(attempt)
                     try mutateTask(batchID,id) { $0.stackAttemptURL = attempt }; try await persist(batchID)
                     before = try task(batchID,id)
@@ -721,7 +723,7 @@ actor WorkflowExecutor {
                         guard try AIFileValidation.hash(source.url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
                     }
                     let job = FocusStackJob(id: 0,sourceFiles: before.sources.files.map(\.url),destinationURL: url,butterflyName: specimen.baseName,side: before.side.fileSuffix)
-                    if let prepare = services.stackWithInput {
+                    if value.effectiveMatteProvider == .aiEngine, let prepare = services.stackWithInput {
                         let result = try await prepare(job,id)
                         saved = result.snapshot; prepared = result.input
                     } else { saved = try await services.stack(job,id) }
@@ -741,6 +743,9 @@ actor WorkflowExecutor {
                 var saved: PSDSnapshot
                 if snapshot.roles != nil {
                     _ = try await services.extract(snapshot); saved = snapshot
+                } else if try batch(batchID: batchID).effectiveMatteProvider == .photoshop {
+                    guard let selectSubject = services.selectSubject else { throw WorkflowStateError.invalidTransition }
+                    saved = try await selectSubject(snapshot)
                 } else {
                     let input: StackPNG
                     var cached = before.stackPNG
@@ -816,7 +821,8 @@ actor WorkflowExecutor {
                 if try batch(batchID: batchID).manualFinalization == true,solution.isApplicable {
                     try mutateTask(batchID,id) { $0.geometryApplySourceVersion = saved.contentVersion }
                     try await persist(batchID)
-                    let applied = try await (services.applyForFinalization ?? services.apply)(saved,solution).carryingCleanup(from: saved,geometry: solution)
+                    let apply = try batch(batchID: batchID).effectiveMatteProvider == .photoshop ? services.apply : (services.applyForFinalization ?? services.apply)
+                    let applied = try await apply(saved,solution).carryingCleanup(from: saved,geometry: solution)
                     try check(batchID,before,stage: stage)
                     let extracted = try await services.extract(applied)
                     try check(batchID,before,stage: stage)

@@ -7,7 +7,7 @@ import ImageIO
 // MARK: - 阶段与状态显示
 extension WorkflowStage {
     var title: String {
-        switch self { case .stack: "景深合成"; case .matte: "AI 抠图与回写"; case .geometry: "旋转裁切"; case .hd: "堆栈原图"; case .png4k: "4K PNG"; case .derivatives: "派生图片" }
+        switch self { case .stack: "景深合成"; case .matte: "AI 抠图"; case .geometry: "旋转裁切"; case .hd: "堆栈原图"; case .png4k: "4K PNG"; case .derivatives: "派生图片" }
     }
 }
 extension WorkflowStatus {
@@ -45,7 +45,7 @@ struct PhotoWorkflowView: View {
                 if store.batch != nil {
                     Button("关闭批次／新建") { store.closeBatch() }.disabled(store.busy || store.manualTaskID != nil)
                     Menu("查看文件") {
-                        if let url = store.batch?.sourceDirectory { Button("工作 PSD") { NSWorkspace.shared.open(url) } }
+                        if let url = store.workingPSDDirectory { Button("工作 PSD") { NSWorkspace.shared.open(url) } }
                         if let url = store.exportDirectory(for: .hd) { Button("堆栈原图") { NSWorkspace.shared.open(url) } }
                         if let url = store.exportDirectory(for: .png4k) { Button("PNG4K") { NSWorkspace.shared.open(url) } }
                         if let url = store.batch?.outputDirectory { Button("批次记录") { NSWorkspace.shared.open(url) } }
@@ -169,7 +169,7 @@ struct PhotoWorkflowView: View {
                     VStack(spacing: 16) {
                         Image(systemName: "photo.on.rectangle.angled").font(.system(size: 42,weight: .light)).foregroundStyle(.tertiary)
                         Text(store.inputMode == .psd ? "导入已合成的 PSD" : "导入第一批蝴蝶照片").font(.title3.weight(.semibold))
-                        Text(store.inputMode == .psd ? "按 文件名_D.psd / 文件名_V.psd 配对。\n自动准备临时 PNG，继续 AI 抠图和裁切矫正。" : "每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
+                        Text(store.inputMode == .psd ? "按 文件名_D.psd / 文件名_V.psd 配对。\n选择抠图方式，继续 AI 抠图和裁切矫正。" : "每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
                             .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Button("选择输入文件夹…",systemImage: "folder") { chooseFolder { store.scan($0) } }.controlSize(.large)
                     }.frame(maxWidth: .infinity).padding(.vertical,100)
@@ -196,7 +196,7 @@ struct PhotoWorkflowView: View {
             Divider()
             inspectorSection("批次目录",icon: "folder") {
                 directoryControl(store.inputMode == .psd ? "已合成 PSD" : "原始照片",url: store.draft?.directory,placeholder: store.inputMode == .psd ? "选择包含 D/V 配对 PSD 的文件夹" : "选择 JPG / JPEG 文件夹") { chooseFolder { store.scan($0) } }
-                Text(store.inputMode == .psd ? "处理结果直接保存回原 PSD，首次写入前保留原始快照。临时 PNG 自动准备并在蒙版回写后清理。" : "PSD 自动保存在原始照片文件夹。AI 临时 PNG 在蒙版回写完成后自动清理。").font(.caption).foregroundStyle(.secondary)
+                Text(store.inputMode == .psd ? "处理结果直接保存回原 PSD，首次写入前保留原始快照。" : "PSD 自动保存在原照片文件夹内的「原文件夹名_psd」子文件夹。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             inspectorSection("名称清单",icon: "text.alignleft") {
@@ -211,12 +211,19 @@ struct PhotoWorkflowView: View {
             Divider()
             exportLocations
             Divider()
-            inspectorSection("AI 引擎",icon: "sparkles") {
-                HStack(spacing: 8) {
-                    TextField("butterfly-matte 目录",text: $store.enginePath).textFieldStyle(.roundedBorder)
-                    Button("选择") { chooseFolder { store.enginePath = $0.path } }
+            inspectorSection("抠图方式",icon: "sparkles") {
+                Picker("抠图方式",selection: $store.matteProvider) {
+                    ForEach(WorkflowMatteProvider.allCases,id: \.self) { Text($0.title).tag($0) }
+                }.labelsHidden()
+                if store.matteProvider == .aiEngine {
+                    HStack(spacing: 8) {
+                        TextField("butterfly-matte 目录",text: $store.enginePath).textFieldStyle(.roundedBorder)
+                        Button("选择") { chooseFolder { store.enginePath = $0.path } }
+                    }
+                    Text("仅用于本批次").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("在合成底图上识别主体，保留蒙版供手动调整。").font(.caption).foregroundStyle(.secondary)
                 }
-                Text("仅用于本批次").font(.caption).foregroundStyle(.secondary)
             }
         }.frame(maxWidth: .infinity,alignment: .leading).toggleStyle(.checkbox)
     }
@@ -511,8 +518,12 @@ struct PhotoWorkflowView: View {
                     LabeledContent("构图后检查",value: b.checkGeometry != false ? "开启" : "关闭")
                     LabeledContent("4K 导出前检查",value: b.check4K != false ? "开启" : "关闭")
                 }
-                directoryControl("AI 引擎",url: store.enginePath.isEmpty ? nil : URL(fileURLWithPath: store.enginePath),placeholder: "尚未配置") { chooseFolder { store.configureEngine($0) } }
-                    .disabled(store.manualTaskID != nil)
+                LabeledContent("抠图方式",value: store.effectiveMatteProvider.title)
+                Text("新建批次时可选择抠图方式。").font(.caption).foregroundStyle(.secondary)
+                if store.effectiveMatteProvider == .aiEngine {
+                    directoryControl("AI 引擎",url: store.enginePath.isEmpty ? nil : URL(fileURLWithPath: store.enginePath),placeholder: "尚未配置") { chooseFolder { store.configureEngine($0) } }
+                        .disabled(store.manualTaskID != nil)
+                }
             }.font(.callout)
         }.toggleStyle(.checkbox).disabled(store.busy)
     }
@@ -575,7 +586,11 @@ struct PhotoWorkflowView: View {
             if store.usesFinalization {
                 Text("可反复打开修改。最终读取「共同调整」里的「底图」和最上方可见透明像素图层；其余备份图层不参与导出。").font(.caption).foregroundStyle(.secondary)
                 Button("刷新保存结果") { store.refreshSaved() }.disabled(!store.canOpenPSD || (store.manualTaskID != nil && store.manualTaskID != store.currentTask?.id))
-                Text("可直接修改「透明成品」。如需修改蒙版，显示「抠图」备份并隐藏旧成品；修改后复制备份、应用蒙版，将副本置顶显示，隐藏备份。保存后刷新，不会自动覆盖人工修改。").font(.caption).foregroundStyle(.secondary)
+                if store.effectiveMatteProvider == .photoshop {
+                    Text("直接调整「抠图」图层的蒙版，保存后刷新即可。无需应用蒙版；导出读取当前保存的抠图效果。").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("可直接修改「透明成品」。如需修改蒙版，显示「抠图」备份并隐藏旧成品；修改后复制备份、应用蒙版，将副本置顶显示，隐藏备份。保存后刷新，不会自动覆盖人工修改。").font(.caption).foregroundStyle(.secondary)
+                }
             } else if store.manualTaskID != nil {
                 Text("自动队列已保留给人工编辑。请先在 PS 保存，再分类刷新。").font(.caption).foregroundStyle(.orange)
                 Picker("这次保存改变了",selection: $store.manualChange) { Text("仅蒙版").tag(WorkflowPSDChange.maskOnly); Text("角度／画布").tag(WorkflowPSDChange.geometry); Text("堆栈内容").tag(WorkflowPSDChange.stackContent) }
