@@ -125,6 +125,34 @@ final class WorkflowPhotoshopMatteTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: batch.generatedPSDDirectory, withDestinationURL: outside)
         XCTAssertThrowsError(try batch.validateOutputURL(allowed))
     }
+    func testRoleValidationAcceptsOnlyOptionalBottomPreviewBackground() throws {
+        let context = try XCTUnwrap(JSContext())
+        let script = PhotoshopWorkflowBridge.stackInputExportScript(output: URL(fileURLWithPath: "/tmp/unused.png"))
+        let invocation = try XCTUnwrap(script.range(of: "\ntry{(function(){"))
+        context.evaluateScript(String(script[..<invocation.lowerBound]))
+        XCTAssertNil(context.exception)
+        // Photoshop 图层属性由宿主提供；执行实际角色校验，保留旧双组兼容并拒绝任意第三层。
+        context.evaluateScript("""
+        wfHasMask=function(l){return !!l.mask;};wfBounds=function(){return [0,0,100,100];};
+        var base={id:1,name:'底图',typename:'ArtLayer'},cutout={id:2,name:'抠图',typename:'ArtLayer',mask:true};
+        var original={id:3,name:'原始堆栈',typename:'LayerSet'};
+        var adjust={id:4,name:'共同调整',typename:'LayerSet',layers:[cutout,base]};
+        var LayerKind={SOLIDFILL:'solidFill',NORMAL:'normal'};
+        var bg={id:5,name:'BG',typename:'ArtLayer',kind:LayerKind.SOLIDFILL};
+        var doc={layers:[adjust,original]};
+        """)
+        XCTAssertFalse(context.evaluateScript("wfIsPreviewBackground({name:'BG',typename:'ArtLayer',kind:LayerKind.NORMAL})")?.toBool() ?? true,
+            "Imported PSD content may legitimately be a normal pixel layer named BG")
+        XCTAssertEqual(context.evaluateScript("wfRoles(doc).ids.cutoutLayer")?.toString(), "2")
+        context.evaluateScript("doc.layers=[adjust,original,bg];")
+        XCTAssertEqual(context.evaluateScript("wfRoles(doc).ids.cutoutLayer")?.toString(), "2")
+        XCTAssertNil(context.exception)
+        for layers in ["[bg,adjust,original]", "[adjust,original,{name:'Unexpected',typename:'ArtLayer'}]", "[adjust,original,bg,bg]"] {
+            context.exception = nil
+            context.evaluateScript("doc.layers=\(layers);wfRoles(doc);")
+            XCTAssertTrue(context.exception?.toString()?.contains("WORKFLOW_STRUCTURE") == true)
+        }
+    }
     func testSelectSubjectUsesOnlyActiveLayerAndRejectsEmptySelection() throws {
         let context = try XCTUnwrap(JSContext())
         context.evaluateScript("""

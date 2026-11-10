@@ -702,6 +702,9 @@ extension PhotoshopWorkflowBridge {
         if (!d.hasKey(key)) key=stringIDToTypeID('bounds');
         var b=d.getObjectValue(key);return [b.getUnitDoubleValue(stringIDToTypeID('left')),b.getUnitDoubleValue(stringIDToTypeID('top')),b.getUnitDoubleValue(stringIDToTypeID('right')),b.getUnitDoubleValue(stringIDToTypeID('bottom'))];
     }
+    function wfIsPreviewBackground(layer) {
+        return layer.typename==='ArtLayer' && (layer.name==='Background #74BFFF' || (layer.name==='BG' && layer.kind===LayerKind.SOLIDFILL));
+    }
     function wfRoles(doc) {
         var original=null,adjust=null,base=null,cutout=null,finished=null,count=0;
         for(var i=0;i<doc.layers.length;i++) {
@@ -710,7 +713,9 @@ extension PhotoshopWorkflowBridge {
             if(l.name==='共同调整' && l.typename==='LayerSet') { adjust=l;count++; }
         }
         if(count===0) return null;
-        if(count!==2 || !original || !adjust || doc.layers.length!==2 || (adjust.layers.length!==2 && adjust.layers.length!==3)) throw new Error('WORKFLOW_STRUCTURE');
+        var background=doc.layers.length===3 ? doc.layers[2] : null;
+        var validRoot=doc.layers.length===2 || (background && background.name==='BG' && wfIsPreviewBackground(background));
+        if(count!==2 || !original || !adjust || !validRoot || (adjust.layers.length!==2 && adjust.layers.length!==3)) throw new Error('WORKFLOW_STRUCTURE');
         for(var j=0;j<adjust.layers.length;j++) {
             var a=adjust.layers[j]; if(a.name==='底图' && a.typename==='ArtLayer') base=a;
             if(a.name==='抠图' && a.typename==='ArtLayer') cutout=a;
@@ -827,7 +832,7 @@ extension PhotoshopWorkflowBridge {
         var copy=null;
         try {copy=wfDuplicate(\(document));app.activeDocument=copy;var r=wfRoles(copy);
             if(r){wfHideAll(copy);r.adjust.visible=true;r.base.visible=true;r.cutout.visible=false;if(r.finished)r.finished.visible=false;}
-            else {for(var i=0;i<copy.layers.length;i++) if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].visible=false;}
+            else {for(var i=0;i<copy.layers.length;i++) if(wfIsPreviewBackground(copy.layers[i]))copy.layers[i].visible=false;}
             wfStackPNG(copy,\(quote(output.path)));return wfJSON(wfMetadata(copy));
         }finally{if(copy)wfCloseDocument(copy);}
         """
@@ -859,13 +864,19 @@ extension PhotoshopWorkflowBridge {
         try {
             if(wfRoles(doc))throw new Error('WORKFLOW_STRUCTURE');
             copy=wfDuplicate(doc);app.activeDocument=copy;
-            for(var i=0;i<copy.layers.length;i++)if(copy.layers[i].name==='Background #74BFFF')copy.layers[i].remove();
+            for(var i=copy.layers.length-1;i>=0;i--)if(wfIsPreviewBackground(copy.layers[i])){copy.layers[i].allLocked=false;copy.layers[i].remove();}
             // 透明辅助层让单层或单个可见组也能无损合并；只存在于可丢弃副本。
             copy.artLayers.add();copy.mergeVisibleLayers();var merged=copy.activeLayer;
-            app.activeDocument=doc;var old=[];for(var j=0;j<doc.layers.length;j++)old.push(doc.layers[j]);
+            app.activeDocument=doc;var old=[],background=null;
+            for(var j=0;j<doc.layers.length;j++){
+                if(wfIsPreviewBackground(doc.layers[j])){if(background)throw new Error('WORKFLOW_STRUCTURE');background=doc.layers[j];}
+                else old.push(doc.layers[j]);
+            }
             var original=doc.layerSets.add();original.name='原始堆栈';
             for(var k=old.length-1;k>=0;k--){if(old[k].typename==='ArtLayer'&&old[k].isBackgroundLayer)old[k].isBackgroundLayer=false;old[k].move(original,ElementPlacement.INSIDE);}
             original.visible=false;
+            // 预览背景独立留在根目录底层，不随原始堆栈隐藏，也不进入合成底图或蒙版。
+            if(background){background.allLocked=false;background.name='BG';background.move(original,ElementPlacement.PLACEAFTER);background.visible=true;background.allLocked=true;}
             var adjust=doc.layerSets.add();adjust.name='共同调整';
             app.activeDocument=copy;merged.duplicate(doc,ElementPlacement.PLACEATBEGINNING);
             app.activeDocument=doc;var base=doc.activeLayer;base.name='底图';base.move(adjust,ElementPlacement.INSIDE);

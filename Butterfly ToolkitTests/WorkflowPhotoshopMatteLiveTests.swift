@@ -43,6 +43,16 @@ import XCTest
         services.install = { _,_ in XCTFail("PS path installed AI matte"); throw WorkflowStateError.invalidTransition }
         let select = try XCTUnwrap(services.selectSubject)
         services.selectSubject = { snapshot in
+            let path = String(decoding: try JSONEncoder().encode(snapshot.workingURL.path), as: UTF8.self)
+            let stackBackground = try await PhotoshopExecutionCoordinator.shared.run(owner: snapshot.taskID) {
+                try await PhotoshopWorkflowBridge.execute("""
+                (function(){var d=app.open(new File(\(path)));try{
+                    var bg=d.layers[d.layers.length-1];
+                    return String(bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);
+                }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
+                """)
+            }
+            XCTAssertEqual(stackBackground, "true", "Stack output must already have a locked visible bottom BG")
             let result = try await select(snapshot)
             try JSONEncoder().encode(result).write(to: root.appendingPathComponent("\(snapshot.taskID)-selected.json"))
             return result
@@ -66,11 +76,13 @@ import XCTest
                     var a=d.layerSets.getByName('共同调整'),c=a.artLayers.getByName('抠图');
                     d.activeLayer=c;var r=new ActionReference();r.putProperty(charIDToTypeID('Prpr'),stringIDToTypeID('hasUserMask'));
                     r.putEnumerated(charIDToTypeID('Lyr '),charIDToTypeID('Ordn'),charIDToTypeID('Trgt'));
-                    return String(a.layers.length===2 && c.visible && executeActionGet(r).getBoolean(stringIDToTypeID('hasUserMask')));
+                    var editable=a.layers.length===2 && c.visible && executeActionGet(r).getBoolean(stringIDToTypeID('hasUserMask'));
+                    var bg=d.layers[d.layers.length-1];
+                    return String(editable && d.layers.length===3 && bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);
                 }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
                 """)
             }
-            XCTAssertEqual(maskCheck, "true", "Editable native mask must remain visible after geometry")
+            XCTAssertEqual(maskCheck, "true", "Editable mask and locked visible root BG must remain after geometry")
         }
         // 仅在副本修改蒙版中心一个像素，确认保存刷新读取蒙版而非隐藏的旧成品。
         let task = try XCTUnwrap(processed.activeTasks.first), saved = try XCTUnwrap(task.snapshot)
@@ -106,7 +118,9 @@ import XCTest
         XCTAssertTrue(finished.activeTasks.allSatisfy { $0[.hd].state == .completed && $0[.png4k].state == .completed })
         for task in finished.activeTasks {
             for asset in task.artifacts where asset.kind == .png4k {
-                XCTAssertEqual(try WorkflowRaster.read(asset.url).size, CGSize(width: 4096,height: 4096))
+                let exported = try WorkflowRaster.read(asset.url)
+                XCTAssertEqual(exported.size, CGSize(width: 4096,height: 4096))
+                XCTAssertEqual(exported.pixels[3], 0, "Preview BG must not enter transparent exports")
             }
         }
         XCTAssertEqual(try AIFileValidation.hash(manifest), manifestHash)

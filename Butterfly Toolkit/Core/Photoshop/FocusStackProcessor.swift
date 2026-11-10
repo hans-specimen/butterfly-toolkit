@@ -363,11 +363,13 @@ struct FocusStackProcessor {
                     layer.putObject(charIDToTypeID("Type"), stringIDToTypeID("solidColorLayer"), solid);
                     make.putObject(charIDToTypeID("Usng"), stringIDToTypeID("contentLayer"), layer);
                     executeAction(charIDToTypeID("Mk  "), make, DialogModes.NO);
-                    stackDocument.activeLayer.name = "Background #74BFFF";
+                    stackDocument.activeLayer.name = "BG";
                     stackDocument.activeLayer.move(
                         stackDocument.layers[stackDocument.layers.length - 1],
                         ElementPlacement.PLACEAFTER
                     );
+                    stackDocument.activeLayer.visible = true;
+                    stackDocument.activeLayer.allLocked = true;
                 } catch (fillError) {
                     throw new Error("创建纯色填充图层失败：" + fillError.message);
                 }
