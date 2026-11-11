@@ -931,14 +931,14 @@ extension WorkflowExecutor {
     /// 清单写入成功前，即使已移除最后一面的跟踪记录，租约仍然有效。
     func manualReviewLeaseID(batchID: UUID) -> UUID? { batchReviewLeases[batchID] }
 
-    func pollManualEdits(batchID: UUID) async throws {
+    func pollManualEdits(batchID: UUID, canObserve: @escaping @Sendable () async -> Bool = { true }) async throws {
         guard !confirming.contains(batchID), !acquiringManual.contains(batchID) else { return }
         guard let session = batchReviewLeases[batchID] else { return }
         confirming.insert(batchID); defer { confirming.remove(batchID) }
         let sides = try batch(batchID: batchID).activeTasks.filter { $0.manualEdit != nil }
         if !sides.isEmpty {
             // 查询失败会完整保留上次记录和租约，不能当作所有文档关闭。
-            let opened = try await observeDocuments(owner: session)
+            let opened = try await observeDocuments(owner: session, canObserve: canObserve)
             for side in sides {
                 try Task.checkCancellation()
                 guard let record = side.manualEdit else { continue }
@@ -949,15 +949,17 @@ extension WorkflowExecutor {
                             $0.manualEditError = nil
                         }
                     }
-                } else if record.observedDocumentID != nil {
+                } else if record.observedDocumentID != nil ||
+                            (try? Self.reviewModificationDate(record.workingURL)) != record.baseline.modificationDate {
+                    // 精修时不查询 PS，保存关闭可能发生在首次查询之前；时间变化只触发核验，不能代替哈希校验。
                     do {
-                        try await acceptClosedSave(batchID, side, owner: session, requireChange: true)
+                        try await acceptClosedSave(batchID, side, owner: session, requireChange: true, canObserve: canObserve)
                     } catch is CancellationError { throw CancellationError() }
                     catch {
                         try recordManualSaveError(batchID, side.id, error)
                         // 已关闭的失败面保留诊断供重新确认，避免文件问题永久占住 Photoshop。
                         if !(error is ReviewObservationFailure), (error as? WorkflowBridgeError) != .manualReviewActive,
-                           let latest = try? await observeDocuments(owner: session),
+                           let latest = try? await observeDocuments(owner: session, canObserve: canObserve),
                            latest[Self.reviewPath(record.workingURL)] == nil {
                             try mutateReviewTask(batchID, side.id) { $0.manualEdit = nil }
                         }
@@ -1072,9 +1074,14 @@ extension WorkflowExecutor {
         batchReviewLeases.removeValue(forKey: batchID)
     }
 
-    private func observeDocuments(owner: UUID) async throws -> [String: WorkflowOpenPhotoshopDocument] {
+    private func observeDocuments(owner: UUID, canObserve: @escaping @Sendable () async -> Bool = { true }) async throws -> [String: WorkflowOpenPhotoshopDocument] {
         guard let observe = services.openDocuments else { throw WorkflowStateError.invalidTransition }
-        let documents = try await coordinator.readSaved(owner: owner, operation: observe)
+        let documents = try await coordinator.readSaved(owner: owner) {
+            // 等待协调器或复制 PSD 期间可能切走，发起每次查询前都须重新检查。
+            guard await canObserve() else { throw CancellationError() }
+            try Task.checkCancellation()
+            return try await observe()
+        }
         var opened: [String: WorkflowOpenPhotoshopDocument] = [:]
         for document in documents {
             let path = Self.reviewPath(document.url)
@@ -1118,17 +1125,18 @@ extension WorkflowExecutor {
         url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
-    private nonisolated static func reviewFileVersion(_ url: URL) throws -> WorkflowPSDFileVersion {
-        func modificationDate() throws -> Date {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular, let date = attributes[.modificationDate] as? Date else {
-                throw WorkflowBridgeError.staleSource
-            }
-            return date
+    private nonisolated static func reviewModificationDate(_ url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular, let date = attributes[.modificationDate] as? Date else {
+            throw WorkflowBridgeError.staleSource
         }
-        let modified = try modificationDate()
+        return date
+    }
+
+    private nonisolated static func reviewFileVersion(_ url: URL) throws -> WorkflowPSDFileVersion {
+        let modified = try reviewModificationDate(url)
         let hash = try AIFileValidation.hash(url.path)
-        guard try modificationDate() == modified else { throw WorkflowBridgeError.staleSource }
+        guard try reviewModificationDate(url) == modified else { throw WorkflowBridgeError.staleSource }
         return WorkflowPSDFileVersion(hash: hash, modificationDate: modified)
     }
 
@@ -1137,7 +1145,8 @@ extension WorkflowExecutor {
         var errorDescription: String? { underlying.localizedDescription }
     }
 
-    private func acceptClosedSave(_ batchID: UUID, _ before: WorkflowSideTask, owner: UUID, requireChange: Bool) async throws {
+    private func acceptClosedSave(_ batchID: UUID, _ before: WorkflowSideTask, owner: UUID, requireChange: Bool,
+                                  canObserve: @escaping @Sendable () async -> Bool = { true }) async throws {
         guard let url = before.snapshot?.workingURL else { throw WorkflowStateError.invalidTransition }
         let value = try batch(batchID: batchID)
         try value.validateOutputURL(url)
@@ -1154,7 +1163,7 @@ extension WorkflowExecutor {
         }
         let opened: [String: WorkflowOpenPhotoshopDocument]?
         if requireChange {
-            do { opened = try await observeDocuments(owner: owner) }
+            do { opened = try await observeDocuments(owner: owner, canObserve: canObserve) }
             catch is CancellationError { throw CancellationError() }
             catch { throw ReviewObservationFailure(underlying: error) }
         } else {

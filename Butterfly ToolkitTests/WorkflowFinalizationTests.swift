@@ -142,6 +142,43 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     @MainActor
+    func testStoreDefersPhotoshopQueriesUntilReturningToToolkit() async throws {
+        let (f, executor, photoshop) = try await readyBatchReview()
+        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        let front = f.batch.specimens[0].front.id, back = f.batch.specimens[0].back.id
+        let activity = ReviewActivity()
+        let store = PhotoWorkflowStore(makeExecutor: { _ in executor }, openPhotoshopDocument: { _ in },
+                                       isApplicationActive: { activity.active })
+        store.openBatch(f.manifest)
+        try await waitForStore { !store.busy && store.currentTask?.id == front }
+        store.selectedTaskIDs = [front, back]
+        store.openSelectedPSDs()
+        try await waitForStore { !store.isUpdatingReview && store.trackedReviewCount == 2 }
+        let frontURL = try XCTUnwrap(store.batch?.task(id: front)?.snapshot?.workingURL)
+        let backURL = try XCTUnwrap(store.batch?.task(id: back)?.snapshot?.workingURL)
+        // 第一张已保存关闭，第二张还开着；Toolkit 尚未查询过这两份文档。
+        let version = try saveReviewPSD(frontURL, marker: "saved while Photoshop was foreground")
+        await photoshop.setDocuments([openDocument(backURL, 2, saved: false)])
+        let session = try XCTUnwrap(store.manualReviewSessionID)
+        let observation = Task { await store.observeManualEdits(sessionID: session) }
+        defer { observation.cancel() }
+        try await Task.sleep(for: .milliseconds(1400))
+        let backgroundQueries = await photoshop.queryCount
+        XCTAssertEqual(backgroundQueries, 0)
+        XCTAssertEqual(store.trackedReviewCount, 2)
+        XCTAssertNil(store.manualObservationError)
+        XCTAssertNotNil(store.manualReviewSessionID)
+
+        activity.active = true
+        try await waitForStore { store.batch?.task(id: front)?[.geometry].confirmedVersion == version }
+        XCTAssertEqual(store.batch?.task(id: back)?.manualEdit?.observedDocumentID, 2)
+        XCTAssertEqual(store.trackedReviewCount, 1)
+        XCTAssertNotNil(store.manualReviewSessionID)
+        observation.cancel()
+        await observation.value
+    }
+
+    @MainActor
     func testStoreTracksEachOpenedFaceAndResumesQueuedExportAfterTrackingEnds() async throws {
         let (f, executor, photoshop) = try await readyBatchReview()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
@@ -156,7 +193,7 @@ final class WorkflowFinalizationTests: XCTestCase {
             var documents = try await photoshop.list()
             documents.append(WorkflowOpenPhotoshopDocument(url: url, documentID: id, saved: true))
             await photoshop.setDocuments(documents)
-        })
+        }, isApplicationActive: { true })
         store.openBatch(f.manifest)
         try await waitForStore { !store.busy && store.currentTask?.id == front }
         XCTAssertTrue(store.selectedReviewTaskIDs.isEmpty)
@@ -234,7 +271,8 @@ final class WorkflowFinalizationTests: XCTestCase {
         let value = try await executor.batch(batchID: f.batch.id)
         let frontURL = try XCTUnwrap(value.task(id: front)?.snapshot?.workingURL)
         let backURL = try XCTUnwrap(value.task(id: back)?.snapshot?.workingURL)
-        let store = PhotoWorkflowStore(makeExecutor: { _ in executor }, openPhotoshopDocument: { _ in })
+        let store = PhotoWorkflowStore(makeExecutor: { _ in executor }, openPhotoshopDocument: { _ in },
+                                       isApplicationActive: { true })
         store.openBatch(f.manifest)
         try await waitForStore { !store.busy && store.currentTask?.id == front }
         store.selectedTaskIDs = [front, back]
@@ -394,7 +432,7 @@ final class WorkflowFinalizationTests: XCTestCase {
         XCTAssertEqual(retried.task(id: front)?[.geometry].confirmedVersion, version)
     }
 
-    func testRestartRestoresObservedOpenEvidenceWithoutConfirmingAnUnobservedOpen() async throws {
+    func testRestartAcceptsSavedCloseThatHappenedBeforeFirstObservation() async throws {
         let (f, executor, photoshop) = try await readyBatchReview()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let front = f.batch.specimens[0].front.id, back = f.batch.specimens[0].back.id
@@ -403,7 +441,7 @@ final class WorkflowFinalizationTests: XCTestCase {
         await photoshop.setDocuments([openDocument(frontURL, 10)])
         try await executor.pollManualEdits(batchID: f.batch.id)
         let accepted = try saveReviewPSD(frontURL, marker: "closed")
-        _ = try saveReviewPSD(backURL, marker: "changed but never observed open")
+        let backAccepted = try saveReviewPSD(backURL, marker: "saved before returning to Toolkit")
         await photoshop.setDocuments([])
 
         let reopened = WorkflowExecutor(services: batchReviewServices(f, photoshop), coordinator: PhotoshopExecutionCoordinator())
@@ -417,12 +455,43 @@ final class WorkflowFinalizationTests: XCTestCase {
         try await reopened.pollManualEdits(batchID: f.batch.id)
         let observed = try await reopened.batch(batchID: f.batch.id)
         XCTAssertEqual(observed.task(id: front)?[.geometry].confirmedVersion, accepted)
-        XCTAssertNil(observed.task(id: back)?.acceptedFinalPSD)
-        XCTAssertNotNil(observed.task(id: back)?.manualEdit)
-        try await reopened.cancelClosedBatchEdits(batchID: f.batch.id, taskIDs: [back])
-        let released = try await reopened.batch(batchID: f.batch.id)
-        XCTAssertNil(released.manualReviewSessionID)
-        XCTAssertEqual(released.task(id: back)?[.geometry].state, .waitingReview)
+        XCTAssertEqual(observed.task(id: back)?[.geometry].confirmedVersion, backAccepted)
+        XCTAssertNil(observed.manualReviewSessionID)
+    }
+
+    @MainActor
+    func testLosingFocusDuringSavedCopyDefersSecondPhotoshopQueryAndKeepsLease() async throws {
+        let (f, executor, photoshop) = try await readyBatchReview()
+        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        let front = f.batch.specimens[0].front.id
+        let urls = try await executor.beginBatchEditing(batchID: f.batch.id, taskIDs: [front])
+        let url = try XCTUnwrap(urls.first)
+        await photoshop.setDocuments([openDocument(url, 1)])
+        try await executor.pollManualEdits(batchID: f.batch.id)
+        let version = try saveReviewPSD(url, marker: "saved")
+        let activity = ReviewActivity()
+        activity.active = true
+        await photoshop.setDocuments([])
+        await photoshop.setNextObservation {
+            await MainActor.run { activity.active = false }
+            return []
+        }
+        let queriesBefore = await photoshop.queryCount
+        do {
+            try await executor.pollManualEdits(batchID: f.batch.id, canObserve: { await activity.active })
+            XCTFail("Lost foreground while copying, but continued Photoshop queries")
+        } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let queriesAfter = await photoshop.queryCount
+        XCTAssertEqual(queriesAfter - queriesBefore, 1)
+        let deferred = try await executor.batch(batchID: f.batch.id)
+        XCTAssertNotNil(deferred.manualReviewSessionID)
+        XCTAssertNil(deferred.task(id: front)?.acceptedFinalPSD)
+        XCTAssertNil(deferred.task(id: front)?.manualEditError)
+        activity.active = true
+        try await executor.pollManualEdits(batchID: f.batch.id, canObserve: { await activity.active })
+        let accepted = try await executor.batch(batchID: f.batch.id)
+        XCTAssertEqual(accepted.task(id: front)?[.geometry].confirmedVersion, version)
+        XCTAssertNil(accepted.manualReviewSessionID)
     }
 
     func testReopenDuringAcceptancePreservesLeaseAndDoesNotAcceptUntilClosed() async throws {
@@ -887,17 +956,24 @@ private actor FinalizationSaveGate {
     func setDirty(_ value: Bool) { dirty = value }
 }
 
+@MainActor
+private final class ReviewActivity {
+    var active = false
+}
+
 private actor ReviewPhotoshop {
+    private(set) var queryCount = 0
     private var documents: [WorkflowOpenPhotoshopDocument] = []
-    private var responses: [@Sendable () throws -> [WorkflowOpenPhotoshopDocument]] = []
+    private var responses: [@Sendable () async throws -> [WorkflowOpenPhotoshopDocument]] = []
 
     func setDocuments(_ documents: [WorkflowOpenPhotoshopDocument]) { self.documents = documents }
-    func setNextObservation(_ response: @escaping @Sendable () throws -> [WorkflowOpenPhotoshopDocument]) {
+    func setNextObservation(_ response: @escaping @Sendable () async throws -> [WorkflowOpenPhotoshopDocument]) {
         responses.append(response)
     }
     func failNextObservation() { setNextObservation { throw WorkflowBridgeError.photoshop("busy") } }
-    func list() throws -> [WorkflowOpenPhotoshopDocument] {
-        if !responses.isEmpty { return try responses.removeFirst()() }
+    func list() async throws -> [WorkflowOpenPhotoshopDocument] {
+        queryCount += 1
+        if !responses.isEmpty { return try await responses.removeFirst()() }
         return documents
     }
 }

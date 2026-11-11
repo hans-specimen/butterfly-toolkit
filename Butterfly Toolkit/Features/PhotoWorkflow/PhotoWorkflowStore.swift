@@ -177,6 +177,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     private var reviewObservation: Task<Void,Never>?
     private let makeReviewExecutor: ((URL) -> WorkflowExecutor)?
     private let openPhotoshopDocument: (URL) async throws -> Void
+    private let isApplicationActive: @MainActor @Sendable () -> Bool
     private var isResettingPreviews = false
     private let geometry: WorkflowGeometryCache
     private let previews: any WorkflowPreviewServing
@@ -184,9 +185,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     private var command: Task<Void,Never>?
     init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil,
          makeExecutor: ((URL) -> WorkflowExecutor)? = nil,
-         openPhotoshopDocument: @escaping (URL) async throws -> Void = PhotoWorkflowStore.openInPhotoshop) {
+         openPhotoshopDocument: @escaping (URL) async throws -> Void = PhotoWorkflowStore.openInPhotoshop,
+         isApplicationActive: @escaping @MainActor @Sendable () -> Bool = { NSApplication.shared.isActive }) {
         self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
         self.makeReviewExecutor = makeExecutor; self.openPhotoshopDocument = openPhotoshopDocument
+        self.isApplicationActive = isApplicationActive
     }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
@@ -691,14 +694,14 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         if manualReviewSessionID != session { manualReviewSessionID = session }
         if session == nil, manualObservationError != nil { manualObservationError = nil }
     }
-    /// 生命周期由界面绑定到实际占用，清单保存失败时继续重试。
+    /// 仅在 Toolkit 前台核对，避免文档查询打断 Photoshop 画笔；后台保留占用与重试状态。
     func observeManualEdits(sessionID: UUID) async {
         while !Task.isCancelled, let executor, let batch, manualReviewSessionID == sessionID {
-            if !isUpdatingReview && reviewObservation == nil {
+            if isApplicationActive() && !isUpdatingReview && reviewObservation == nil {
                 let poll = Task { [self] in
                     defer { reviewObservation = nil }
                     do {
-                        try await executor.pollManualEdits(batchID: batch.id)
+                        try await executor.pollManualEdits(batchID: batch.id, canObserve: isApplicationActive)
                         guard !Task.isCancelled else { return }
                         if manualObservationError != nil { manualObservationError = nil }
                     } catch is CancellationError { return }

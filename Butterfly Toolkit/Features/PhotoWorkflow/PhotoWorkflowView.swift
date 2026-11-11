@@ -619,7 +619,7 @@ struct PhotoWorkflowView: View {
                 .disabled(!store.canOpenPSD)
             Button("打开所选 \(store.selectedReviewTaskIDs.count) 张 PSD") { store.openSelectedPSDs() }
                 .disabled(!store.canOpenSelectedPSDs)
-            Text("可少量勾选正面或反面。在 Photoshop 保存并关闭后自动确认此图。")
+            Text("可少量勾选正面或反面。在 Photoshop 保存并关闭，切回 Toolkit 后自动确认。")
                 .font(.caption).foregroundStyle(.secondary)
             if store.canStopTrackingCurrentPSD {
                 Button("结束跟踪此图") { store.stopTrackingCurrentPSD() }
