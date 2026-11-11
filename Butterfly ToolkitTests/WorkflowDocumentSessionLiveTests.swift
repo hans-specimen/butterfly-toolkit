@@ -121,6 +121,72 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: ["sameWorkingDocument":true,"geometryCalls":geometryCalls,"sourceFilesUnchanged":true,"manualMaskAccepted":true,"changedStackRejected":true,"explicitManualAcknowledgement":true,"checkpointRestoredToNewPath":true], options: .prettyPrinted)
             .write(to: root.appendingPathComponent("validation.json"))
     }
+    func testSyntheticFinalExportUsesRenamedHiddenFirstLayer() async throws {
+        guard ProcessInfo.processInfo.environment["WORKFLOW_SESSION_SYNTHETIC"] == "1" else {
+            throw XCTSkip("Requires explicit synthetic Photoshop validation")
+        }
+        let owner = UUID()
+        let openCount = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
+            try await PhotoshopWorkflowBridge.execute("String(app.documents.length)")
+        }
+        guard openCount.trimmingCharacters(in: .whitespacesAndNewlines) == "0" else {
+            throw XCTSkip("Photoshop has open documents; leave the user's editing session untouched")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Toolkit-First-Layer-Live-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        print("FIRST_LAYER_EVIDENCE=" + root.path)
+        let image = try syntheticImage()
+        let sources = try (0..<3).map { index -> URL in
+            let url = root.appendingPathComponent("synthetic-\(index).png")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil))
+            CGImageDestinationAddImage(destination, image, nil)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            return url
+        }
+        let hashes = try sources.map { try AIFileValidation.hash($0.path) }
+        let work = root.appendingPathComponent("manual-first-layer.psd")
+        let bridge = PhotoshopWorkflowBridge(workspace: root.appendingPathComponent("evidence"))
+        let encodedPath = String(decoding: try JSONEncoder().encode(work.path), as: UTF8.self)
+        // 只操作本测试新建的PSD，模拟一个有独特像素、改名且隐藏的首层；原抠图层仍留在下方。
+        let topID = try await bridge.withTaskDocument(owner: owner, document: work) {
+            let stack = try await bridge.stack(job: FocusStackJob(id: 1, sourceFiles: sources, destinationURL: work, butterflyName: "synthetic", side: "D"), owner: owner)
+            _ = try await bridge.selectSubject(snapshot: stack)
+            let identifier = try await PhotoshopWorkflowBridge.execute("""
+            (function(){var d=app.open(new File(\(encodedPath)));
+                var g=d.layerSets.getByName('共同调整');
+                var top=g.artLayers.getByName('Keying_Level').duplicate();top.move(g,ElementPlacement.INSIDE);
+                top.name='人工精修结果';d.activeLayer=top;d.activeChannels=d.componentChannels;
+                d.selection.selectAll();var c=new SolidColor();c.rgb.red=240;c.rgb.green=20;c.rgb.blue=20;
+                d.selection.fill(c);d.selection.deselect();top.visible=false;d.save();return String(top.id);
+            }());
+            """)
+            let openDocuments = try await bridge.openDocuments()
+            let observed = try XCTUnwrap(openDocuments.first { $0.url == work.resolvingSymlinksInPath().standardizedFileURL })
+            XCTAssertGreaterThan(observed.documentID, 0)
+            XCTAssertTrue(observed.saved)
+            return identifier
+        }
+        let closedDocuments = try await bridge.openDocuments()
+        XCTAssertFalse(closedDocuments.contains { $0.url == work.resolvingSymlinksInPath().standardizedFileURL })
+        let savedHash = try AIFileValidation.hash(work.path)
+        let final = try await bridge.captureFinalPSD(document: work, owner: owner)
+        let roles = try await bridge.extractRoles(snapshot: final)
+        XCTAssertEqual(final.finalRoles?.cutoutLayer, topID)
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(roles.cutoutPNG as CFURL, nil))
+        let cutout = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var pixel = [UInt8](repeating: 0, count: 4)
+        try pixel.withUnsafeMutableBytes { bytes in
+            let context = try XCTUnwrap(CGContext(data: bytes.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            let center = try XCTUnwrap(cutout.cropping(to: CGRect(x: cutout.width / 2, y: cutout.height / 2, width: 1, height: 1)))
+            context.draw(center, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        XCTAssertGreaterThan(pixel[3], 200, "The subject center must retain mask alpha")
+        XCTAssertGreaterThan(Int(pixel[0]), Int(pixel[1]) + 100, "Export must contain the edited first-layer pixels")
+        XCTAssertEqual(try AIFileValidation.hash(work.path), savedHash, "Extraction must not change the saved PSD or its visibility")
+        XCTAssertEqual(try sources.map { try AIFileValidation.hash($0.path) }, hashes)
+        try JSONEncoder().encode(final).write(to: root.appendingPathComponent("final-snapshot.json"))
+    }
     private func syntheticImage() throws -> CGImage {
         let color = try XCTUnwrap(CGColorSpace(name: CGColorSpace.adobeRGB1998))
         let context = try XCTUnwrap(CGContext(data: nil, width: 512, height: 512, bitsPerComponent: 8, bytesPerRow: 512 * 4,

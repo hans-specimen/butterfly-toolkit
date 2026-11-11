@@ -6,6 +6,33 @@ import UniformTypeIdentifiers
 @testable import Butterfly_Toolkit
 
 @MainActor final class WorkflowPreviewTests: XCTestCase {
+    func testPreviewChoicesAreIndependentForEveryStage() {
+        let store = PhotoWorkflowStore()
+        store.previewMode = "蒙版"; store.previewBackground = "黑"
+        store.stage = .matte
+        XCTAssertEqual(store.previewMode,"抠图")
+        XCTAssertEqual(store.previewBackground,"天蓝")
+        store.previewMode = "蒙版"; store.previewBackground = "白"
+        store.stage = .geometry
+        XCTAssertEqual(store.previewMode,"底图")
+        XCTAssertEqual(store.previewBackground,"棋盘")
+        store.previewMode = "抠图"; store.previewBackground = "黑"
+        store.stage = .hd
+        store.previewMode = "蒙版"; store.previewBackground = "天蓝"
+        store.stage = .png4k
+        store.previewBackground = "白"
+        store.stage = .stack
+        XCTAssertEqual(store.previewMode,"蒙版"); XCTAssertEqual(store.previewBackground,"黑")
+        store.stage = .matte
+        XCTAssertEqual(store.previewMode,"蒙版"); XCTAssertEqual(store.previewBackground,"白")
+        store.stage = .geometry
+        XCTAssertEqual(store.previewMode,"抠图"); XCTAssertEqual(store.previewBackground,"黑")
+        store.stage = .hd
+        XCTAssertEqual(store.previewMode,"蒙版"); XCTAssertEqual(store.previewBackground,"天蓝")
+        store.stage = .png4k
+        XCTAssertEqual(store.previewBackground,"白")
+    }
+
     func testOldPreviewCannotReplaceLatestRequest() {
         var gate = WorkflowPreviewGate()
         let old = gate.begin(sourceVersion: "old")
@@ -141,7 +168,7 @@ import UniformTypeIdentifiers
         }
 
     }
-    func testCurrentFaceCanBeConfirmedAfterPreviewEvenWhenOtherFaceFailed() async throws {
+    func testCurrentFaceCanBeConfirmedBeforePreviewEvenWhenOtherFaceFailed() async throws {
         var batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
         batch.manualFinalization = true
         batch.specimens[0].front[.geometry].state = .waitingReview
@@ -150,14 +177,95 @@ import UniformTypeIdentifiers
         batch.specimens[0].back[.geometry].confirmedVersion = nil
         let store = PhotoWorkflowStore()
         store.batch = batch; store.currentSpecimenID = batch.specimens[0].id
-        XCTAssertFalse(store.canFinalize)
-        store.prepareSelected()
-        try await waitUntil { store.canFinalize }
+        XCTAssertTrue(store.images.isEmpty)
+        XCTAssertTrue(store.canFinalize)
         XCTAssertEqual(store.stage,.hd)
         store.face = .back
         XCTAssertFalse(store.canFinalize)
         XCTAssertEqual(store.stage,.geometry)
     }
+    func testOpeningExportDoesNotDecodeSelectedFaces() async throws {
+        var batch = try imageFixture(specimens: 2)
+        defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        batch.manualFinalization = true
+        let probe = PreviewProbe(), store = PhotoWorkflowStore(previews: probe)
+        store.batch = batch
+        store.currentSpecimenID = batch.specimens[0].id
+        store.selectedSpecimens = Set(batch.specimens.map(\.id))
+        store.stage = .png4k
+        store.prepareSelected()
+        store.refreshVisibleImage()
+        for preview in Array(store.previewTasks.values) { await preview.value }
+        let calls = await probe.values()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(store.images.isEmpty)
+    }
+
+    func testExportDecodesOnlyFacesRequestedByTheUser() async throws {
+        var batch = try imageFixture(specimens: 2)
+        defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        batch.manualFinalization = true
+        let probe = PreviewProbe(), store = PhotoWorkflowStore(previews: probe)
+        let front = batch.specimens[0].front, back = batch.specimens[0].back
+        store.batch = batch
+        store.currentSpecimenID = batch.specimens[0].id
+        store.selectedSpecimens = Set(batch.specimens.map(\.id))
+        store.stage = .png4k
+        store.loadCurrentExportPreview()
+        await store.previewTasks[front.id]?.value
+        let image = try XCTUnwrap(store.displayImage(for: front))
+        let gate = store.gates[front.id]?.token
+        let solution = store.solutions[front.id]
+        var layout = store.currentLayout; layout.safeMargin = 300
+        store.editLayout(layout)
+        XCTAssertNil(store.displayImage(for: back))
+
+        store.face = .back
+        store.refreshVisibleImage()
+        XCTAssertNil(store.previewTasks[back.id])
+        store.loadCurrentExportPreview()
+        await store.previewTasks[back.id]?.value
+        XCTAssertEqual(Set(store.images.keys), [front.id, back.id])
+        XCTAssertTrue(store.displayImage(for: front) === image)
+        XCTAssertEqual(store.gates[front.id]?.token, gate)
+        XCTAssertEqual(store.solutions[front.id], solution)
+        XCTAssertEqual(store.layouts[front.id], layout)
+        let calls = await probe.values()
+        XCTAssertEqual(calls.filter { $0 == "image" }.count, 2)
+    }
+
+    func testSwitchingBetweenConfirmedAndEditingFacesKeepsReviewOpen() throws {
+        var batch = try imageFixture(specimens: 1)
+        defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        batch.manualFinalization = true
+        batch.specimens[0].back[.geometry].state = .waitingReview
+        batch.specimens[0].back[.geometry].confirmedVersion = nil
+        let store = PhotoWorkflowStore()
+        store.batch = batch
+        store.currentSpecimenID = batch.specimens[0].id
+        store.stage = .hd
+        store.face = .back
+        XCTAssertEqual(store.stage, .hd)
+        store.face = .front
+        XCTAssertEqual(store.stage, .hd)
+    }
+
+    func testFailedMatteWithWorkingPSDCanStillOpenForManualRepair() throws {
+        var batch = try imageFixture(specimens: 1)
+        defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        batch.manualFinalization = true
+        batch.specimens[0].front[.matte].state = .failed
+        batch.specimens[0].front[.geometry].state = .pending
+        let store = PhotoWorkflowStore()
+        store.batch = batch
+        store.currentSpecimenID = batch.specimens[0].id
+        store.stage = .hd
+        XCTAssertTrue(store.canOpenPSD)
+        XCTAssertFalse(store.canFinalize)
+        store.selectedTaskIDs = [batch.specimens[0].front.id]
+        XCTAssertTrue(store.selectedReviewTaskIDs.isEmpty)
+    }
+
     func testStorePreviewUsesRoleThumbnailAndValidationWithoutDiscardedBitmap() async throws {
         let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
         let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
@@ -371,7 +479,7 @@ import UniformTypeIdentifiers
         try await waitUntil { store.currentDetailReady && store.canConfirm }
         XCTAssertEqual(store.displayImage(for: batch.specimens[0].front)?.width,3000)
         XCTAssertEqual(alphaAtCorner(store.displayImage(for: batch.specimens[0].front)),0)
-        store.previewMode = "蒙版"; store.stage = .geometry
+        store.stage = .geometry; store.previewMode = "蒙版"
         XCTAssertNil(store.displayImage(for: batch.specimens[0].front))
         XCTAssertFalse(store.canConfirm)
         try await waitUntil { store.currentDetailReady && store.canConfirm }

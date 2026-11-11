@@ -7,8 +7,11 @@ import UniformTypeIdentifiers
 
 nonisolated enum WorkflowBridgeError: LocalizedError, Equatable {
     case unsavedDocument, staleSource, invalidStructure, ownershipConflict, invalidImage(String), photoshop(String), interruptedWrite(String)
+    case photoshopNotRunning, manualReviewActive
     var errorDescription: String? {
         switch self {
+        case .photoshopNotRunning: "Photoshop 未运行，无法确认打开的文档。"
+        case .manualReviewActive: "请先保存并关闭本批正在精修的 PSD。"
         case .unsavedDocument: "Photoshop 文档尚未保存，请保存后刷新。"
         case .staleSource: "保存版本或输入图片已变化，请刷新后重试。"
         case .invalidStructure: "PSD 角色图层或蒙版已删除、合并或单独变换，请修复后刷新。"

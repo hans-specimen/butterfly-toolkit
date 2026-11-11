@@ -42,6 +42,7 @@ python3 scripts/version.py check
 | 分组 | 文件与主要范围 |
 | --- | --- |
 | 逐面处理 | [WorkflowPerImageTests](<../Butterfly ToolkitTests/WorkflowPerImageTests.swift>) 覆盖逐面顺序、失败隔离、安全暂停、人工接管、单面确认、重跑和独立导出。 |
+| 批量精修与定稿 | [WorkflowFinalizationTests](<../Butterfly ToolkitTests/WorkflowFinalizationTests.swift>) 覆盖多文档分别保存关闭、打开观察与重启恢复、接收凭据、延后角色准备、导出版本冻结和已确认面重新处理。 |
 | 状态和文件 | [WorkflowStateTests](<../Butterfly ToolkitTests/WorkflowStateTests.swift>)、[WorkflowOutputTests](<../Butterfly ToolkitTests/WorkflowOutputTests.swift>)、[WorkflowPSDImportTests](<../Butterfly ToolkitTests/WorkflowPSDImportTests.swift>) 覆盖状态、清单、输出目录、PSD 配对及保护。 |
 | Photoshop 桥接 | [WorkflowBridgeTests](<../Butterfly ToolkitTests/WorkflowBridgeTests.swift>) 与 [WorkflowDocumentSessionTests](<../Butterfly ToolkitTests/WorkflowDocumentSessionTests.swift>) 覆盖角色、同一工作文档、独立快照读回、归属、未保存保护和写入恢复。 |
 | 预览与几何 | [WorkflowPreviewTests](<../Butterfly ToolkitTests/WorkflowPreviewTests.swift>)、[WorkflowGeometryCacheTests](<../Butterfly ToolkitTests/WorkflowGeometryCacheTests.swift>)、[MaskGeometryProcessorTests](<../Butterfly ToolkitTests/MaskGeometryProcessorTests.swift>) 覆盖确认门槛、缓存、翅顶、主体和坐标。 |
@@ -56,7 +57,7 @@ Xcode 运行测试时用 `TEST_RUNNER_` 前缀传递变量，并用 `-only-testi
 
 | 测试入口 | 变量与范围 |
 | --- | --- |
-| Photoshop 单面连续文档 | `WORKFLOW_SESSION_SYNTHETIC=1` 启用 [WorkflowDocumentSessionLiveTests](<../Butterfly ToolkitTests/WorkflowDocumentSessionLiveTests.swift>)。素材由测试生成，检查合成、主体识别、矫正使用同一工作文档，验证保存凭据重用和文档释放。临时证据位置见 `SESSION_EVIDENCE` 输出。 |
+| Photoshop 文档与首层输出 | `WORKFLOW_SESSION_SYNTHETIC=1` 启用 [WorkflowDocumentSessionLiveTests](<../Butterfly ToolkitTests/WorkflowDocumentSessionLiveTests.swift>)。素材由测试生成，检查合成、主体识别、矫正使用同一工作文档，验证保存凭据重用和文档释放。另验证改名且隐藏的精修首层实际像素，以及只读查询的路径、文档 ID、保存和关闭状态。首层用例发现已有打开文档时跳过；整个类运行前须确认 Photoshop 空闲。临时证据位置见 `SESSION_EVIDENCE`、`FIRST_LAYER_EVIDENCE` 输出。 |
 | 新照片逐面工作流 | `WORKFLOW_PS_BATCH/EVIDENCE`，可选 `WORKFLOW_PS_NAMES` 指定逗号分隔的标本编号前缀。[WorkflowPhotoshopMatteLiveTests](<../Butterfly ToolkitTests/WorkflowPhotoshopMatteLiveTests.swift>) 从指定清单复制原照到新目录，检查自动处理、图层、人工保存刷新与双输出。 |
 | 已有 PSD 原生处理 | `WORKFLOW_IMPORT_REAL_SOURCE/EVIDENCE`，选用合成 PSD 并在独立副本验证 PS 选择主体、角色提取与几何。`WORKFLOW_IMPORT_FLATTEN=1` 额外验证单层背景 PSD。 |
 | 人工定稿 | `WORKFLOW_FINAL_SOURCE/EVIDENCE` 需符合当前三层角色的 PSD，验证保存版本、人工编辑、角色隔离及双输出。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 用于从指定清单读取并分析蒙版。 |

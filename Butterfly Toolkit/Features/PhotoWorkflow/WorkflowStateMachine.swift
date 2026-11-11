@@ -130,6 +130,8 @@ nonisolated enum WorkflowStateMachine {
                         task[stage].exclusionReason = reason
                         task[stage].revision += 1
                     }
+                    task.manualEdit = nil; task.manualEditError = nil
+                    task.acceptedFinalPSD = nil; task.finalPreparationError = nil
                     for artifact in task.artifacts.indices { task.artifacts[artifact].state = .excluded }
                     if side == .front { next.specimens[index].front = task } else { next.specimens[index].back = task }
                 }
@@ -288,7 +290,10 @@ nonisolated enum WorkflowStateMachine {
             task.stackAttemptURL = nil
             task.snapshot = nil; task.stackPNG = nil; task.matteArtifact = nil; task.roleImages = nil
         }
-        if stages.contains(.geometry) { task.exportHD = nil; task.geometryApplySourceVersion = nil }
+        if stages.contains(.geometry) {
+            task.exportHD = nil; task.geometryApplySourceVersion = nil
+            task.acceptedFinalPSD = nil; task.finalPreparationError = nil; task.manualEditError = nil
+        }
         if stages.contains(.png4k) { task.fourKExportRequested = nil }
         for kind in [WorkflowAssetKind.hd, .png4k] where stages.contains(kind.stage) {
             task.requestedExports?.removeValue(forKey: kind)

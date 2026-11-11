@@ -71,7 +71,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
         return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
     }
-    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true,manualFinalization: Bool = false,matteProvider: WorkflowMatteProvider = .photoshop) throws -> WorkflowBatch {
+    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true,manualFinalization: Bool = false,matteProvider: WorkflowMatteProvider = .photoshop,geometryRequest: GeometryRequest = GeometryRequest()) throws -> WorkflowBatch {
         let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
         guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage(inputMode == .psd ? "请补齐 D/V 配对或明确排除未配对 PSD" : "请明确排除剩余未分组照片") }
@@ -94,6 +94,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             func side(_ value: WorkflowSide,_ offset: Int) -> WorkflowSideTask {
                 let sources = inputMode == .psd ? WorkflowSources(first: files[offset]) : WorkflowSources(first: files[offset],second: files[offset+1],third: files[offset+2])
                 var task = WorkflowSideTask(side: value,sources: sources)
+                task.geometryRequest = geometryRequest
                 if group.excluded { for stage in WorkflowStage.allCases { task[stage].state = .excluded; task[stage].exclusionReason = "建批次时排除" } }; return task
             }
             return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,inputMode.filesPerSide),exclusionReason: group.excluded ? "建批次时排除" : nil)
@@ -131,6 +132,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     @Published var checkGeometry = true
     @Published var check4K = true
+    @Published var draftGeometryRequest = GeometryRequest()
     var needsExportDirectories: Bool { false }
     var usesFinalization: Bool { batch?.manualFinalization == true }
     var canStart: Bool { draft != nil && (!needsExportDirectories || (hdDirectory != nil && png4kDirectory != nil)) }
@@ -143,8 +145,17 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     private var isSelectingTaskStage = false
     @Published var error: String?
     @Published var busy = false
-    @Published var previewMode = "底图" { didSet { if previewMode != oldValue { prepareSelected() } } }
-    @Published var previewBackground = "棋盘"
+    // 每个阶段只记住本阶段的看图选择，切换时不会沿用另一个阶段的图层或底色。
+    @Published private var previewModes: [WorkflowStage: String] = [:]
+    @Published private var previewBackgrounds: [WorkflowStage: String] = [:]
+    var previewMode: String {
+        get { previewModes[stage] ?? (stage == .matte || stage == .png4k ? "抠图" : "底图") }
+        set { guard newValue != previewMode else { return }; previewModes[stage] = newValue; prepareSelected() }
+    }
+    var previewBackground: String {
+        get { previewBackgrounds[stage] ?? (stage == .matte ? "天蓝" : "棋盘") }
+        set { previewBackgrounds[stage] = newValue }
+    }
     @Published var zoom = 1.0
     @Published var showSafeFrame = true
     @Published var pickingTips = false
@@ -165,14 +176,25 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var manualTaskID: UUID?
     @Published var manualChange: WorkflowPSDChange = .maskOnly
     private var executor: WorkflowExecutor?
-    private var manifestURL: URL?
+    @Published private(set) var isUpdatingReview = false
+    @Published private(set) var manualReviewSessionID: UUID?
+    @Published private(set) var manualObservationError: String?
+    @Published private(set) var photoshopOpenErrors: [UUID: String] = [:]
+    @Published private(set) var preparingExportPreview: UUID?
+    @Published private var exportPreviewVersions: [UUID: String] = [:]
+    private var reviewObservation: Task<Void,Never>?
+    private let makeReviewExecutor: ((URL) -> WorkflowExecutor)?
+    private let openPhotoshopDocument: (URL) async throws -> Void
     private var isResettingPreviews = false
     private let geometry: WorkflowGeometryCache
     private let previews: any WorkflowPreviewServing
     private(set) var previewTasks: [UUID: Task<Void,Never>] = [:]
     private var command: Task<Void,Never>?
-    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil) {
+    init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil,
+         makeExecutor: ((URL) -> WorkflowExecutor)? = nil,
+         openPhotoshopDocument: @escaping (URL) async throws -> Void = PhotoWorkflowStore.openInPhotoshop) {
         self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
+        self.makeReviewExecutor = makeExecutor; self.openPhotoshopDocument = openPhotoshopDocument
     }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
@@ -205,12 +227,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     private func desiredImageIdentity(_ task: WorkflowSideTask) -> WorkflowPreviewImageIdentity? {
         guard let roles = task.roleImages,roles.snapshotVersion == task.snapshot?.contentVersion else { return nil }
+        if usesFinalization && stage == .png4k && !hasRequestedExportPreview(task) { return nil }
         let mode = stage == .png4k ? "抠图" : previewMode
         let url = mode == "蒙版" ? roles.maskPNG : mode == "抠图" ? roles.cutoutPNG : roles.basePNG
         return WorkflowPreviewImageIdentity(sourceVersion: roles.snapshotVersion,url: url,maximumPixelSize: detailRequested.contains(task.id) ? Int(max(roles.pixelSize.width,roles.pixelSize.height)) : 2048)
     }
     func loadCurrentDetail() {
-        guard manualTaskID == nil || usesFinalization,let task = currentTask else { return }
+        guard manualTaskID == nil || usesFinalization,let task = currentTask,desiredImageIdentity(task) != nil else { return }
         retainCurrentDetailOnly()
         detailRequested.insert(task.id); requestPreview(task: task)
     }
@@ -241,6 +264,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     var canResumeAutomatic: Bool {
         guard batch?.isPaused == true else { return false }
+        guard manualReviewSessionID == nil, !isUpdatingReview else { return false }
         return !usesFinalization || manualTaskID == nil || batch?.activeTasks.contains { task in
             [WorkflowStage.stack,.matte,.geometry].contains { task[$0].state == .pending }
         } == true
@@ -250,13 +274,30 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         if usesFinalization && stage == .png4k && task[.hd].state == .failed { return task[.hd] }
         return task[stage]
     }
+    private func isReviewable(_ task: WorkflowSideTask) -> Bool {
+        task.snapshot?.taskID == task.id && task[.stack].state == .completed && task[.matte].state == .completed &&
+            [.waitingReview,.completed].contains(task[.geometry].state) &&
+            task.geometryApplySourceVersion == nil && task.manualAdoptionRequired != true
+    }
+    var hasManualEditing: Bool { manualTaskID != nil || manualReviewSessionID != nil }
+    var hasQueuedExports: Bool { batch?.activeTasks.contains { !($0.requestedExports ?? [:]).isEmpty } == true }
     var canFinalize: Bool {
-        guard usesFinalization, manualTaskID == nil, let task = currentTask,
-              task.manualAdoptionRequired != true, task.geometryApplySourceVersion == nil,
-              [.waitingReview, .completed].contains(task[.geometry].state),
-              displayImage(for: task) != nil, !loading.contains(task.id),
-              task.roleImages?.snapshotVersion == task.snapshot?.contentVersion else { return false }
-        return gates[task.id]?.canConfirm == true
+        guard usesFinalization, !busy, !isUpdatingReview, manualTaskID == nil,
+              currentSpecimen?.isExcluded == false, let task = currentTask, isReviewable(task) else { return false }
+        if task.manualEdit?.observedDocumentID != nil { return manualObservationError != nil }
+        return task[.geometry].state == .waitingReview || task.manualEdit != nil || task.manualEditError != nil
+    }
+    func reviewStatus(_ task: WorkflowSideTask) -> String {
+        if photoshopOpenErrors[task.id] != nil { return "打开失败" }
+        if task.manualEditError != nil { return "确认失败" }
+        if let edit = task.manualEdit { return edit.observedDocumentID == nil ? "等待打开" : "精修中" }
+        if task[.geometry].state == .completed { return "已确认" }
+        if task[.geometry].state == .waitingReview { return "待检查" }
+        return task[.geometry].state.title
+    }
+    func outputPreparationStatus(_ task: WorkflowSideTask) -> String? {
+        if task.finalPreparationError != nil { return "输出校验失败" }
+        return task.pendingFinalPSD == nil ? nil : "待准备输出"
     }
     @Published var notice: String?
     @Published var exportPolicy: WorkflowExportPolicy = .skipExisting
@@ -289,7 +330,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             if queueFilter == "全部" { return true }
             return [specimen.front,specimen.back].contains { task in
                 switch queueFilter {
-                case "失败": return task.records.values.contains { $0.state == .failed }
+                case "失败": return photoshopOpenErrors[task.id] != nil || task.manualEditError != nil ||
+                    task.finalPreparationError != nil || task.records.values.contains { $0.state == .failed }
                 case "待检查": return task[.geometry].state == .waitingReview
                 case "已确认": return task[.geometry].state == .completed
                 case "待导出": return task[.geometry].state == .completed && (task[.hd].state != .completed || task[.png4k].state != .completed)
@@ -302,6 +344,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let task = currentTask else { return }
         // 选择变化由视图统一准备预览，避免阶段切换提前重复派发解码任务。
         isSelectingTaskStage = true; defer { isSelectingTaskStage = false }
+        if usesFinalization, isReviewable(task) {
+            if stage == .hd || stage == .png4k { return }
+            if hasManualEditing { stage = .hd; return }
+        }
         if task[.geometry].state == .completed { stage = .png4k }
         else if task[.geometry].state == .waitingReview { stage = .hd }
         else { stage = [WorkflowStage.stack,.matte,.geometry].first { task[$0].state != .completed } ?? .hd }
@@ -310,8 +356,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let task = runningTask, let specimen = batch?.specimens.first(where: { $0.front.id == task.id || $0.back.id == task.id }) else { return }
         currentSpecimenID = specimen.id; face = task.side; selectCurrentTaskStage()
     }
+    private var nextReviewTask: WorkflowSideTask? {
+        batch?.activeTasks.first { $0.id != currentTask?.id && $0.manualEdit == nil && $0[.geometry].state == .waitingReview }
+    }
+    var hasNextReview: Bool { nextReviewTask != nil }
     func nextReview() {
-        guard let batch, let task = batch.activeTasks.first(where: { $0.id != currentTask?.id && $0[.geometry].state == .waitingReview }),
+        guard let batch, let task = nextReviewTask,
               let specimen = batch.specimens.first(where: { $0.front.id == task.id || $0.back.id == task.id }) else { return }
         currentSpecimenID = specimen.id; face = task.side; stage = .hd
     }
@@ -321,10 +371,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         else { launch(action) }
     }
     func confirmCurrent() {
-        guard canFinalize, let e = executor, let b = batch, let task = currentTask, let version = task.snapshot?.contentVersion else { return }
-        enqueue { [self] in
-            try await e.confirmFinalTasks(batchID: b.id, versions: [task.id:version]); await sync()
-            notice = "此图已确认，可以单独或批量导出"
+        guard canFinalize, let task = currentTask else { return }
+        updateReview { executor, batchID in
+            try await executor.confirmSavedTasks(batchID: batchID, taskIDs: [task.id])
         }
     }
     func exportTaskIDs(scope: String) -> Set<UUID> {
@@ -332,15 +381,30 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         if scope == "此图" { candidates = currentTask.map { [$0] } ?? [] }
         else if scope == "所选" { candidates = batch?.activeTasks.filter { selectedTaskIDs.contains($0.id) } ?? [] }
         else { candidates = batch?.activeTasks ?? [] }
-        return Set(candidates.filter { $0[.geometry].state == .completed && $0[.geometry].confirmedVersion == $0.snapshot?.contentVersion }.map(\.id))
+        return Set(candidates.filter { task in
+            task.manualEdit == nil && task[.geometry].state == .completed &&
+                task.finalPSDVersion != nil && task[.geometry].confirmedVersion == task.finalPSDVersion
+        }.map(\.id))
     }
     func exportImages(scope: String) {
-        guard let e = executor, let b = batch else { return }
+        guard !isUpdatingReview, let e = executor, let b = batch else { return }
         let ids = exportTaskIDs(scope: scope), kinds = Set(([exportHDSelected ? WorkflowAssetKind.hd : nil, exportPNGSelected ? .png4k : nil]).compactMap { $0 })
         guard !ids.isEmpty,!kinds.isEmpty else { error = "请选择已确认图片及至少一种输出"; return }
         let policy = exportPolicy, layouts = layouts.filter { ids.contains($0.key) }
-        notice = busy ? "已加入导出队列，等待自动处理结束" : manualTaskID != nil ? "已加入导出队列，等待结束人工编辑并继续" : "正在导出"
-        enqueue { [self] in try await e.requestExports(batchID: b.id,taskIDs: ids,kinds: kinds,policy: policy,layouts: layouts); await sync(); notice = batch?.activeTasks.contains(where: { !($0.requestedExports ?? [:]).isEmpty }) == true ? "导出已排队，逐张结果会持续更新" : "导出任务结束，逐张结果见导出记录" }
+        if manualReviewSessionID != nil {
+            updateReview { [self] executor, batchID in
+                try await executor.requestExports(batchID: batchID, taskIDs: ids, kinds: kinds, policy: policy, layouts: layouts)
+                await sync()
+                notice = hasQueuedExports ? "已加入导出队列" : "导出任务结束，逐张结果见导出记录"
+            }
+        } else {
+            notice = hasManualEditing ? "正在加入导出队列" : "正在导出"
+            enqueue { [self] in
+                try await e.requestExports(batchID: b.id,taskIDs: ids,kinds: kinds,policy: policy,layouts: layouts)
+                await sync()
+                notice = hasQueuedExports ? "导出已排队，逐张结果会持续更新" : "导出任务结束，逐张结果见导出记录"
+            }
+        }
     }
     func finishEditing() {
         guard let e = executor,let b = batch else { return }
@@ -358,13 +422,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let outputDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Butterfly Toolkit/PhotoWorkflow/\(UUID().uuidString)", isDirectory: true)
         let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
-        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K,provider = WorkflowMatteProvider.photoshop
+        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K,provider = WorkflowMatteProvider.photoshop,request = draftGeometryRequest
         launch { [self] in
-            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK,manualFinalization: true,matteProvider: provider) }.value
+            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK,manualFinalization: true,matteProvider: provider,geometryRequest: request) }.value
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)
-            await clearPreviewState(); executor = e; manifestURL = manifest
+            await clearPreviewState(); executor = e
             batch = try await e.batch(batchID: frozen.id); currentSpecimenID = frozen.specimens.first { !$0.isExcluded }?.id; selectedSpecimens = Set(frozen.specimens.filter { !$0.isExcluded }.map(\.id))
             try await e.runPending(batchID: frozen.id)
         }
@@ -375,7 +439,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let directory = draft?.directory else { return nil }
         return directory.appendingPathComponent(directory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
     }
+    var canChangeExportDirectory: Bool { canSwitchBatch }
     func selectExportDirectory(_ url: URL, kind: WorkflowAssetKind) {
+        guard canChangeExportDirectory else { return }
         guard let executor, let batch else {
             if kind == .hd { hdDirectory = url } else { png4kDirectory = url }
             return
@@ -383,46 +449,55 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         launch { try await executor.setExportDirectory(batchID: batch.id, kind: kind, directory: url) }
     }
 
-    private var canSwitchBatch: Bool { !busy && manualTaskID == nil }
+    var canSwitchBatch: Bool { !busy && !isUpdatingReview && !hasManualEditing }
     func openBatch(_ url: URL) {
-        guard canSwitchBatch else { error = "请先结束当前操作，并保存、刷新及明确继续人工 PSD 编辑"; return }
+        guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
         launch { [self] in
             try await persistBeforeSwitch()
             let e = makeExecutor(output: url.deletingLastPathComponent())
             let id = try await e.register(manifestURL: url)
             let value = try await e.batch(batchID: id)
-            await clearPreviewState(); executor = e; manifestURL = url; batch = value
+            let session = await e.manualReviewLeaseID(batchID: id)
+            await clearPreviewState(); executor = e; batch = value; manualReviewSessionID = session
             currentSpecimenID = value.specimens.first { !$0.isExcluded }?.id
             selectedSpecimens = Set(value.specimens.filter { !$0.isExcluded }.map(\.id))
-            stage = value.currentStage ?? .png4k
+            if let editing = value.activeTasks.first(where: { $0.manualEdit != nil }),
+               let specimen = value.specimens.first(where: { $0.front.id == editing.id || $0.back.id == editing.id }) {
+                currentSpecimenID = specimen.id; face = editing.side; stage = .hd
+            } else {
+                stage = value.currentStage ?? .png4k
+                if value.manualFinalization == true && stage == .geometry {
+                    if currentTask?[.geometry].state == .waitingReview { stage = .hd }
+                    else { nextReview() }
+                }
+            }
         }
     }
     func closeBatch() {
-        guard canSwitchBatch else { error = "请先结束当前操作，并保存、刷新及明确继续人工 PSD 编辑"; return }
+        guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
         launch { [self] in
             try await persistBeforeSwitch()
-            await clearPreviewState(); executor = nil; manifestURL = nil; batch = nil
+            await clearPreviewState(); executor = nil; batch = nil; manualReviewSessionID = nil
             currentSpecimenID = nil; selectedSpecimens = []; draft = nil; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
         }
     }
     private func persistBeforeSwitch() async throws {
-        guard manualTaskID == nil else { throw WorkflowStateError.invalidTransition }
-        guard let executor,let batch,let manifestURL else { return }
-        await executor.pause(batchID: batch.id)
-        let paused = try await executor.batch(batchID: batch.id)
-        // 执行器暂停采用尽力保存策略；切换批次则必须确认持久化成功。
-        try await WorkflowBatchStore().save(paused,to: manifestURL)
-        self.batch = paused
+        guard let executor, let batch else { return }
+        try await executor.prepareToCloseBatch(batchID: batch.id)
+        await sync()
     }
     private func clearPreviewState() async {
         isResettingPreviews = true
         defer { isResettingPreviews = false }
         for task in previewTasks.values { task.cancel() }
+        exportPreviewVersions = [:]; preparingExportPreview = nil; photoshopOpenErrors = [:]
+        manualObservationError = nil; selectedTaskIDs = []
         previewTasks = [:]; images = [:]; imageIdentities = [:]; requestedImageIdentities = [:]
         gates = [:]; solutions = [:]; requests = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; warmSources = []; cancelMove()
         await geometry.removeAll()
     }
     private func makeExecutor(output: URL) -> WorkflowExecutor {
+        if let makeReviewExecutor { return makeReviewExecutor(output) }
         let workspace = output.appendingPathComponent(".work")
         return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),geometry: geometry))
     }
@@ -438,33 +513,56 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func sync(readBatch: @Sendable (WorkflowExecutor,UUID) async throws -> WorkflowBatch = { try await $0.batch(batchID: $1) }) async {
-        guard let executor,let id = batch?.id else { return }
+        guard let executor,let id = batch?.id,let revision = batch?.revision else { return }
         do {
             let value = try await readBatch(executor,id)
             // 读取可能跨越批次切换；只接收仍属于当前执行器与批次的返回值。
-            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id else { return }
-            let previous = batch; batch = value
-            if let currentTask, let old = previous?.task(id: currentTask.id),
-               old[stage].state == .running, currentTask[stage].state != .running {
-                selectCurrentTaskStage()
+            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,
+                  let previous = batch,previous.id == id,value.revision >= previous.revision else { return }
+            if value.revision == previous.revision { return }
+            batch = value
+            if let currentTask, let old = previous.task(id: currentTask.id) {
+                if usesFinalization, [.stack,.matte,.geometry].contains(stage),
+                   !isReviewable(old), isReviewable(currentTask) {
+                    stage = .hd
+                } else if old[stage].state == .running, currentTask[stage].state != .running {
+                    selectCurrentTaskStage()
+                }
             }
-            for task in value.sideTasks where task.roleImages != previous?.task(id: task.id)?.roleImages {
-                images[task.id] = nil; solutions[task.id] = nil; requests[task.id] = nil; gates[task.id] = nil
-                if task.roleImages != nil { requestPreview(task: task) }
+            let previousTasks = Dictionary(uniqueKeysWithValues: previous.sideTasks.map { ($0.id, $0) })
+            for task in value.sideTasks {
+                guard let old = previousTasks[task.id] else { continue }
+                if photoshopOpenErrors[task.id] != nil, task.manualEdit == nil || task.manualEdit?.observedDocumentID != nil {
+                    photoshopOpenErrors[task.id] = nil
+                }
+                let changedVersion = task.finalPSDVersion != old.finalPSDVersion || task.sourceRevision != old.sourceRevision
+                guard changedVersion || task.roleImages != old.roleImages else { continue }
+                invalidatePreview(task.id)
+                if changedVersion { layouts[task.id] = nil; exportPreviewVersions[task.id] = nil }
+                if !usesFinalization || task.id == currentSpecimen?.front.id || task.id == currentSpecimen?.back.id {
+                    requestPreview(task: task)
+                }
             }
         } catch {
-            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id else { return }
+            guard !Task.isCancelled,!isResettingPreviews,self.executor === executor,batch?.id == id,batch?.revision == revision else { return }
             self.error = error.localizedDescription
         }
+    }
+    private func invalidatePreview(_ id: UUID) {
+        previewTasks.removeValue(forKey: id)?.cancel()
+        images[id] = nil; imageIdentities[id] = nil; requestedImageIdentities[id] = nil
+        solutions[id] = nil; requests[id] = nil; gates[id] = nil; loading.remove(id)
+        previewInteractionStarted[id] = nil
     }
     func prepareSelected() {
         guard manualTaskID == nil || usesFinalization,let batch else { return }
         let ordered = batch.specimens.filter { $0.id == currentSpecimenID }
-            + batch.specimens.filter { $0.id != currentSpecimenID && selectedSpecimens.contains($0.id) }
+            + (usesFinalization ? [] : batch.specimens.filter { $0.id != currentSpecimenID && selectedSpecimens.contains($0.id) })
         var visible: [Task<Void,Never>] = []
         for specimen in ordered {
-            for task in [specimen.front,specimen.back] where task.roleImages != nil {
-                if gates[task.id] == nil || requestedImageIdentities[task.id] != desiredImageIdentity(task) {
+            for task in [specimen.front,specimen.back] {
+                guard let identity = desiredImageIdentity(task) else { continue }
+                if gates[task.id] == nil || requestedImageIdentities[task.id] != identity {
                     requestPreview(task: task,after: specimen.id == currentSpecimenID ? [] : visible)
                 }
                 if specimen.id == currentSpecimenID,let pending = previewTasks[task.id] { visible.append(pending) }
@@ -521,7 +619,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         return l.safeMargin >= 0 && l.safeMargin <= 512 && l.center.x-b.width*s/2 >= 0 && l.center.y-b.height*s/2 >= 0 && l.center.x+b.width*s/2 <= 4096 && l.center.y+b.height*s/2 <= 4096
     }
     private func requestPreview(task: WorkflowSideTask,request: GeometryRequest? = nil,after predecessors: [Task<Void,Never>] = []) {
-        guard !isResettingPreviews,let roles = task.roleImages,let identity = desiredImageIdentity(task) else { return }
+        guard !isResettingPreviews, let batchID = batch?.id, let roles = task.roleImages, let identity = desiredImageIdentity(task) else { return }
         previewTasks[task.id]?.cancel()
         requestedImageIdentities[task.id] = identity
         if imageIdentities[task.id] != identity { images[task.id] = nil; imageIdentities[task.id] = nil }
@@ -535,22 +633,25 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             do {
                 try Task.checkCancellation()
                 let image = try await previews.image(url: identity.url,version: roles.snapshotVersion,maximumPixelSize: identity.maximumPixelSize)
-                guard !Task.isCancelled,gates[task.id]?.token == token,desiredImageIdentity(task) == identity else { return }
+                guard !Task.isCancelled, batch?.id == batchID, batch?.task(id: task.id)?.roleImages == roles,
+                      gates[task.id]?.token == token else { return }
                 imageIdentities[task.id] = identity; images[task.id] = image
                 let solution = try await previews.geometry(source: roles,request: request,savedCandidate: useSaved ? saved : nil)
-                guard !Task.isCancelled,gates[task.id]?.token == token else { return }
+                guard !Task.isCancelled, batch?.id == batchID, batch?.task(id: task.id)?.roleImages == roles,
+                      gates[task.id]?.token == token else { return }
                 guard solution.sourceVersion == roles.snapshotVersion else { throw WorkflowBridgeError.staleSource }
                 guard !Task.isCancelled,gates[task.id]?.accept(token: token,sourceVersion: roles.snapshotVersion,valid: solution.isApplicable) == true else { return }
                 solutions[task.id] = solution; loading.remove(task.id); warmSources.insert(roles.snapshotVersion)
             } catch is CancellationError {} catch {
-                guard gates[task.id]?.token == token else { return }; loading.remove(task.id); self.error = error.localizedDescription
+                guard !Task.isCancelled, batch?.id == batchID, gates[task.id]?.token == token else { return }
+                loading.remove(task.id); self.error = error.localizedDescription
             }
         }
     }
     // MARK: - 检查点确认与人工编辑
     func primary() {
         if usesFinalization {
-            if stage == .hd || stage == .geometry { confirmCurrent() }
+            if stage == .hd { confirmCurrent() }
             else if stage == .png4k { exportImages(scope: "此图") }
             return
         }
@@ -560,11 +661,6 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             switch stage {
             case .stack,.matte: try await e.continueAfterReview(batchID: b.id,stage: stage,specimenIDs: b.specimens.filter { !$0.isExcluded }.map(\.id))
             case .geometry:
-                if usesFinalization {
-                    try await e.confirmFinalPSD(batchID: b.id,specimenIDs: selectedSpecimens)
-                    manualTaskID = nil; await clearPreviewState(); await sync(); stage = .png4k
-                    return
-                }
                 try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: selected.compactMap { task in solutions[task.id].map { (task.id,$0) } }),exportHD: true)
             case .png4k:
                 try await e.confirm4K(batchID: b.id,layouts: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,layouts[$0.id] ?? $0.squareLayout) }))
@@ -573,22 +669,172 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             }
         }
     }
-    func retry() { guard let e = executor,let b = batch else { return }; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: Set(b.activeTasks.map(\.id))) } }
+    func retry() { guard let e = executor,let b = batch else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: Set(b.activeTasks.map(\.id)),stage: stage) } }
     func reprocessCurrent(from stage: WorkflowStage) {
-        guard let e = executor, let b = batch, let task = currentTask else { return }
+        guard !hasManualEditing, !isUpdatingReview, let e = executor, let b = batch, let task = currentTask else { return }
         launch { [self] in
-            try await e.reprocessTask(batchID: b.id,taskID: task.id,from: stage,expectedVersion: task.snapshot?.contentVersion)
-            await clearPreviewState(); await sync(); selectCurrentTaskStage()
+            try await e.reprocessTask(batchID: b.id,taskID: task.id,from: stage,expectedVersion: task.finalPSDVersion)
+            invalidatePreview(task.id); layouts[task.id] = nil; exportPreviewVersions[task.id] = nil
+            await sync(); selectCurrentTaskStage()
         }
     }
-    func retryCurrent() { guard let e = executor,let b = batch,let task = currentTask else { return }; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: [task.id]) } }
+    func retryCurrent() { guard let e = executor,let b = batch,let task = currentTask else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: [task.id],stage: stage) } }
     func excludeSelected() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.update(batchID: b.id,event: .excludeSpecimens(ids: selectedSpecimens,reason: "用户暂不处理",expectedRevision: b.revision)); try await e.runPending(batchID: b.id) } }
     func pause() { guard let e = executor,let b = batch else { return }; notice = "正在等待当前步骤安全保存并暂停"; Task { await e.pause(batchID: b.id); await sync() } }
     func resume() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.continueAutomatic(batchID: b.id); manualTaskID = nil } }
-    var canOpenPSD: Bool { currentTask?.snapshot != nil && (manualTaskID == nil || manualTaskID == currentTask?.id) }
+    private func usesBatchReview(for task: WorkflowSideTask) -> Bool {
+        usesFinalization && manualTaskID != task.id && isReviewable(task)
+    }
+    var canOpenPSD: Bool {
+        guard let task = currentTask, task.snapshot != nil, currentSpecimen?.isExcluded == false else { return false }
+        // 未走完自动阶段的面仍可用旧的单面修补入口。
+        if !usesBatchReview(for: task) {
+            return !isUpdatingReview && manualReviewSessionID == nil && (manualTaskID == nil || manualTaskID == task.id)
+        }
+        return !busy && !isUpdatingReview && manualTaskID == nil && canOpenReviewPSD(task)
+    }
     func openPSD() {
         guard canOpenPSD,let e = executor,let b = batch,let task = currentTask else { return }
-        enqueue { [self] in let url = try await e.beginManualEditing(batchID: b.id,taskID: task.id); manualTaskID = task.id; if usesFinalization { stage = .geometry }; NSWorkspace.shared.open(url) }
+        if usesBatchReview(for: task) {
+            openReviewPSDs([task.id])
+        } else {
+            enqueue { [self] in
+                let url = try await e.beginManualEditing(batchID: b.id,taskID: task.id)
+                manualTaskID = task.id
+                try await openPhotoshopDocument(url)
+            }
+        }
+    }
+    // MARK: - 批量精修与按需输出预览
+
+    var trackedReviewCount: Int { batch?.activeTasks.filter { $0.manualEdit != nil }.count ?? 0 }
+    private func canOpenReviewPSD(_ task: WorkflowSideTask) -> Bool {
+        isReviewable(task) && task.manualEdit?.observedDocumentID == nil
+    }
+    var selectedReviewTaskIDs: Set<UUID> {
+        Set((batch?.activeTasks ?? []).filter { selectedTaskIDs.contains($0.id) && canOpenReviewPSD($0) }.map(\.id))
+    }
+    var canOpenSelectedPSDs: Bool {
+        usesFinalization && !busy && !isUpdatingReview && manualTaskID == nil && !selectedReviewTaskIDs.isEmpty
+    }
+    func openSelectedPSDs() {
+        guard canOpenSelectedPSDs else { return }
+        openReviewPSDs(selectedReviewTaskIDs)
+    }
+    private func openReviewPSDs(_ ids: Set<UUID>) {
+        updateReview { [self] executor, batchID in
+            let urls = try await executor.beginBatchEditing(batchID: batchID, taskIDs: ids)
+            await sync()
+            let selected = batch?.activeTasks.filter { ids.contains($0.id) } ?? []
+            for url in urls {
+                guard let id = selected.first(where: { $0.manualEdit?.workingURL == url })?.id else { throw WorkflowStateError.invalidTransition }
+                photoshopOpenErrors[id] = nil
+                do { try await openPhotoshopDocument(url) }
+                catch { photoshopOpenErrors[id] = error.localizedDescription }
+            }
+        }
+    }
+    private static func openInPhotoshop(_ url: URL) async throws {
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.Photoshop") else {
+            throw WorkflowBridgeError.photoshop("找不到 Adobe Photoshop")
+        }
+        _ = try await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: .init())
+    }
+    var canStopTrackingCurrentPSD: Bool {
+        guard let edit = currentTask?.manualEdit else { return false }
+        return edit.observedDocumentID == nil && !isUpdatingReview
+    }
+    func stopTrackingCurrentPSD() {
+        guard canStopTrackingCurrentPSD, let id = currentTask?.id else { return }
+        updateReview { executor, batchID in
+            try await executor.cancelClosedBatchEdits(batchID: batchID, taskIDs: [id])
+        }
+    }
+
+    /// 和轮询串行进入执行器，选择图片和切换面板在等待期间仍然可用。
+    private func updateReview(_ action: @escaping (WorkflowExecutor, UUID) async throws -> Void) {
+        guard !isUpdatingReview, let executor, let id = batch?.id else { return }
+        isUpdatingReview = true; error = nil
+        Task { [self] in
+            await reviewObservation?.value
+            do { try await action(executor, id) }
+            catch { self.error = error.localizedDescription }
+            await sync()
+            await syncReviewLease(executor, batchID: id)
+            isUpdatingReview = false
+            continueQueuedExports()
+        }
+    }
+    private func syncReviewLease(_ executor: WorkflowExecutor, batchID: UUID) async {
+        let session = await executor.manualReviewLeaseID(batchID: batchID)
+        guard !Task.isCancelled, self.executor === executor, batch?.id == batchID else { return }
+        if manualReviewSessionID != session { manualReviewSessionID = session }
+        if session == nil, manualObservationError != nil { manualObservationError = nil }
+    }
+    /// 生命周期由界面绑定到实际占用，清单保存失败时继续重试。
+    func observeManualEdits(sessionID: UUID) async {
+        while !Task.isCancelled, let executor, let batch, manualReviewSessionID == sessionID {
+            if !isUpdatingReview && reviewObservation == nil {
+                let poll = Task { [self] in
+                    defer { reviewObservation = nil }
+                    do {
+                        try await executor.pollManualEdits(batchID: batch.id)
+                        guard !Task.isCancelled else { return }
+                        if manualObservationError != nil { manualObservationError = nil }
+                    } catch is CancellationError { return }
+                    catch {
+                        guard !Task.isCancelled else { return }
+                        let message = error.localizedDescription
+                        if manualObservationError != message { manualObservationError = message }
+                    }
+                    await sync()
+                    await syncReviewLease(executor, batchID: batch.id)
+                    continueQueuedExports()
+                }
+                reviewObservation = poll
+                await withTaskCancellationHandler { await poll.value } onCancel: { poll.cancel() }
+            }
+            try? await Task.sleep(for: .milliseconds(650))
+        }
+    }
+    private func continueQueuedExports() {
+        guard !hasManualEditing, !isUpdatingReview, hasQueuedExports, let executor, let batch, !batch.isPaused else { return }
+        launch { [self] in
+            try await executor.runPending(batchID: batch.id)
+            await sync()
+            if !hasQueuedExports { notice = "导出任务结束，逐张结果见导出记录" }
+        }
+    }
+
+    func hasRequestedExportPreview(_ task: WorkflowSideTask) -> Bool {
+        guard let version = task.finalPSDVersion else { return false }
+        return exportPreviewVersions[task.id] == version
+    }
+    var canLoadCurrentExportPreview: Bool {
+        guard usesFinalization, stage == .png4k, currentSpecimen?.isExcluded == false, let task = currentTask,
+              !hasManualEditing, !busy, !isUpdatingReview, !loading.contains(task.id),
+              task[.geometry].state == .completed, let version = task.finalPSDVersion,
+              task[.geometry].confirmedVersion == version else { return false }
+        return !hasRequestedExportPreview(task) || displayImage(for: task) == nil || task.finalPreparationError != nil
+    }
+    func loadCurrentExportPreview() {
+        guard canLoadCurrentExportPreview, let task = currentTask, let version = task.finalPSDVersion else { return }
+        if task.pendingFinalPSD == nil && task.finalPreparationError == nil && task.roleImages != nil {
+            exportPreviewVersions[task.id] = version
+            requestPreview(task: task)
+            return
+        }
+        preparingExportPreview = task.id
+        updateReview { [self] executor, batchID in
+            defer { preparingExportPreview = nil }
+            try await executor.prepareFinalPSD(batchID: batchID, taskID: task.id)
+            await sync()
+            guard batch?.id == batchID, let prepared = batch?.task(id: task.id),
+                  prepared.finalPSDVersion == version else { return }
+            guard prepared.roleImages != nil else { throw WorkflowBridgeError.invalidImage("没有可用的输出预览") }
+            exportPreviewVersions[task.id] = version
+            if stage == .png4k { requestPreview(task: prepared) }
+        }
     }
     func migrateToFinalization() {
         guard let e = executor,let b = batch else { return }
@@ -612,7 +858,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             if usesFinalization {
                 if manualTaskID == taskID { try await e.refreshManualPSD(batchID: b.id,taskID: taskID) }
                 else { try await e.refreshFinalPSD(batchID: b.id,taskID: taskID) }
-                await clearPreviewState(); await sync(); stage = .geometry; return
+                await clearPreviewState(); await sync(); stage = .hd; return
             }
             try await e.refreshSavedPSD(batchID: b.id,taskID: taskID,change: manualChange); await sync(); if let task = batch?.task(id: taskID) { requestPreview(task: task) }; if manualChange != .maskOnly { stage = .geometry } }
     }

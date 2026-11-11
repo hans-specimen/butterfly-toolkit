@@ -3,6 +3,46 @@ import XCTest
 
 @MainActor
 final class WorkflowOutputTests: XCTestCase {
+    func testDraftFreezesCropChoicesForEveryFaceAndAutomaticProcessingReadsThem() async throws {
+        let f = try ExecutorFixture(checks: false,count: 2)
+        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
+        let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
+        let request = GeometryRequest(ratio: .fiveByFour,targetMargin: 0.16)
+        let batch = try draft.freeze(names: "first\nsecond",output: f.batch.sourceDirectory.appendingPathComponent("output"),checkStack: false,checkMatte: false,manualFinalization: true,geometryRequest: request)
+        XCTAssertEqual(batch.activeTasks.count,4)
+        for task in batch.activeTasks {
+            XCTAssertEqual(task.geometryRequest.ratio,.fiveByFour)
+            XCTAssertEqual(task.geometryRequest.targetMargin,0.16)
+            XCTAssertEqual(task.geometryRequest.angleStrategy,.automaticWingTips)
+        }
+        var services = f.services
+        services.analyze = { roles, received in
+            XCTAssertEqual(received.ratio,.fiveByFour)
+            XCTAssertEqual(received.targetMargin,0.16)
+            await f.probe.record("analyze-frozen-request")
+            return ExecutorFixture.solution(roles.snapshotVersion)
+        }
+        let executor = WorkflowExecutor(services: services)
+        try await executor.register(batch: batch,manifestURL: batch.outputDirectory.appendingPathComponent("batch.json"))
+        try await executor.runPending(batchID: batch.id)
+        let result = try await executor.batch(batchID: batch.id)
+        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
+        let calls = await f.probe.values()
+        XCTAssertEqual(calls.filter { $0 == "analyze-frozen-request" }.count,4)
+    }
+
+    func testDraftCropDefaultsKeepExistingCallersCompatible() throws {
+        let f = try ExecutorFixture(checks: false)
+        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
+        let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
+        let batch = try draft.freeze(names: "sample",output: f.batch.sourceDirectory.appendingPathComponent("output"),checkStack: true,checkMatte: true)
+        for task in batch.activeTasks {
+            XCTAssertEqual(task.geometryRequest.ratio,.adaptive)
+            XCTAssertEqual(task.geometryRequest.targetMargin,0.1)
+            XCTAssertEqual(task.geometryRequest.angleStrategy,.automaticWingTips)
+        }
+    }
+
     func testSkipPolicyAtPublicationPreservesReappearedOwnedFile() throws {
         let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
         let store = WorkflowArtifactStore()

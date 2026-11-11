@@ -95,6 +95,38 @@ nonisolated enum WorkflowPSDChange: String, Codable, Equatable, Sendable {
 }
 
 // MARK: - 单面任务与批次记录
+// MARK: - 人工精修的打开基线与保存凭据
+
+nonisolated struct WorkflowPSDFileVersion: Codable, Equatable, Sendable {
+    let hash: String
+    let modificationDate: Date
+
+    static func isHash(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+}
+
+nonisolated struct WorkflowManualEdit: Codable, Equatable, Sendable {
+    let sessionID: UUID
+    let workingURL: URL
+    let baseline: WorkflowPSDFileVersion
+    var observedDocumentID: Int?
+}
+
+nonisolated struct WorkflowAcceptedFinalPSD: Codable, Equatable, Sendable {
+    let taskID: UUID
+    let sourceRevision: Int
+    let workingURL: URL
+    let snapshotURL: URL
+    let contentVersion: String
+}
+
+nonisolated struct WorkflowOpenPhotoshopDocument: Equatable, Sendable {
+    let url: URL
+    let documentID: Int
+    let saved: Bool
+}
+
 nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable {
     var id: UUID = UUID()
     var side: WorkflowSide
@@ -122,6 +154,20 @@ nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable 
     var historicalArtifacts: [WorkflowArtifact]?
     var requestedExports: [WorkflowAssetKind: WorkflowExportRequest]?
     var exportNotes: [WorkflowAssetKind: String]?
+    var manualEdit: WorkflowManualEdit?
+    var manualEditError: String?
+    var acceptedFinalPSD: WorkflowAcceptedFinalPSD?
+    var finalPreparationError: String?
+
+    var finalPSDVersion: String? { acceptedFinalPSD?.contentVersion ?? snapshot?.contentVersion }
+    var pendingFinalPSD: WorkflowAcceptedFinalPSD? {
+        guard let acceptedFinalPSD else { return nil }
+        if snapshot?.contentVersion == acceptedFinalPSD.contentVersion,
+           snapshot?.snapshotURL == acceptedFinalPSD.snapshotURL,
+           snapshot?.finalRoles?.isValid == true, roleImages?.isFinalized == true,
+           roleImages?.snapshotVersion == acceptedFinalPSD.contentVersion { return nil }
+        return acceptedFinalPSD
+    }
 
     subscript(stage: WorkflowStage) -> WorkflowStageRecord {
         get { records[stage] ?? WorkflowStageRecord(stage: stage) }
@@ -174,6 +220,23 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
 
     var sideTasks: [WorkflowSideTask] { specimens.flatMap { [$0.front, $0.back] } }
     var activeTasks: [WorkflowSideTask] { specimens.filter { !$0.isExcluded }.flatMap { [$0.front, $0.back] } }
+    var manualReviewSessionID: UUID? { activeTasks.lazy.compactMap { $0.manualEdit?.sessionID }.first }
+
+    func acceptedFinalURL(taskID: UUID, contentVersion: String) -> URL {
+        outputDirectory.appendingPathComponent(".work/accepted-final/\(taskID)/\(contentVersion).psd")
+    }
+
+    func validateAcceptedFinalURL(_ url: URL, taskID: UUID, contentVersion: String) throws {
+        let relative = ".work/accepted-final/\(taskID)/\(contentVersion).psd"
+        let rooted = outputDirectory.resolvingSymlinksInPath().standardizedFileURL.appendingPathComponent(relative)
+        guard WorkflowPSDFileVersion.isHash(contentVersion),
+              url == acceptedFinalURL(taskID: taskID, contentVersion: contentVersion),
+              Self.isContained(url, in: outputDirectory),
+              url.resolvingSymlinksInPath().standardizedFileURL.path == rooted.path else {
+            throw WorkflowStateError.invalidManifest("Invalid accepted PSD path")
+        }
+    }
+
     /// 从各面的持久记录推导阶段，使已确认的部分标本可以独立推进。
     var currentStage: WorkflowStage? {
         let stage = WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
@@ -291,6 +354,11 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
         }
         let identities = specimens.map(\.id) + sideTasks.map(\.id)
         guard Set(identities).count == identities.count else { throw WorkflowStateError.invalidManifest("Duplicate task identity") }
+        let edits = sideTasks.compactMap(\.manualEdit)
+        guard Set(edits.map(\.sessionID)).count <= 1,
+              Set(edits.map { $0.workingURL.resolvingSymlinksInPath().path }).count == edits.count else {
+            throw WorkflowStateError.invalidManifest("Invalid batch review session")
+        }
         for specimen in specimens {
             guard Self.isSafeBaseName(specimen.baseName),
                   specimen.front.side == .front, specimen.back.side == .back,
@@ -336,7 +404,30 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                         throw WorkflowStateError.invalidManifest("Matte requires a saved PSD with role identities")
                     }
                 }
-                if manualFinalization == true && task[.geometry].state == .completed {
+                if let review = task.manualEdit {
+                    guard manualFinalization == true, !specimen.isExcluded,
+                          review.workingURL == task.snapshot?.workingURL,
+                          WorkflowPSDFileVersion.isHash(review.baseline.hash),
+                          review.baseline.modificationDate.timeIntervalSinceReferenceDate.isFinite,
+                          (review.observedDocumentID ?? 1) > 0,
+                          task[.stack].state == .completed, task[.matte].state == .completed,
+                          [.waitingReview, .completed].contains(task[.geometry].state) else {
+                        throw WorkflowStateError.invalidManifest("Invalid PSD review baseline")
+                    }
+                    try validateOutputURL(review.workingURL)
+                }
+                if let accepted = task.acceptedFinalPSD {
+                    guard manualFinalization == true, !specimen.isExcluded,
+                          accepted.taskID == task.id, accepted.sourceRevision == task.sourceRevision,
+                          accepted.workingURL == task.snapshot?.workingURL,
+                          task[.geometry].state == .completed,
+                          task[.geometry].confirmedVersion == accepted.contentVersion else {
+                        throw WorkflowStateError.invalidManifest("Invalid accepted PSD version")
+                    }
+                    try validateOutputURL(accepted.workingURL)
+                    try validateAcceptedFinalURL(accepted.snapshotURL, taskID: task.id, contentVersion: accepted.contentVersion)
+                }
+                if manualFinalization == true && task[.geometry].state == .completed && task.pendingFinalPSD == nil {
                     guard task.snapshot?.finalRoles?.isValid == true,task.roleImages?.isFinalized == true,
                           task[.geometry].confirmedVersion == task.snapshot?.contentVersion else {
                         throw WorkflowStateError.invalidManifest("Final export requires confirmation of the saved final PSD")

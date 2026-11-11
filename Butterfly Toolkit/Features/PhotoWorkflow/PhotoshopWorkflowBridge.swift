@@ -1,6 +1,8 @@
 // 桥接 Photoshop 堆栈、蒙版回写、角色提取与几何操作，维护文档归属、不可变快照和中断恢复。
 
 import Foundation
+import AppKit
+import ApplicationServices
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -33,16 +35,18 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
     let workspace: URL
     private let coordinator: PhotoshopExecutionCoordinator
     private let scriptRunner: ScriptRunner
+    private let documentListRunner: ScriptRunner
     private let installCheckpoint: @Sendable (PhotoshopInstallCheckpoint) async throws -> Void
     @TaskLocal private static var performanceTaskID: UUID?
     private let performanceObserver: WorkflowPerformanceObserver?
-    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil, reuseDocumentsWithinOperation: Bool = false, stackProcessor: @escaping StackProcessor = { job, hook in
+    init(workspace: URL, coordinator: PhotoshopExecutionCoordinator = .shared, scriptRunner: @escaping ScriptRunner = { try await Self.execute($0) }, documentListRunner: @escaping ScriptRunner = { try await Self.executeInRunningPhotoshop($0) }, installCheckpoint: @escaping @Sendable (PhotoshopInstallCheckpoint) async throws -> Void = { _ in }, performanceObserver: WorkflowPerformanceObserver? = nil, reuseDocumentsWithinOperation: Bool = false, stackProcessor: @escaping StackProcessor = { job, hook in
         guard let application = FocusStackProcessor.photoshopApplicationName() else { throw FocusStackError.photoshopNotFound }
         let handoff = Self.taskDocument.map { Self.stackDocumentHandoffScript($0) }
         try await Task.detached(priority: .userInitiated) {
             try FocusStackProcessor.process(job, photoshopApplicationName: application, workflowPNGExportScript: hook, workflowDocumentHandoff: handoff)
         }.value
     }) {
+        self.documentListRunner = documentListRunner
         self.workspace = workspace; self.coordinator = coordinator; self.scriptRunner = scriptRunner; self.installCheckpoint = installCheckpoint; self.performanceObserver = performanceObserver; self.stackProcessor = stackProcessor; self.reuseDocumentsWithinOperation = reuseDocumentsWithinOperation
     }
     // MARK: - 持久归属与服务元数据
@@ -614,6 +618,115 @@ nonisolated struct PhotoshopWorkflowBridge: Sendable {
             try await capture(document: document,owner: owner,final: true)
         }
     }
+    func verifyManualSaveOwnership(document: URL, owner: UUID) throws {
+        let ownership = try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: ownershipURL(document)))
+        guard ownership.owner == owner else { throw WorkflowBridgeError.ownershipConflict }
+        guard ownership.pendingInstall == nil, ownership.pendingMutation == nil else {
+            throw WorkflowBridgeError.interruptedWrite("请先处理原步骤的保存凭据")
+        }
+    }
+
+    func prepareAcceptedFinalPSD(_ accepted: WorkflowAcceptedFinalPSD) async throws -> (PSDSnapshot, RoleImages) {
+        try await withLease("prepareFinalPSD", owner: accepted.taskID, savedRead: false, document: accepted.workingURL) {
+            func verifyFiles() throws {
+                try verifyManualSaveOwnership(document: accepted.workingURL, owner: accepted.taskID)
+                guard try hash(accepted.workingURL.path) == accepted.contentVersion,
+                      try hash(accepted.snapshotURL.path) == accepted.contentVersion else { throw WorkflowBridgeError.staleSource }
+            }
+            try verifyFiles()
+            let metadata = try await invoke(Self.inspectScript(document: accepted.snapshotURL, final: true))
+            guard metadata.finalRoles?.isValid == true, metadata.width > 0, metadata.height > 0 else {
+                throw WorkflowBridgeError.invalidStructure
+            }
+            let snapshot = PSDSnapshot(taskID: accepted.taskID, workingURL: accepted.workingURL,
+                snapshotURL: accepted.snapshotURL, contentVersion: accepted.contentVersion,
+                pixelSize: CGSize(width: metadata.width, height: metadata.height), roles: nil,
+                structureSummary: metadata.summary, finalRoles: metadata.finalRoles)
+            let roles = try await extractUnlocked(snapshot)
+            try verifyFiles()
+            return (snapshot, roles)
+        }
+    }
+
+    // 观察请求只遍历文档，不触碰当前文档、打开文件或修改 Photoshop 设置。
+    func openDocuments() async throws -> [WorkflowOpenPhotoshopDocument] {
+        struct Entry: Decodable {
+            let path: String?
+            let documentID: Int
+            let saved: Bool
+
+            private enum CodingKeys: CodingKey { case path, documentID, saved }
+
+            init(from decoder: Decoder) throws {
+                let values = try decoder.container(keyedBy: CodingKeys.self)
+                path = try values.decode(String?.self, forKey: .path)
+                documentID = try values.decode(Int.self, forKey: .documentID)
+                saved = try values.decode(Bool.self, forKey: .saved)
+            }
+        }
+        let result = try await documentListRunner(Self.openDocumentsScript)
+        let entries = try JSONDecoder().decode([Entry].self, from: Data(result.utf8))
+        guard entries.allSatisfy({ $0.documentID > 0 && ($0.path?.hasPrefix("/") ?? true) }),
+              Set(entries.map { $0.documentID }).count == entries.count else {
+            throw WorkflowBridgeError.photoshop("打开文档列表不完整")
+        }
+        let documents = entries.compactMap { entry in
+            entry.path.map { WorkflowOpenPhotoshopDocument(url: URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL,
+                                                            documentID: entry.documentID, saved: entry.saved) }
+        }
+        guard Set(documents.map { $0.url }).count == documents.count else {
+            throw WorkflowBridgeError.photoshop("多个 Photoshop 文档使用同一个工作路径")
+        }
+        return documents
+    }
+
+    private static let openDocumentsScript = #"""
+    (function() {
+        function quotePath(path) {
+            return '"' + path.replace(/["\\\x00-\x1f]/g, function(c) {
+                return '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4);
+            }) + '"';
+        }
+        var list = [];
+        for (var i = 0; i < app.documents.length; i++) {
+            var doc = app.documents[i], ref = new ActionReference(), fileKey = stringIDToTypeID('fileReference');
+            ref.putIdentifier(charIDToTypeID('Dcmn'), doc.id);
+            var meta = executeActionGet(ref);
+            // 未命名文档没有文件路径；读取错误直接使整次观察失败。
+            var path = meta.hasKey(fileKey) ? quotePath(meta.getPath(fileKey).fsName) : 'null';
+            list.push('{"path":' + path + ',"documentID":' + doc.id + ',"saved":' + doc.saved + '}');
+        }
+        return '[' + list.join(',') + ']';
+    }());
+    """#
+
+    private static func executeInRunningPhotoshop(_ script: String) async throws -> String {
+        try await Task.detached {
+            let instances = NSRunningApplication.runningApplications(withBundleIdentifier: "com.adobe.Photoshop")
+                .filter { !$0.isTerminated }
+            guard let application = instances.first else { throw WorkflowBridgeError.photoshopNotRunning }
+            guard instances.count == 1 else { throw WorkflowBridgeError.photoshop("同时运行多个 Photoshop，无法确认打开的文档") }
+            // 以已运行的进程为目标，避免按应用名称发送事件时自动启动 Photoshop。
+            let target = NSAppleEventDescriptor(processIdentifier: application.processIdentifier)
+            let event = NSAppleEventDescriptor(eventClass: 0x6D697363, eventID: 0x446A784D,
+                                               targetDescriptor: target, returnID: -1, transactionID: 0) // misc/DjxM
+            event.setParam(NSAppleEventDescriptor(string: script), forKeyword: keyDirectObject)
+            let reply: NSAppleEventDescriptor
+            do {
+                reply = try event.sendEvent(options: [.waitForReply, .neverInteract], timeout: 3)
+            } catch {
+                throw WorkflowBridgeError.photoshop(error.localizedDescription)
+            }
+            if let code = reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value, code != 0 {
+                throw WorkflowBridgeError.photoshop(reply.paramDescriptor(forKeyword: keyErrorString)?.stringValue ?? "Apple Event \(code)")
+            }
+            guard let result = reply.paramDescriptor(forKeyword: keyDirectObject)?.stringValue else {
+                throw WorkflowBridgeError.photoshop("无法读取打开文档列表")
+            }
+            return result
+        }.value
+    }
+
     /// 仅由明确的人工“采用当前结果”动作调用；普通刷新不会删除自动写入意图。
     func acknowledgeManualResult(snapshot: PSDSnapshot) async throws {
         try await withLease("acknowledgeManual", owner: snapshot.taskID, savedRead: true, document: snapshot.workingURL) {
@@ -1013,16 +1126,16 @@ extension PhotoshopWorkflowBridge {
         var roles={};
         for(var j=0;j<group.layers.length;j++) {
             var layer=group.layers[j],name=layer.name;
-            if(name==='Stack' || name==='Keying_Level' || name==='Keying_Origin') {
+            if(name==='Stack' || name==='Keying_Origin') {
                 if(roles[name] || !wfRoleLayer(layer,name))throw new Error('共同调整中需要唯一且未剪贴的像素图层 '+name);
                 roles[name]=layer;
             }
         }
-        var base=roles.Stack,cutout=roles.Keying_Level,origin=roles.Keying_Origin;
+        var base=roles.Stack,cutout=group.layers[0],origin=roles.Keying_Origin;
         if(!base || wfHasMask(base,true))throw new Error('共同调整中需要未加蒙版的像素图层 Stack');
         if(!origin || !wfHasMask(origin))throw new Error('共同调整中需要保留原始蒙版的像素图层 Keying_Origin');
-        if(!cutout)throw new Error('共同调整中需要用于透明输出的像素图层 Keying_Level');
-        if(wfHasMask(group,true))throw new Error('请将共同调整组的蒙版落实到 Keying_Level 后再刷新');
+        if(!cutout || !wfRoleLayer(cutout,cutout.name) || cutout===base)throw new Error('共同调整的第一层需要是独立的透明成品像素图层');
+        if(wfHasMask(group,true))throw new Error('请将共同调整组的蒙版落实到第一层后再刷新');
         if(group.opacity!==100)throw new Error('请将共同调整组的不透明度设为 100% 后再刷新');
         return {adjust:group,base:base,cutout:cutout,ids:{adjustmentGroup:String(group.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id)}};
     }

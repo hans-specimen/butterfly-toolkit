@@ -7,6 +7,55 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class WorkflowBridgeTests: XCTestCase {
+    func testDocumentListReadsPathsIDsAndSavedStateWithoutTouchingDocuments() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let first = folder.appendingPathComponent("正面.psd"), alias = folder.appendingPathComponent("链接.psd")
+        let second = folder.appendingPathComponent("反面.psd")
+        try Data().write(to: first)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: first)
+        let paths = String(decoding: try JSONEncoder().encode([alias.path, second.path]), as: UTF8.self)
+        let bridge = PhotoshopWorkflowBridge(workspace: folder, documentListRunner: { script in
+            let context = JSContext()!
+            let setup = """
+            var paths = \(paths);
+            var app = {documents: [{id: 4, saved: false}, {id: 5, saved: true}, {id: 6, saved: false}]};
+            function forbidden() { throw new Error('observer mutated Photoshop'); }
+            Object.defineProperty(app, 'activeDocument', {get: forbidden, set: forbidden});
+            app.open = forbidden;
+            for (var i = 0; i < app.documents.length; i++) app.documents[i].close = forbidden;
+            function ActionReference() { this.putIdentifier = function(type, id) { this.id = id; }; }
+            function charIDToTypeID(value) { return value; }
+            function stringIDToTypeID(value) { return value; }
+            function executeActionGet(ref) {
+                return {hasKey: function() { return ref.id !== 6; },
+                        getPath: function() { return {fsName: paths[ref.id - 4]}; }};
+            }
+            """
+            guard let result = context.evaluateScript(setup + "\n" + script)?.toString(),
+                  context.exception == nil else { throw WorkflowBridgeError.photoshop("观察脚本执行失败") }
+            return result
+        })
+        let result = try await bridge.openDocuments()
+        XCTAssertEqual(result, [
+            WorkflowOpenPhotoshopDocument(url: first.resolvingSymlinksInPath(), documentID: 4, saved: false),
+            WorkflowOpenPhotoshopDocument(url: second.resolvingSymlinksInPath(), documentID: 5, saved: true)
+        ])
+    }
+
+    func testDocumentListRejectsEntriesWithoutPathEvidence() async throws {
+        let bridge = PhotoshopWorkflowBridge(workspace: FileManager.default.temporaryDirectory, documentListRunner: { _ in
+            #"[{"documentID":2,"saved":true}]"#
+        })
+        do {
+            _ = try await bridge.openDocuments()
+            XCTFail("Missing path field was accepted as an untitled document")
+        } catch is DecodingError {
+            // 显式 null 才代表未命名文档，省略字段是损坏的查询结果。
+        }
+    }
+
     private final class DocumentRuntime {
         let context = JSContext()!
         let metadata: String
@@ -49,7 +98,7 @@ final class WorkflowBridgeTests: XCTestCase {
         }
         func events() -> [String] { context.objectForKeyedSubscript("events")?.toArray() as? [String] ?? [] }
     }
-    func testFinalRolesExportOnlyStackAndKeyingLevelEvenWhenHidden() async throws {
+    func testFinalRolesExportOnlyStackAndTopLayerEvenWhenRenamedAndHidden() async throws {
         let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
         let context = JSContext()!
         let setup = """
@@ -58,7 +107,7 @@ final class WorkflowBridgeTests: XCTestCase {
         var LayerKind={NORMAL:'normal',SOLIDFILL:'solid'};
         function fixture() {
             var group={id:1,name:'共同调整',typename:'LayerSet',visible:true,opacity:100,layers:[
-                layer(2,'预览',false,true),layer(3,'Keying_Level',true,false),
+                layer(2,'手工精修结果',true,false),layer(3,'Keying_Level',true,true),
                 layer(4,'Keying_Origin',true,true),layer(5,'Stack',false,false),layer(6,'底图',false,true)
             ]};
             var bg=layer(7,'BG',false,true);bg.kind=LayerKind.SOLIDFILL;
@@ -97,7 +146,7 @@ final class WorkflowBridgeTests: XCTestCase {
             if script.contains("base.png") {
                 try await MainActor.run {
                     let outputs = try XCTUnwrap(context.objectForKeyedSubscript("exports")?.toArray() as? [[String: Any]])
-                    XCTAssertEqual(outputs.compactMap { $0["visible"] as? [String] }, [["Stack"], ["Keying_Level"]])
+                    XCTAssertEqual(outputs.compactMap { $0["visible"] as? [String] }, [["Stack"], ["手工精修结果"]])
                     for output in outputs {
                         let destination = URL(fileURLWithPath: try XCTUnwrap(output["path"] as? String))
                         let fixture = f.directory.appendingPathComponent("fixtures").appendingPathComponent(destination.lastPathComponent)
@@ -109,15 +158,34 @@ final class WorkflowBridgeTests: XCTestCase {
         })
         let saved = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
         XCTAssertEqual(saved.finalRoles?.baseLayer, "5")
-        XCTAssertEqual(saved.finalRoles?.cutoutLayer, "3")
+        XCTAssertEqual(saved.finalRoles?.cutoutLayer, "2")
         let images = try await bridge.extractRoles(snapshot: saved)
         let cutout = try WorkflowRaster.read(images.cutoutPNG), mask = try WorkflowRaster.read(images.maskPNG)
         XCTAssertEqual(stride(from: 0, to: mask.pixels.count, by: 4).map { mask.pixels[$0] },
                        stride(from: 3, to: cutout.pixels.count, by: 4).map { cutout.pixels[$0] })
         XCTAssertEqual(context.evaluateScript("source.layers[0].layers.map(function(layer){return layer.visible;});")?.toArray() as? [Bool],
-                       [true, false, true, false, true])
+                       [false, true, true, false, true])
         XCTAssertEqual(try AIFileValidation.hash(f.document.path), saved.contentVersion)
 
+        context.evaluateScript("source.layers[0].layers[0].mask=false;source.layers[0].layers[0].name='Keying_Level copy';")
+        let appliedMask = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
+        XCTAssertEqual(appliedMask.finalRoles?.cutoutLayer,"2")
+        context.evaluateScript("source.layers[0].layers[0].name='Keying_Level';source.layers[0].layers[1].kind='smart';")
+        let duplicateName = try await bridge.captureFinalPSD(document: f.document,owner: f.owner)
+        XCTAssertEqual(duplicateName.finalRoles?.cutoutLayer,"2")
+        context.evaluateScript("source=fixture();var origin=source.layers[0].layers.splice(2,1)[0];source.layers[0].layers.unshift(origin);")
+        let reordered = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
+        XCTAssertEqual(reordered.finalRoles?.cutoutLayer,"4")
+        for edit in ["source.layers[0].layers[0].kind='solid'", "source.layers[0].layers[0].grouped=true"] {
+            context.evaluateScript("source=fixture();\(edit);")
+            do {
+                _ = try await bridge.captureFinalPSD(document: f.document,owner: f.owner)
+                XCTFail("Unsupported first layer accepted")
+            } catch WorkflowBridgeError.photoshop(let error) {
+                XCTAssertTrue(error.contains("第一层"),error)
+            }
+        }
+        context.evaluateScript("source=fixture();")
         context.evaluateScript("source.layers[0].layers.splice(3,1);")
         do {
             _ = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
@@ -721,31 +789,42 @@ final class WorkflowBridgeTests: XCTestCase {
     }
     func testMatteAcceptsWhiteCompositedEdgesButRejectsChangedPixels() async throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
-        let source = directory.appendingPathComponent("input.png")
-        let alpha = directory.appendingPathComponent("alpha.png"), cutout = directory.appendingPathComponent("cutout.png")
+        let source = directory.appendingPathComponent("input.png"), alpha = directory.appendingPathComponent("alpha.png")
         // 使用 Adobe RGB，确保先在输入色彩空间铺白底，再转换到校验用的 sRGB。
         try png(source, width: 4, height: 1, pixels: [23,45,67,0, 0,255,0,128, 255,0,0,255, 0,0,255,255])
         try png(alpha, width: 4, height: 1, pixels: [7,7,7,255, 128,128,128,255, 255,255,255,255, 0,0,0,255], colorSpaceName: CGColorSpace.sRGB)
         let expected: [UInt8] = [255,255,255,7, 127,255,127,128, 255,0,0,255, 0,0,255,0]
-        try png(cutout, width: 4, height: 1, pixels: expected)
+        func matchingCutout(_ name: String, pixels: [UInt8]) throws -> URL {
+            // 每个变体使用独立文件；像素夹具直接沿用输入嵌入的 ICC。
+            let url = directory.appendingPathComponent(name + ".png")
+            try png(url, width: 4, height: 1, pixels: pixels)
+            try WorkflowRaster.preservePNGColorMetadata(from: source,to: url)
+            return url
+        }
+        let cutout = try matchingCutout("ai-cutout", pixels: expected)
         let input = StackPNG(snapshotVersion: "saved",pngURL: source,fingerprint: try AIFileValidation.hash(source.path),pixelSize: CGSize(width: 4,height: 1),orientation: 1,colorProfile: "Adobe RGB")
         try JSONSerialization.data(withJSONObject: ["inputSha256":input.fingerprint]).write(to: directory.appendingPathComponent("result.json"))
-        let event = AIEvent(event: "completed",input: source.path,prediction: cutout.path,predictionAlpha: alpha.path)
-        let service = WorkflowMatteService(engine: directory,workspace: directory,run: { _ in event })
-        let result = try await service.infer(input: input)
+        func infer(_ cutout: URL) async throws -> MatteArtifact {
+            let event = AIEvent(event: "completed",input: source.path,prediction: cutout.path,predictionAlpha: alpha.path)
+            return try await WorkflowMatteService(engine: directory,workspace: directory,run: { _ in event }).infer(input: input)
+        }
+        let result = try await infer(cutout)
         XCTAssertEqual(result.inputPNGFingerprint,input.fingerprint)
         for (channel,value) in [(0,UInt8(0)),(5,UInt8(0)),(9,UInt8(255)),(7,UInt8(64))] {
             var corrupt = expected; corrupt[channel] = value
-            try png(cutout, width: 4, height: 1, pixels: corrupt)
-            do { _ = try await service.infer(input: input); XCTFail("Accepted changed channel \(channel)") }
-            catch { XCTAssertTrue(error is WorkflowBridgeError) }
+            let changed = try matchingCutout("changed-\(channel)", pixels: corrupt)
+            do { _ = try await infer(changed); XCTFail("Accepted changed channel \(channel)") }
+            catch {
+                let reason = channel == 7 ? "Alpha 与透明结果不一致或坐标翻转" : "前景与输入像素坐标不符"
+                XCTAssertEqual(error as? WorkflowBridgeError, .invalidImage(reason))
+            }
         }
-        try png(cutout, width: 4, height: 1, pixels: expected, colorSpaceName: CGColorSpace.sRGB)
-        await rejects { _ = try await service.infer(input: input) }
+        let wrongProfile = directory.appendingPathComponent("wrong-profile.png")
+        try png(wrongProfile, width: 4, height: 1, pixels: expected, colorSpaceName: CGColorSpace.sRGB)
+        await rejects { _ = try await infer(wrongProfile) }
         // PSD 回写继续使用原始 Alpha，不能套用 AI 的白底参照。
-        try png(cutout, width: 4, height: 1, pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
-        try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true)
-        try png(cutout, width: 4, height: 1, pixels: expected)
+        let psdCutout = try matchingCutout("psd-cutout", pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
+        try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(psdCutout),respectSourceAlpha: true)
         XCTAssertThrowsError(try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true))
         XCTAssertEqual(try AIFileValidation.hash(source.path),input.fingerprint)
     }

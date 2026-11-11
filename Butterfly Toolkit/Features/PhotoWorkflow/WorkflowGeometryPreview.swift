@@ -97,6 +97,7 @@ struct WorkflowGeometryPreview: View {
     var background: String
     var showSafeFrame = true
     var savedCanvasOnly = false
+    var showWingTips = false
     var cleanupRegions: [CGRect] = []
     var interactionStarted: TimeInterval?
     var onSourcePoint: (CGPoint) -> Void = { _ in }
@@ -151,9 +152,11 @@ struct WorkflowGeometryPreview: View {
                     if let solution {
                         ctx.stroke(Path(map.viewRect(solution.subjectBounds)),with: .color(.green),lineWidth: 1)
                         ctx.stroke(Path(map.viewRect(solution.sourceCropRect)),with: .color(solution.isApplicable ? .orange : .red),lineWidth: 2)
-                        for p in [solution.leftWingTip,solution.rightWingTip].compactMap({ $0 }) {
-                            let q = map.viewPoint(WorkflowPreviewCoordinates.rotate(p,degrees: solution.angleDegrees,pivot: solution.rotationPivot))
-                            ctx.fill(Path(ellipseIn: CGRect(x: q.x-4,y: q.y-4,width: 8,height: 8)),with: .color(.cyan))
+                        if showWingTips {
+                            for p in [solution.leftWingTip,solution.rightWingTip].compactMap({ $0 }) {
+                                let q = map.viewPoint(WorkflowPreviewCoordinates.rotate(p,degrees: solution.angleDegrees,pivot: solution.rotationPivot))
+                                ctx.fill(Path(ellipseIn: CGRect(x: q.x-4,y: q.y-4,width: 8,height: 8)),with: .color(.cyan))
+                            }
                         }
                     }
                 }
