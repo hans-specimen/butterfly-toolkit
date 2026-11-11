@@ -141,10 +141,27 @@ import UniformTypeIdentifiers
         }
 
     }
+    func testCurrentFaceCanBeConfirmedAfterPreviewEvenWhenOtherFaceFailed() async throws {
+        var batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
+        batch.manualFinalization = true
+        batch.specimens[0].front[.geometry].state = .waitingReview
+        batch.specimens[0].front[.geometry].confirmedVersion = nil
+        batch.specimens[0].back[.geometry].state = .failed
+        batch.specimens[0].back[.geometry].confirmedVersion = nil
+        let store = PhotoWorkflowStore()
+        store.batch = batch; store.currentSpecimenID = batch.specimens[0].id
+        XCTAssertFalse(store.canFinalize)
+        store.prepareSelected()
+        try await waitUntil { store.canFinalize }
+        XCTAssertEqual(store.stage,.hd)
+        store.face = .back
+        XCTAssertFalse(store.canFinalize)
+        XCTAssertEqual(store.stage,.geometry)
+    }
     func testStorePreviewUsesRoleThumbnailAndValidationWithoutDiscardedBitmap() async throws {
         let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
         let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
-        store.stage = .geometry; store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]
+        store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]; store.stage = .geometry
         store.prepareSelected()
         try await waitUntil { store.canConfirm }
         let calls = await probe.values()
@@ -188,7 +205,7 @@ import UniformTypeIdentifiers
         let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
         let probe = PreviewProbe(),store = PhotoWorkflowStore(previews: probe)
         await probe.returnStaleGeometry()
-        store.stage = .geometry; store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]
+        store.batch = batch; store.currentSpecimenID = batch.specimens[0].id; store.selectedSpecimens = [batch.specimens[0].id]; store.stage = .geometry
         store.prepareSelected(); try await waitUntil { store.loading.isEmpty }
         XCTAssertNotNil(store.displayImage(for: batch.specimens[0].front))
         XCTAssertFalse(store.canConfirm); XCTAssertTrue(store.solutions.isEmpty)
@@ -360,7 +377,7 @@ import UniformTypeIdentifiers
         try await waitUntil { store.currentDetailReady && store.canConfirm }
         XCTAssertEqual(alphaAtCorner(store.displayImage(for: batch.specimens[0].front)),255)
     }
-    func testBatchLifecycleConfiguresLocalEnginePersistsAndProtectsManualLease() async throws {
+    func testBatchLifecyclePersistsAndProtectsManualLease() async throws {
         let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
         let manifest = batch.outputDirectory.appendingPathComponent("batch.json")
         try await WorkflowBatchStore().save(batch,to: manifest)
@@ -370,12 +387,9 @@ import UniformTypeIdentifiers
         let originalGlobal = UserDefaults.standard.string(forKey: "aiEnginePath")
         let store = PhotoWorkflowStore(); store.openBatch(manifest)
         try await waitUntil { !store.busy && store.batch != nil }
-        store.configureEngine(engine); try await waitUntil { !store.busy }
-        XCTAssertEqual(store.enginePath,engine.path); XCTAssertEqual(store.batch?.isPaused,true)
         XCTAssertEqual(UserDefaults.standard.string(forKey: "aiEnginePath"),originalGlobal)
         store.manualTaskID = batch.specimens[0].front.id
         store.closeBatch(); XCTAssertEqual(store.batch?.id,batch.id)
-        store.configureEngine(URL(fileURLWithPath: "/tmp/other-engine")); XCTAssertEqual(store.enginePath,engine.path)
         XCTAssertEqual(store.manualTaskID,batch.specimens[0].front.id)
         store.manualTaskID = nil; store.closeBatch(); try await waitUntil { !store.busy && store.batch == nil }
         let saved = try await WorkflowBatchStore().load(from: manifest)
@@ -493,23 +507,7 @@ extension WorkflowGeometryCache {
 }
 
 @MainActor extension WorkflowPreviewTests {
-    func testBatchSwitchEngineChangeAndCloseShutDownSharedInferenceWorker() async throws {
-        let batch = try imageFixture(specimens: 1); defer { try? FileManager.default.removeItem(at: batch.outputDirectory) }
-        let fake = try AIInferenceWorkerTests.Fixture(); defer { fake.remove() }
-        let worker = AIInferenceWorker(),store = PhotoWorkflowStore(inference: worker)
-        let manifest = batch.outputDirectory.appendingPathComponent("batch.json")
-        try await WorkflowBatchStore().save(batch,to: manifest)
-        _ = try await worker.infer(fake.request("before-open"))
-        store.openBatch(manifest); try await waitUntil { !store.busy && store.batch != nil }
-        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
-        _ = try await worker.infer(fake.request("before-engine"))
-        store.configureEngine(fake.root); try await waitUntil { !store.busy }
-        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
-        _ = try await worker.infer(fake.request("before-close"))
-        store.closeBatch(); try await waitUntil { !store.busy && store.batch == nil }
-        XCTAssertTrue(try fake.starts().allSatisfy { kill($0,0) == -1 })
-        XCTAssertEqual(try fake.starts().count,3)
-    }
+
 }
 
 @MainActor extension WorkflowPreviewTests {
@@ -521,7 +519,7 @@ extension WorkflowGeometryCache {
         func release() { waiting?.resume(); waiting = nil }
     }
     func testDelayedSnapshotCannotRestoreClosedOrReplacedBatchOrError() async throws {
-        for action in ["switch","close","engine","error"] {
+        for action in ["switch","close","error"] {
             let first = try imageFixture(specimens: 1),second = try imageFixture(specimens: 1)
             defer { try? FileManager.default.removeItem(at: first.outputDirectory); try? FileManager.default.removeItem(at: second.outputDirectory) }
             let cache = WorkflowGeometryCache(),store = PhotoWorkflowStore(geometry: cache)
@@ -543,12 +541,7 @@ extension WorkflowGeometryCache {
             await fulfillment(of: [entered],timeout: 2)
             let expected: UUID?
             if action == "close" { store.closeBatch(); expected = nil }
-            else if action == "engine" {
-                let engine = first.outputDirectory.appendingPathComponent("engine")
-                try FileManager.default.createDirectory(at: engine.appendingPathComponent("scripts"),withIntermediateDirectories: true)
-                try Data().write(to: engine.appendingPathComponent("scripts/toolkit_bridge.py"))
-                store.configureEngine(engine); expected = first.id
-            } else { store.openBatch(secondManifest); expected = second.id }
+            else { store.openBatch(secondManifest); expected = second.id }
             try await waitUntil { !store.busy && store.batch?.id == expected && store.loading.isEmpty }
             let ids = Set(store.gates.keys),paused = store.batch?.isPaused
             store.error = "Current session message"

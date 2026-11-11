@@ -179,7 +179,8 @@ struct FocusStackProcessor {
     nonisolated static func process(
         _ job: FocusStackJob,
         photoshopApplicationName: String,
-        workflowPNGExportScript: String? = nil
+        workflowPNGExportScript: String? = nil,
+        workflowDocumentHandoff: String? = nil
     ) throws {
         // 已有 PSD 直接跳过，避免重复执行覆盖用户已经编辑的结果。
         guard !FileManager.default.fileExists(atPath: job.destinationURL.path) else { return }
@@ -191,7 +192,7 @@ struct FocusStackProcessor {
 
         do {
             try FileManager.default.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
-            try jsx(for: job, workflowPNGExportScript: workflowPNGExportScript).write(to: jsxURL, atomically: true, encoding: .utf8)
+            try jsx(for: job, workflowPNGExportScript: workflowPNGExportScript, workflowDocumentHandoff: workflowDocumentHandoff).write(to: jsxURL, atomically: true, encoding: .utf8)
         } catch {
             throw FocusStackError.scriptFailed("无法创建临时处理脚本。")
         }
@@ -253,7 +254,7 @@ struct FocusStackProcessor {
     // MARK: - 景深合成脚本生成
 
     // 可选导出脚本在保存 PSD 后执行，工作流可复用尚未关闭的文档。
-    nonisolated static func jsx(for job: FocusStackJob, workflowPNGExportScript: String? = nil) -> String {
+    nonisolated static func jsx(for job: FocusStackJob, workflowPNGExportScript: String? = nil, workflowDocumentHandoff: String? = nil) -> String {
         let sources = job.sourceFiles
             .map { "\"\(jsxEscaped($0.path))\"" }
             .joined(separator: ", ")
@@ -289,7 +290,7 @@ struct FocusStackProcessor {
 
             var sources = [\(sources)];
             var destination = "\(jsxEscaped(job.destinationURL.path))";
-            var stackDocument = null;
+            var stackDocument = null, workflowSaved = false;
 
             try {
                 stackDocument = app.open(new File(sources[0]));
@@ -379,14 +380,17 @@ struct FocusStackProcessor {
                 psdOptions.embedColorProfile = true;
                 psdOptions.maximizeCompatibility = true;
                 try {
-                    stackDocument.saveAs(new File(destination), psdOptions, true, Extension.LOWERCASE);
+                    if(new File(destination).exists)throw new Error("目标 PSD 已存在，禁止覆盖。");
+                    stackDocument.saveAs(new File(destination), psdOptions, \(workflowDocumentHandoff == nil ? "true" : "false"), Extension.LOWERCASE);
+                    workflowSaved = true;
+                    \(workflowDocumentHandoff ?? "")
                 } catch (saveError) {
                     throw new Error("保存 PSD 失败：" + saveError.message);
                 }
                 \(workflowPNGExportScript.map { "try { (function(){" + $0 + "}()); } catch (pngError) {}" } ?? "")
-                stackDocument.close(SaveOptions.DONOTSAVECHANGES);
+                \(workflowDocumentHandoff == nil ? "stackDocument.close(SaveOptions.DONOTSAVECHANGES);" : "")
             } catch (error) {
-                if (stackDocument) {
+                if (stackDocument && (!workflowSaved || \(workflowDocumentHandoff == nil ? "true" : "false"))) {
                     try { stackDocument.close(SaveOptions.DONOTSAVECHANGES); } catch (_) {}
                 }
                 throw error;

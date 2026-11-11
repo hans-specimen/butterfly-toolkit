@@ -49,6 +49,104 @@ final class WorkflowBridgeTests: XCTestCase {
         }
         func events() -> [String] { context.objectForKeyedSubscript("events")?.toArray() as? [String] ?? [] }
     }
+    func testFinalRolesExportOnlyStackAndKeyingLevelEvenWhenHidden() async throws {
+        let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
+        let context = JSContext()!
+        let setup = """
+        var exports=[],source;
+        function layer(id,name,mask,visible) {return {id:id,name:name,mask:mask,visible:visible,typename:'ArtLayer',kind:'normal'};}
+        var LayerKind={NORMAL:'normal',SOLIDFILL:'solid'};
+        function fixture() {
+            var group={id:1,name:'共同调整',typename:'LayerSet',visible:true,opacity:100,layers:[
+                layer(2,'预览',false,true),layer(3,'Keying_Level',true,false),
+                layer(4,'Keying_Origin',true,true),layer(5,'Stack',false,false),layer(6,'底图',false,true)
+            ]};
+            var bg=layer(7,'BG',false,true);bg.kind=LayerKind.SOLIDFILL;
+            return {width:{as:function(){return 2;}},height:{as:function(){return 2;}},
+                colorProfileName:'AdobeRGB',layers:[group,bg]};
+        }
+        source=fixture();
+        """
+        context.evaluateScript(setup)
+        let run: @MainActor (String) throws -> String = { script in
+            let anchor = "function wfHideAll(doc) {for(var i=0;i<doc.layers.length;i++)doc.layers[i].visible=false;}"
+            let overrides = """
+            wfOpen=function(){return {doc:source};};wfClose=function(){};wfCloseDocument=function(){};
+            function stringIDToTypeID(value){return value;}
+            wfDescriptor=function(layer){
+                var values={hasUserMask:layer.mask,hasVectorMask:layer.vectorMask};
+                return {hasKey:function(key){return values[key]!==undefined;},getBoolean:function(key){return !!values[key];}};
+            };
+            wfBounds=function(){return [0,0,2,2];};
+            wfDuplicate=function(doc){var copy=fixture();copy.layers=JSON.parse(JSON.stringify(doc.layers));return copy;};
+            var app={};
+            wfRolePNG=function(doc,path){
+                var visible=[];
+                function visit(layer){if(!layer.visible)return;if(layer.layers)layer.layers.forEach(visit);else visible.push(layer.name);}
+                doc.layers.forEach(visit);exports.push({path:path,visible:visible});
+            };
+            """
+            context.exception = nil
+            let result = context.evaluateScript(script.replacingOccurrences(of: "#target photoshop", with: "")
+                .replacingOccurrences(of: anchor, with: anchor + overrides))
+            if let error = context.exception?.toString() { throw WorkflowBridgeError.photoshop(error) }
+            return try XCTUnwrap(result?.toString())
+        }
+        let bridge = PhotoshopWorkflowBridge(workspace: f.directory, scriptRunner: { script in
+            let result = try await run(script)
+            if script.contains("base.png") {
+                try await MainActor.run {
+                    let outputs = try XCTUnwrap(context.objectForKeyedSubscript("exports")?.toArray() as? [[String: Any]])
+                    XCTAssertEqual(outputs.compactMap { $0["visible"] as? [String] }, [["Stack"], ["Keying_Level"]])
+                    for output in outputs {
+                        let destination = URL(fileURLWithPath: try XCTUnwrap(output["path"] as? String))
+                        let fixture = f.directory.appendingPathComponent("fixtures").appendingPathComponent(destination.lastPathComponent)
+                        try FileManager.default.copyItem(at: fixture, to: destination)
+                    }
+                }
+            }
+            return result
+        })
+        let saved = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
+        XCTAssertEqual(saved.finalRoles?.baseLayer, "5")
+        XCTAssertEqual(saved.finalRoles?.cutoutLayer, "3")
+        let images = try await bridge.extractRoles(snapshot: saved)
+        let cutout = try WorkflowRaster.read(images.cutoutPNG), mask = try WorkflowRaster.read(images.maskPNG)
+        XCTAssertEqual(stride(from: 0, to: mask.pixels.count, by: 4).map { mask.pixels[$0] },
+                       stride(from: 3, to: cutout.pixels.count, by: 4).map { cutout.pixels[$0] })
+        XCTAssertEqual(context.evaluateScript("source.layers[0].layers.map(function(layer){return layer.visible;});")?.toArray() as? [Bool],
+                       [true, false, true, false, true])
+        XCTAssertEqual(try AIFileValidation.hash(f.document.path), saved.contentVersion)
+
+        context.evaluateScript("source.layers[0].layers.splice(3,1);")
+        do {
+            _ = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
+            XCTFail("Legacy 底图 cannot substitute for Stack")
+        } catch WorkflowBridgeError.photoshop(let error) {
+            XCTAssertTrue(error.contains("Stack"), error)
+        }
+        for (edit,diagnostic) in [("source.layers[0].vectorMask=true","蒙版"),
+                                  ("source.layers[0].opacity=50","不透明度"),
+                                  ("source.layers[0].layers[3].vectorMask=true","Stack")] {
+            context.evaluateScript("source=fixture();\(edit);")
+            do {
+                _ = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
+                XCTFail("Final role read accepted \(edit)")
+            } catch WorkflowBridgeError.photoshop(let error) {
+                XCTAssertTrue(error.contains(diagnostic), error)
+            }
+
+            context.exception = nil
+            context.evaluateScript("""
+            source.layers[0].layers=source.layers[0].layers.slice(1,4);
+            source.layers.splice(1,0,{id:8,name:'原始堆栈',typename:'LayerSet',layers:[]});
+            wfRoles(source);
+            """)
+            XCTAssertTrue(context.exception?.toString()?.contains("WORKFLOW_STRUCTURE") == true,
+                          "Automatic role read accepted \(edit)")
+        }
+        XCTAssertEqual(try AIFileValidation.hash(f.document.path), saved.contentVersion)
+    }
     func testApplyKeepsDocumentOpenThroughSaveAndCapture() async throws {
         for (reuse,nativePrefix) in [(false,""),(true,""),(true,"/native")] {
             let f = try roleCacheFixture(); defer { try? FileManager.default.removeItem(at: f.directory) }
@@ -649,14 +747,6 @@ final class WorkflowBridgeTests: XCTestCase {
         try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true)
         try png(cutout, width: 4, height: 1, pixels: expected)
         XCTAssertThrowsError(try WorkflowRaster.validateMatte(original: WorkflowRaster.read(source),alpha: WorkflowRaster.read(alpha),cutout: WorkflowRaster.read(cutout),respectSourceAlpha: true))
-        let installed = directory.appendingPathComponent("installed.png")
-        try png(installed, width: 4, height: 1, pixels: [0,0,0,0, 0,255,0,64, 255,0,0,255, 0,0,0,0])
-        let roles = RoleImages(snapshotVersion: "installed",basePNG: source,cutoutPNG: installed,maskPNG: result.alphaURL,pixelSize: input.pixelSize,coordinateOrigin: .zero,editableExtent: CGRect(origin: .zero,size: input.pixelSize),cropViewport: CGRect(origin: .zero,size: input.pixelSize))
-        let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: directory),matte: service)
-        // 中断恢复须分别验证 AI 白底结果和保留源 Alpha 的 PSD，不能要求两者透明边缘相等。
-        try await services.validateInstalledMatte(roles,input,result)
-        try png(installed, width: 4, height: 1, pixels: [0,0,0,0, 255,0,0,64, 255,0,0,255, 0,0,0,0])
-        await rejects { try await services.validateInstalledMatte(roles,input,result) }
         XCTAssertEqual(try AIFileValidation.hash(source.path),input.fingerprint)
     }
     func testSavedRefreshCanReadWithinManualLeaseWithoutReleasingIt() async throws {

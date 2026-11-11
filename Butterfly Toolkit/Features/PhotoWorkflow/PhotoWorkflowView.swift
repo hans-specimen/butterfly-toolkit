@@ -7,7 +7,7 @@ import ImageIO
 // MARK: - 阶段与状态显示
 extension WorkflowStage {
     var title: String {
-        switch self { case .stack: "景深合成"; case .matte: "AI 抠图"; case .geometry: "旋转裁切"; case .hd: "堆栈原图"; case .png4k: "4K PNG"; case .derivatives: "派生图片" }
+        switch self { case .stack: "景深合成"; case .matte: "PS 抠图"; case .geometry: "旋转裁切"; case .hd: "堆栈原图"; case .png4k: "4K PNG"; case .derivatives: "派生图片" }
     }
 }
 extension WorkflowStatus {
@@ -21,6 +21,8 @@ struct PhotoWorkflowView: View {
     @ObservedObject var store: PhotoWorkflowStore
     @State private var selectedDraftID: UUID?
     @State private var singleFace = false
+    @State private var exportScope = "此图"
+    @State private var reprocessStage: WorkflowStage?
     @State private var cleanupReports: [UUID: (version: String,report: MaskCleanupReport?)] = [:]
     @State private var showCleanupRegions = false
     @Environment(\.colorScheme) private var colorScheme
@@ -29,8 +31,9 @@ struct PhotoWorkflowView: View {
     private let queueWidth: CGFloat = 210
     private let inspectorWidth: CGFloat = 300
     private func stageTitle(_ stage: WorkflowStage) -> String {
-        if store.usesFinalization && stage == .geometry { return "裁切矫正与人工检查" }
-        if store.usesFinalization && (stage == .png4k || stage == .hd) { return "导出" }
+        if store.usesFinalization && stage == .geometry { return "旋转矫正" }
+        if store.usesFinalization && stage == .hd { return "人工检查" }
+        if store.usesFinalization && stage == .png4k { return "导出" }
         return stage == .stack && store.currentTask?.sources.isPSD == true ? "已有 PSD" : stage.title
     }
     var body: some View {
@@ -55,6 +58,7 @@ struct PhotoWorkflowView: View {
             Divider()
             if store.batch == nil { setup.disabled(store.busy) }
             else { execution }
+            if let notice = store.notice { HStack { Text(notice).font(.caption); Spacer(); Button("关闭") { store.notice = nil } }.padding(10) }
             if let error = store.error { HStack { Image(systemName: "exclamationmark.triangle.fill"); Text(error).textSelection(.enabled); Spacer(); Button("关闭") { store.error = nil } }.foregroundStyle(.red).padding(10).background(.red.opacity(0.07)) }
         }
         .background(panelBackground)
@@ -82,7 +86,7 @@ struct PhotoWorkflowView: View {
                 Text(store.draft.map { "\($0.groups.filter { !$0.excluded }.count) 只待处理 · \($0.inputMode == .psd ? "正反面各一份 PSD" : "正反面各三张")" } ?? "选择输入文件夹，开始建立收藏批次")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
-                Button(store.busy ? "正在准备批次…" : (store.inputMode == .psd ? "从 AI 抠图开始" : "开始处理")) { store.start() }
+                Button(store.busy ? "正在准备批次…" : (store.inputMode == .psd ? "从 PS 抠图开始" : "开始处理")) { store.start() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(store.busy || !store.canStart)
             }.padding(.horizontal,24).padding(.vertical,14)
@@ -169,7 +173,7 @@ struct PhotoWorkflowView: View {
                     VStack(spacing: 16) {
                         Image(systemName: "photo.on.rectangle.angled").font(.system(size: 42,weight: .light)).foregroundStyle(.tertiary)
                         Text(store.inputMode == .psd ? "导入已合成的 PSD" : "导入第一批蝴蝶照片").font(.title3.weight(.semibold))
-                        Text(store.inputMode == .psd ? "按 文件名_D.psd / 文件名_V.psd 配对。\n选择抠图方式，继续 AI 抠图和裁切矫正。" : "每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
+                        Text(store.inputMode == .psd ? "按 文件名_D.psd / 文件名_V.psd 配对。\n复制工作 PSD 后，继续 PS 抠图和裁切矫正。" : "每只蝴蝶六张照片，正反面各三张。\n导入后在左侧选择标本，在这里核对原图。")
                             .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Button("选择输入文件夹…",systemImage: "folder") { chooseFolder { store.scan($0) } }.controlSize(.large)
                     }.frame(maxWidth: .infinity).padding(.vertical,100)
@@ -207,23 +211,12 @@ struct PhotoWorkflowView: View {
                 Text(store.inputMode == .psd ? "已从 PSD 文件名填入；改名仅影响导出名称，不改原 PSD 文件名。" : "每只一行，与左侧顺序对应；排除整组时保留原行。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
-            inspectorSection("人工检查",icon: "checkmark.circle") { Text("AI 抠图、裁切矫正后自动停下。在 Photoshop 完整检查并保存，再确认进入导出。").font(.caption).foregroundStyle(.secondary) }
+            inspectorSection("人工检查",icon: "checkmark.circle") { Text("每面自动完成 PS 抠图与矫正后进入待检查，继续处理下一面。检查确认后可单独或批量导出。").font(.caption).foregroundStyle(.secondary) }
             Divider()
             exportLocations
             Divider()
-            inspectorSection("抠图方式",icon: "sparkles") {
-                Picker("抠图方式",selection: $store.matteProvider) {
-                    ForEach(WorkflowMatteProvider.allCases,id: \.self) { Text($0.title).tag($0) }
-                }.labelsHidden()
-                if store.matteProvider == .aiEngine {
-                    HStack(spacing: 8) {
-                        TextField("butterfly-matte 目录",text: $store.enginePath).textFieldStyle(.roundedBorder)
-                        Button("选择") { chooseFolder { store.enginePath = $0.path } }
-                    }
-                    Text("仅用于本批次").font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text("在合成底图上识别主体，保留蒙版供手动调整。").font(.caption).foregroundStyle(.secondary)
-                }
+            inspectorSection("PS 抠图",icon: "sparkles") {
+                Text("选择主体 → 保留原始蒙版 → 副本色阶 15 / 1.00 / 240").font(.caption).foregroundStyle(.secondary)
             }
         }.frame(maxWidth: .infinity,alignment: .leading).toggleStyle(.checkbox)
     }
@@ -241,23 +234,15 @@ struct PhotoWorkflowView: View {
         }.frame(maxWidth: .infinity,alignment: .leading)
     }
     @ViewBuilder private func exportLocation(_ kind: WorkflowAssetKind) -> some View {
-        if store.batch == nil || store.usesFinalization {
-            VStack(alignment: .leading,spacing: 6) {
-                Text(kind == .hd ? "堆栈原图 JPG" : "4K PNG").font(.callout)
-                Text(store.exportDirectory(for: kind)?.path ?? "选择输入文件夹后自动确定")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
-            }
-        } else {
-            directoryControl(kind == .hd ? "堆栈原图" : "PNG4K",url: store.exportDirectory(for: kind),placeholder: "未设置 · 可在导出步骤选择") {
-                chooseFolder { store.selectExportDirectory($0,kind: kind) }
-            }
-        }
+        directoryControl(kind == .hd ? "堆栈原图 JPEG（Stack）" : "透明 PNG4K（Keying_Level）",url: store.exportDirectory(for: kind),placeholder: "请选择导出文件夹") {
+            chooseFolder { store.selectExportDirectory($0,kind: kind) }
+        }.disabled(store.busy || store.manualTaskID != nil)
     }
     private var exportLocations: some View {
         inspectorSection("导出位置", icon: "square.and.arrow.down") {
             exportLocation(.hd)
             exportLocation(.png4k)
-            Text(store.batch == nil || store.usesFinalization ? "导出时在输入文件夹内自动创建以上子文件夹。" : "两个目录可分别指定，流程在 PNG4K 导出后结束。").font(.caption).foregroundStyle(.secondary)
+            Text(store.batch == nil || store.usesFinalization ? "默认在输入文件夹内创建输出目录，也可分别更改。" : "两个目录可分别指定，流程在 PNG4K 导出后结束。").font(.caption).foregroundStyle(.secondary)
         }
     }
     // MARK: - 执行队列与正反面对照
@@ -273,17 +258,18 @@ struct PhotoWorkflowView: View {
             }
             Divider()
             HStack(spacing: 12) {
-                if store.busy { ProgressView().controlSize(.small); Text("正在处理，请勿在 PS 中同时编辑").font(.caption) }
-                else if store.batch?.allSucceeded == true { Label("PNG4K 已导出 · 本批次完成",systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
-                else { Text(store.batch?.isPaused == true ? "已暂停 · 保存并刷新后继续" : "已选 \(store.selectedSpecimens.count) 只 · 正反面").font(.callout).foregroundStyle(.secondary) }
+                if store.busy { ProgressView().controlSize(.small); Text(store.runningDescription ?? "正在安全处理，请勿在 PS 中同时编辑").font(.caption) }
+                else if store.batch?.allSucceeded == true { Label("全部输出已完成",systemImage: "checkmark.circle.fill").foregroundStyle(.green) }
+                else { Text(store.batch?.isPaused == true ? "已暂停 · 保存并刷新后继续" : store.batchSummary).font(.callout).foregroundStyle(.secondary) }
                 Spacer()
                 Menu("更多操作") {
-                    Button("重试失败项") { store.retry() }.disabled(store.busy || store.selectedSpecimens.isEmpty)
-                    Button("暂不处理所选标本") { store.excludeSelected() }.disabled(store.busy || store.selectedSpecimens.isEmpty)
+                    Button("重试自动处理失败项") { store.retry() }
+                    Button("暂不处理所选标本") { store.excludeSelected() }.disabled(store.busy || store.manualTaskID != nil || store.selectedSpecimens.isEmpty)
                 }.fixedSize()
                 if store.canResumeAutomatic { Button(store.usesFinalization ? (store.stage == .png4k ? "继续导出" : "继续自动准备") : "明确继续批处理") { store.resume() }.disabled(store.busy) }
                 else if store.busy { Button("暂停") { store.pause() } }
-                Button(primaryTitle) { store.primary() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(primaryDisabled)
+                Button("批量导出") { exportScope = "全部已确认"; store.stage = .png4k }
+                Button(primaryTitle) { if store.stage == .png4k { store.exportImages(scope: exportScope) } else { store.primary() } }.buttonStyle(.borderedProminent).controlSize(.large).disabled(primaryDisabled)
             }.padding(.horizontal,24).padding(.vertical,14)
         }
     }
@@ -292,21 +278,25 @@ struct PhotoWorkflowView: View {
             HStack {
                 VStack(alignment: .leading,spacing: 6) {
                     Text(store.currentSpecimen?.baseName ?? "请选择标本").font(.title2.bold())
-                    Text("收藏批次 · \(store.batch?.specimens.count ?? 0) 只标本").font(.callout).foregroundStyle(.secondary)
+                    Text(store.batchSummary).font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
+                if store.runningTask != nil { Button("定位正在处理") { store.locateRunning() }.font(.caption) }
                 if let task = store.currentTask {
-                    Text(store.displayedRecord(task).state.title).font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
+                    Text(store.summaryRecord(task).state.title).font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
                         .padding(.horizontal,10).padding(.vertical,6).background(Color.accentColor.opacity(0.12),in: Capsule())
                 }
             }
             ScrollView(.horizontal,showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(Array(WorkflowStage.processingStages.filter { !store.usesFinalization || $0 != .hd }.enumerated()),id: \.element) { index,stage in
+                    ForEach(Array(WorkflowStage.processingStages.enumerated()),id: \.element) { index,stage in
                         Button { store.stage = stage } label: {
                             HStack(spacing: 5) {
                                 Text("\(index+1)").font(.caption2.bold()).frame(width: 18,height: 18).background(store.stage == stage ? Color.accentColor : Color.secondary.opacity(0.14),in: Circle()).foregroundStyle(store.stage == stage ? .white : .secondary)
-                                Text(stageTitle(stage)).font(.caption).fixedSize()
+                                VStack(alignment: .leading,spacing: 3) {
+                                    Text(stageTitle(stage)).font(.caption).fixedSize()
+                                    Text(panelStatus(stage)).font(.system(size: 10)).foregroundStyle(.secondary)
+                                }
                             }.padding(.horizontal,8).padding(.vertical,8)
                                 .background(store.stage == stage ? Color.accentColor.opacity(0.1) : .clear,in: RoundedRectangle(cornerRadius: 7))
                         }.buttonStyle(.plain)
@@ -430,20 +420,28 @@ struct PhotoWorkflowView: View {
     private var queue: some View {
         VStack(alignment: .leading,spacing: 0) {
             HStack { Text("本批标本").font(.headline); Spacer(); Text("\(store.batch?.specimens.count ?? 0)").foregroundStyle(.secondary) }.padding(18)
+            Picker("筛选",selection: $store.queueFilter) { ForEach(["全部","失败","待检查","已确认","待导出"],id: \.self) { Text($0) } }.padding(.horizontal,12)
             Divider()
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    ForEach(store.batch?.specimens ?? []) { specimen in
-                        HStack(alignment: .top,spacing: 8) {
-                            Toggle("选择 \(specimen.baseName)",isOn: Binding(get: { store.selectedSpecimens.contains(specimen.id) },set: { if $0 { store.selectedSpecimens.insert(specimen.id) } else { store.selectedSpecimens.remove(specimen.id) } }))
-                                .labelsHidden().toggleStyle(.checkbox).disabled(specimen.isExcluded).padding(.top,4)
-                            Button { store.currentSpecimenID = specimen.id } label: {
-                                VStack(alignment: .leading,spacing: 8) {
-                                    Text(specimen.baseName).font(.body.weight(.medium)).lineLimit(1)
-                                    HStack(spacing: 6) { sideStatus(specimen.front); sideStatus(specimen.back) }
-                                    if let reason = specimen.exclusionReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-                                }.frame(maxWidth: .infinity,alignment: .leading).contentShape(Rectangle())
-                            }.buttonStyle(.plain)
+                    ForEach(store.filteredSpecimens) { specimen in
+                        VStack(alignment: .leading,spacing: 9) {
+                            HStack(spacing: 7) {
+                                Toggle("选择 \(specimen.baseName)",isOn: Binding(get: { store.selectedSpecimens.contains(specimen.id) },set: { if $0 { store.selectedSpecimens.insert(specimen.id); store.selectedTaskIDs.formUnion([specimen.front.id,specimen.back.id]) } else { store.selectedSpecimens.remove(specimen.id); store.selectedTaskIDs.subtract([specimen.front.id,specimen.back.id]) } }))
+                                    .labelsHidden().toggleStyle(.checkbox).disabled(specimen.isExcluded)
+                                Button { store.currentSpecimenID = specimen.id } label: {
+                                    Text(specimen.baseName).font(.body.weight(.medium)).lineLimit(1).frame(maxWidth: .infinity,alignment: .leading)
+                                }.buttonStyle(.plain)
+                            }
+                            HStack(spacing: 9) {
+                                ForEach([specimen.front,specimen.back]) { task in
+                                    VStack(alignment: .leading,spacing: 5) {
+                                        Toggle(task.side == .front ? "正面" : "反面",isOn: Binding(get: { store.selectedTaskIDs.contains(task.id) },set: { if $0 { store.selectedTaskIDs.insert(task.id) } else { store.selectedTaskIDs.remove(task.id) } })).font(.caption).toggleStyle(.checkbox).disabled(specimen.isExcluded)
+                                        Button { store.currentSpecimenID = specimen.id; store.face = task.side } label: { sideStatus(task) }.buttonStyle(.plain)
+                                    }.frame(maxWidth: .infinity)
+                                }
+                            }
+                            if let reason = specimen.exclusionReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
                         }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
                             .background(store.currentSpecimenID == specimen.id ? Color.accentColor.opacity(0.16) : .clear,in: RoundedRectangle(cornerRadius: 9))
                             .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(store.currentSpecimenID == specimen.id ? Color.accentColor.opacity(0.35) : .clear) }
@@ -456,7 +454,7 @@ struct PhotoWorkflowView: View {
     private func sideStatus(_ task: WorkflowSideTask) -> some View {
         VStack(alignment: .leading,spacing: 5) {
             WorkflowFileThumbnail(url: task.roleImages?.cutoutPNG ?? task.sources.first.url).frame(height: 44).clipShape(RoundedRectangle(cornerRadius: 5))
-            Text("\(task.side.fileSuffix) · \(store.displayedRecord(task).state.title)").font(.system(size: 10)).foregroundStyle(store.displayedRecord(task).state == .failed ? .red : .secondary).lineLimit(1)
+            Text("\(task.side.fileSuffix) · \(store.summaryRecord(task).state.title)").font(.system(size: 10)).foregroundStyle(store.summaryRecord(task).state == .failed ? .red : .secondary).lineLimit(1)
         }.frame(maxWidth: .infinity)
     }
     // MARK: - 阶段参数与人工编辑
@@ -476,29 +474,34 @@ struct PhotoWorkflowView: View {
                 if store.usesFinalization {
                     inspectorSection("保存版本预览",icon: "eye") { imageControls }
                     inspectorSection("人工检查",icon: "checkmark.circle") {
-                        Text("自动处理已停下。请打开 PSD，检查并修改蒙版、裁切、角度和堆栈内容，保存后刷新。无需选择修改类型。")
+                        Text("本图完成后可检查确认，队列继续处理其他图片。需要修改时在 PS 中打开，自动队列会先安全暂停。")
                             .font(.callout).foregroundStyle(.secondary)
                         if let reason = store.currentTask?.geometrySolution?.reason { Text(reason).font(.caption).foregroundStyle(.orange) }
                         if store.currentTask?.geometrySolution?.isApplicable == false {
-                            Text("自动裁切未应用，请在 Photoshop 调整后保存；仍可确认进入导出。").font(.caption).foregroundStyle(.orange)
+                            Text("自动裁切未应用。请在 Photoshop 调整并保存，明确采用当前姿态与裁切后再检查确认。").font(.caption).foregroundStyle(.orange)
                         }
                     }
                 } else { geometryControls }
             case .hd:
-                inspectorSection("高清堆栈",icon: "photo") {
-                    Text("使用当前保存的底图，保留原尺寸。").font(.caption).foregroundStyle(.secondary)
-                    exportLocation(.hd)
-                    artifactResults(kinds: [.hd])
+                inspectorSection("检查此图",icon: "checkmark.circle") {
+                    imageControls
+                    Text("检查边缘、触角、角度和裁切。确认只作用于当前这一面，不会自动导出。").font(.caption).foregroundStyle(.secondary)
+                    Button("确认此图") { store.confirmCurrent() }.disabled(!store.canFinalize)
+                    Button("下一张待检查") { store.nextReview() }
                 }
             case .png4k:
-                inspectorSection("4K 构图",icon: "crop") { squareControls }
-                Divider()
-                inspectorSection("PNG4K 导出", icon: "square.and.arrow.down") {
-                    exportLocation(.png4k)
-                    if store.usesFinalization { exportLocation(.hd) }
-                    artifactResults(kinds: store.usesFinalization ? [.hd,.png4k] : [.png4k])
-                    Text("导出后完成本批次。衍生图片可在其他图片工具中制作。").font(.caption).foregroundStyle(.secondary)
+                inspectorSection("导出", icon: "square.and.arrow.up") {
+                    Picker("范围",selection: $exportScope) { ForEach(["此图","所选","全部已确认"],id: \.self) { Text($0) } }
+                    Text("符合导出条件：\(store.exportTaskIDs(scope: exportScope).count) 张，未确认图片不参与").font(.caption).foregroundStyle(.secondary)
+                    Toggle("高清 JPEG（Stack）",isOn: $store.exportHDSelected)
+                    Toggle("透明 PNG4K（Keying_Level）",isOn: $store.exportPNGSelected)
+                    Picker("已有成品",selection: $store.exportPolicy) { ForEach(WorkflowExportPolicy.allCases,id: \.self) { Text($0.title).tag($0) } }
+                    Text("跳过模式保留已有文件；旧版本标为待更新。覆盖仅替换本任务成品，外来同名文件会报冲突。").font(.caption).foregroundStyle(.secondary)
+                    exportLocation(.hd); exportLocation(.png4k)
+                    artifactResults(kinds: [.hd,.png4k])
                 }
+                Divider()
+                inspectorSection("4K 构图",icon: "crop") { squareControls }
             case .derivatives:
                 EmptyView()
             }
@@ -508,24 +511,12 @@ struct PhotoWorkflowView: View {
             Divider()
             inspectorSection("批次设置",icon: "gearshape") {
                 if store.usesFinalization {
-                    Text("裁切后必须人工检查；导出时同时生成堆栈原图和 4K PNG。").font(.caption).foregroundStyle(.secondary)
-                } else if let b = store.batch {
-                    Button("切换到人工定稿流程") { store.migrateToFinalization() }
-                        .disabled(b.activeTasks.isEmpty || !b.activeTasks.allSatisfy { $0[.matte].state == .completed })
-                    Text("完成本批次 AI 抠图及检查后可切换。保留已有 PSD 和抠图结果，不会再次裁切；先备份清单，再进入人工检查。").font(.caption).foregroundStyle(.secondary)
-                    LabeledContent("合成后检查",value: b.checkAfterStack ? "开启" : "关闭")
-                    LabeledContent("蒙版后检查",value: b.checkAfterMatte ? "开启" : "关闭")
-                    LabeledContent("构图后检查",value: b.checkGeometry != false ? "开启" : "关闭")
-                    LabeledContent("4K 导出前检查",value: b.check4K != false ? "开启" : "关闭")
+                    Text("逐面处理和确认；可分别选择 JPEG、PNG4K，按需单张或批量导出。").font(.caption).foregroundStyle(.secondary)
                 }
                 LabeledContent("抠图方式",value: store.effectiveMatteProvider.title)
-                Text("新建批次时可选择抠图方式。").font(.caption).foregroundStyle(.secondary)
-                if store.effectiveMatteProvider == .aiEngine {
-                    directoryControl("AI 引擎",url: store.enginePath.isEmpty ? nil : URL(fileURLWithPath: store.enginePath),placeholder: "尚未配置") { chooseFolder { store.configureEngine($0) } }
-                        .disabled(store.manualTaskID != nil)
-                }
+                Text("照片工作流使用 Photoshop 选择主体，无需外部引擎。").font(.caption).foregroundStyle(.secondary)
             }.font(.callout)
-        }.toggleStyle(.checkbox).disabled(store.busy)
+        }.toggleStyle(.checkbox)
     }
     private var imageControls: some View {
         VStack(alignment: .leading,spacing: 12) {
@@ -584,13 +575,23 @@ struct PhotoWorkflowView: View {
         VStack(alignment: .leading,spacing: 8) {
             Button(store.face == .front ? "打开正面工作 PSD" : "打开反面工作 PSD") { store.openPSD() }.disabled(!store.canOpenPSD || (store.manualTaskID != nil && !store.usesFinalization))
             if store.usesFinalization {
-                Text("可反复打开修改。最终读取「共同调整」里的「底图」和最上方可见透明像素图层；其余备份图层不参与导出。").font(.caption).foregroundStyle(.secondary)
-                Button("刷新保存结果") { store.refreshSaved() }.disabled(!store.canOpenPSD || (store.manualTaskID != nil && store.manualTaskID != store.currentTask?.id))
-                if store.effectiveMatteProvider == .photoshop {
-                    Text("直接调整「抠图」图层的蒙版，保存后刷新即可。无需应用蒙版；导出读取当前保存的抠图效果。").font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text("可直接修改「透明成品」。如需修改蒙版，显示「抠图」备份并隐藏旧成品；修改后复制备份、应用蒙版，将副本置顶显示，隐藏备份。保存后刷新，不会自动覆盖人工修改。").font(.caption).foregroundStyle(.secondary)
+                Text("高清导出读取 Stack，透明导出读取 Keying_Level。Keying_Origin 保留原始蒙版，默认隐藏。").font(.caption).foregroundStyle(.secondary)
+                Button("刷新保存结果") { store.refreshSaved() }.disabled(store.busy || (store.manualTaskID != nil && store.manualTaskID != store.currentTask?.id))
+                if store.manualTaskID != nil {
+                    Button("采用当前姿态与裁切") { store.adoptCurrentPSD() }.disabled(store.busy)
+                    Button("结束编辑") { store.finishEditing() }.disabled(store.busy)
+                    Text("先在 PS 保存再刷新；结束编辑后点击继续处理恢复队列。").font(.caption).foregroundStyle(.secondary)
                 }
+                Button("重试此图失败步骤") { store.retryCurrent() }
+                Menu("从此步骤重新处理") {
+                    Button("重新景深合成／导入") { reprocessStage = .stack }
+                    Button("重新 PS 抠图") { reprocessStage = .matte }.disabled(store.currentTask?.checkpoints?[.stack] == nil)
+                    Button("重新旋转矫正") { reprocessStage = .geometry }.disabled(store.currentTask?.checkpoints?[.matte] == nil)
+                }.disabled(store.busy || store.manualTaskID != nil)
+                .confirmationDialog("从\(reprocessStage?.title ?? "所选步骤")重新处理？",isPresented: Binding(get: { reprocessStage != nil },set: { if !$0 { reprocessStage = nil } })) {
+                    Button("重新处理") { if let step = reprocessStage { store.reprocessCurrent(from: step) }; reprocessStage = nil }
+                    Button("取消",role: .cancel) { reprocessStage = nil }
+                } message: { Text("旧 PSD 和已导出文件会保留。后续处理与确认失效，请重新检查后再导出。") }
             } else if store.manualTaskID != nil {
                 Text("自动队列已保留给人工编辑。请先在 PS 保存，再分类刷新。").font(.caption).foregroundStyle(.orange)
                 Picker("这次保存改变了",selection: $store.manualChange) { Text("仅蒙版").tag(WorkflowPSDChange.maskOnly); Text("角度／画布").tag(WorkflowPSDChange.geometry); Text("堆栈内容").tag(WorkflowPSDChange.stackContent) }
@@ -602,9 +603,10 @@ struct PhotoWorkflowView: View {
     private func artifactResults(kinds: [WorkflowAssetKind]) -> some View {
         VStack(alignment: .leading,spacing: 8) {
             ForEach(kinds,id: \.self) { kind in
-                let artifact = store.currentTask?.artifacts.first { $0.kind == kind }
+                let artifact = store.currentTask?.artifacts.last { $0.kind == kind }
                 VStack(alignment: .leading) {
                     Text(assetTitle(kind)).font(.caption.bold())
+                    if let note = store.currentTask?.exportNotes?[kind] { Text(note).font(.caption).foregroundStyle(.secondary) }
                     if let message = store.currentTask?[kind.stage].error { Text(message).font(.caption).foregroundStyle(.red) }
                     if let artifact { Text(artifact.state.title).font(.caption); Button(artifact.url.lastPathComponent) { NSWorkspace.shared.open(artifact.url) }.font(.caption).disabled(artifact.state != .completed) }
                     else { Text(kind == .hd && store.currentTask?.exportHD == false ? "本次未选择" : "尚无有效产物").font(.caption).foregroundStyle(.secondary) }
@@ -612,14 +614,23 @@ struct PhotoWorkflowView: View {
             }
         }
     }
+    private func panelStatus(_ panel: WorkflowStage) -> String {
+        guard let task = store.currentTask else { return "未开始" }
+        if panel == .hd { return task[.geometry].state == .waitingReview ? "待检查" : task[.geometry].state == .completed ? "已确认" : "未开始" }
+        if panel == .geometry && task[.geometry].state == .waitingReview { return "自动处理完成" }
+        if panel == .png4k { return "JPEG \(task[.hd].state.title) / PNG \(task[.png4k].state.title)" }
+        return task[panel].state.title
+    }
     private var primaryTitle: String {
-        if store.usesFinalization && store.stage == .geometry { return "确认所选两面并进入导出" }
-        if store.usesFinalization && store.stage == .png4k { return "导出堆栈原图和 4K PNG" }
+        if store.usesFinalization && (store.stage == .geometry || store.stage == .hd) { return "确认此图" }
+        if store.usesFinalization && store.stage == .png4k { return "导出\(exportScope)" }
         return switch store.stage { case .stack: "整批检查完成，继续 AI"; case .matte: "整批检查完成，继续构图"; case .geometry: "确认所选标本两面构图"; case .hd: "导出堆栈原图"; case .png4k: "确认两面并导出 4K PNG"; case .derivatives: "仅重试失败资产" }
     }
     // 检查点条件由存储层汇总；界面仅据此禁用按钮，避免未验证预览进入确认。
     private var primaryDisabled: Bool {
-        if store.usesFinalization && store.stage == .geometry { return !store.canFinalize }
+        if store.usesFinalization && (store.stage == .geometry || store.stage == .hd) { return !store.canFinalize }
+        if store.usesFinalization && store.stage == .png4k { return store.exportTaskIDs(scope: exportScope).isEmpty || (!store.exportHDSelected && !store.exportPNGSelected) }
+        if store.usesFinalization { return true }
         if store.busy || store.manualTaskID != nil || store.batch?.isPaused == true { return true }
         if store.stage == .hd && store.exportDirectory(for: .hd) == nil { return true }
         if store.stage == .png4k && store.exportDirectory(for: .png4k) == nil { return true }

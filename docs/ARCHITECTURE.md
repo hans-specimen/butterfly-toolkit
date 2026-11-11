@@ -1,13 +1,13 @@
 # 技术架构与代码导航
 
-依据当前工作目录核对：2026-11-09。应用是一个 macOS SwiftUI target，测试为独立 XCTest target；没有拆分 Swift Package 或第三方 Swift 依赖。部署目标为 macOS 26.5，Swift 语言模式为 5，应用默认 actor 隔离为 MainActor；这些设置以 `project.pbxproj` 为准。
+以下说明当前源码。应用是一个 macOS SwiftUI target，测试为独立 XCTest target；没有拆分 Swift Package 或第三方 Swift 依赖。部署目标为 macOS 26.5，Swift 语言模式为 5，应用默认 actor 隔离为 MainActor；这些设置以 `project.pbxproj` 为准。
 
 ## 职责结构
 
 | 位置 | 职责与主要入口 |
 | --- | --- |
 | `App` | `Butterfly_ToolkitApp` 创建窗口；`ContentView` 定义工具路由并持有 AI、工作流状态；`AboutView` 读取构建版本 |
-| `Features/AI` | `AIWorkspaceStore` 管理独立 AI 页面；`AIProcessRunner` 运行单次桥接命令；`AIInferenceWorker` 为照片工作流复用推理会话 |
+| `Features/AI` | `AIWorkspaceStore` 管理独立 AI 页面；`AIProcessRunner` 运行单次桥接命令 |
 | `Features/PhotoWorkflow` | `PhotoWorkflowStore/View` 负责交互；`WorkflowExecutor` 调度；`WorkflowStateMachine` 校验状态转换；模型、预览、几何、持久化、发布各有专属文件 |
 | 其他 `Features` | 按工具保存界面及专用处理器，如智能裁剪、PSD 导出；没有为了层级统一强行拆出每个工具的模型或服务 |
 | `Core/ImageProcessing` | `SpecimenGeometry` 共用主体边界、翅顶扶正和真实背景裁切；另有压缩／旋转、透明 PNG 裁切、闲鱼产品图合成 |
@@ -25,12 +25,11 @@ PhotoWorkflowView / PhotoWorkflowStore
         WorkflowExecutor
           ├─ WorkflowStateMachine → WorkflowBatchStore → batch.json
           ├─ PhotoshopWorkflowBridge → PhotoshopExecutionCoordinator → Photoshop
-          ├─ WorkflowMatteService → AIInferenceWorker → Python 引擎
           ├─ WorkflowGeometryCache → MaskGeometryProcessor → SpecimenGeometry
           └─ WorkflowAssetRenderer → WorkflowArtifactStore → 导出文件与归属凭据
 ```
 
-- `WorkflowBatchDraft` 在输入阶段固定六张源图的位置与名称，建批次时记录源哈希。排除标本不会把后续图片重新挤入空槽。
+- `WorkflowBatchDraft` 固定每只标本的六张照片或 D/V 两份 PSD 的位置和名称，建批次时记录源哈希。排除标本不会把后续图片重新挤入空槽。
 - `WorkflowStateMachine.reduce` 在批次副本上执行版本和状态校验；不写文件或调用处理服务，但路径校验会读取文件系统。
 - `WorkflowExecutor` 持有运行状态，注入可替换服务以供测试。异步操作前后核对修订与快照；最后一次校验到文件发布在同一 actor 内同步完成。
 - `WorkflowBatchStore` 保存和恢复清单；`WorkflowArtifactStore` 维护发布意图、已提交归属、指纹与历史记录，防止仅凭同名路径覆盖他人文件。
@@ -42,11 +41,11 @@ PhotoWorkflowView / PhotoWorkflowStore
 
 ## 并发与外部进程
 
-UI 状态由 MainActor 管理；重图像处理、哈希及阻塞进程交互放在后台。Swift actor 会在 `await` 时允许重入，因此 Photoshop 采用显式占用与等待队列，AI worker 采用显式先进先出请求队列。
+UI 状态由 MainActor 管理。重图像处理、哈希及阻塞进程交互放在后台。Swift actor 会在 `await` 时允许重入，Photoshop 通过显式占用与等待队列保持串行。
 
-照片工作流默认最多两个抠图面任务在途、两个本地导出任务并发，但 Photoshop 和 AI 各自仍是单路。暂停先撤销后续执行资格，已进入不可中断 Photoshop 调用的操作必须安全收尾后释放占用。
+照片工作流逐面串行执行 Photoshop 自动处理。从合成到矫正保留同一工作文档和独占占用，每一步保存并校验，结束时仅关闭本任务打开的工作文档。暂停等已派发步骤安全收尾。导出最多两路并发，人工编辑持有 Photoshop 占用。
 
-Python 引擎是外部项目，通过所选目录下的 `.venv/bin/python` 与 `scripts/toolkit_bridge.py` 调用；应用不携带模型或 Python 环境。独立 AI 命令与工作流常驻协议见 [AI 工作区](AI-WORKSPACE.md)。
+Python 引擎是外部项目，通过所选目录下的 `.venv/bin/python` 与 `scripts/toolkit_bridge.py` 调用；应用不携带模型或 Python 环境。独立 AI 命令见 [AI 工作区](AI-WORKSPACE.md)。
 
 ## 图像与坐标约定
 
@@ -54,15 +53,15 @@ Python 引擎是外部项目，通过所选目录下的 `.venv/bin/python` 与 `
 - `RoleImages` 分别记录完整可编辑像素范围、像素原点与可见裁切框，不能把画布尺寸当成全部可恢复内容。
 - 角色图、快照版本、尺寸、方向、ICC 和蒙版／抠图 Alpha 必须相互匹配；预览可确认状态也必须对应当前版本。
 - 几何修改仅作用于指定快照的增量，恢复不能再次叠加已经写入 PSD 的旋转或裁切。
-- 高清 JPEG 使用确认裁切框内的底图，质量参数 0.82；透明输出默认 4096 × 4096、256 像素安全边距，保留主体边界内细微 Alpha。
+- 高清 JPEG 使用确认裁切框内的 `Stack`，质量参数 0.82。透明输出读取 `Keying_Level`，默认 4096 × 4096、256 像素安全边距。
 
 ## 磁盘数据与清理边界
 
 | 位置 | 含义 |
 | --- | --- |
-| 用户输入目录 | 原图；新合成的 `<名称>_D.psd`、`<名称>_V.psd` 保存在原图旁；已有 PSD 入口按冻结路径直接回写原文件 |
-| `~/Library/Application Support/Butterfly Toolkit/PhotoWorkflow/<UUID>/` | `batch.json`、`.work` 中的可恢复中间数据；不是构建缓存 |
-| 用户选择的高清与 PNG4K 目录 | 成品及发布归属记录；旧批次可能使用内部子目录，保留兼容读取 |
+| 用户输入目录 | 源照片或已有 D/V 合成 PSD，输入文件只读 |
+| `~/Library/Application Support/Butterfly Toolkit/PhotoWorkflow/<UUID>/` | 第 2 版 `batch.json`、`PSD/` 下的工作 PSD 和 `.work/` 下的恢复材料 |
+| 用户选择的高清与 PNG4K 目录 | 成品、发布归属记录和历史版本 |
 | 所选 AI 项目的数据／输出目录 | 独立导入副本、人工答案、推理记录与工作区设置，具体由引擎和 UI 契约管理 |
 | `/tmp`、本地 `build/`、`staging/` | 本次构建、测试及临时证据；只有确认可再生成或已备份的部分才清理 |
 | `output/app-icon-liquid-glass/` | 当前图标的原始设计图与生成说明；正式各尺寸图标在 `Assets.xcassets`，重复导出包与旧方案已清理 |

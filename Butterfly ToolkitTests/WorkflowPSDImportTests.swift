@@ -40,13 +40,14 @@ import XCTest
         let draft = try WorkflowBatchDraft.scan(directory: root,inputMode: .psd)
         XCTAssertEqual(draft.groups.map(\.suggestedName),["SC2_蝶","SC10_蝶"])
         XCTAssertEqual(draft.groups[0].files.compactMap { $0?.lastPathComponent },["SC2_蝶_d.PSD","SC2_蝶_v.psd"])
-        let batch = try draft.freeze(names: "SC2_蝶\nSC10_蝶",output: root.appendingPathComponent("batch"),checkStack: true,checkMatte: true)
+        let batch = try draft.freeze(names: "SC2_蝶\nSC10_蝶",output: root.appendingPathComponent("batch"),checkStack: true,checkMatte: true,manualFinalization: true)
         XCTAssertFalse(batch.checkAfterStack)
         XCTAssertTrue(batch.activeTasks.allSatisfy { $0.sources.isPSD && $0.sources.files.count == 1 && $0.stackPNG == nil })
         let restored = try JSONDecoder().decode(WorkflowBatch.self,from: JSONEncoder().encode(batch))
         XCTAssertEqual(restored,batch)
         try restored.validate()
         for task in restored.activeTasks { try restored.validateOutputURL(task.sources.first.url) }
+        try restored.validateOutputURL(restored.generatedPSDDirectory.appendingPathComponent("SC2_蝶_D.psd"))
         XCTAssertThrowsError(try restored.validateOutputURL(root.appendingPathComponent("foreign.psd")))
     }
     func testUnpairedAndUnknownPSDRequireExplicitExclusionAndDuplicatesFail() throws {
@@ -106,10 +107,10 @@ import XCTest
         XCTAssertFalse(FileManager.default.fileExists(atPath: document.appendingPathExtension("workflow-owner.json").path))
         XCTAssertEqual(try AIFileValidation.hash(document.path),source.fingerprint)
     }
-    func testImportedPSDExportsInputAndContinuesWithoutStackingIncludingReopen() async throws {
+    func testImportedPSDCopyUsesNativeMatteAndContinuesWithoutStackingIncludingReopen() async throws {
         let f = try ExecutorFixture(checks: false)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch
+        var batch = f.batch; batch.manualFinalization = true
         for side in WorkflowSide.allCases {
             var task = side == .front ? batch.specimens[0].front : batch.specimens[0].back
             let url = batch.sourceDirectory.appendingPathComponent("manual_\(side.fileSuffix).psd")
@@ -123,7 +124,7 @@ import XCTest
             await f.probe.record("import-psd")
             let snapshot = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: source.url))
             XCTAssertEqual(snapshot.taskID,owner)
-            return snapshot
+            return ExecutorFixture.snapshot(owner,source.url,snapshot.contentVersion,roles: false)
         }
         let executor = WorkflowExecutor(services: services)
         try await executor.register(batch: batch,manifestURL: f.manifest)
@@ -132,7 +133,11 @@ import XCTest
         XCTAssertTrue(result.activeTasks.allSatisfy { $0[.stack].state == .completed && $0[.matte].state == .completed && $0[.geometry].state == .waitingReview })
         let calls = await f.probe.values()
         XCTAssertFalse(calls.contains("stack"))
-        for operation in ["import-psd","export-stack","ai","install"] { XCTAssertEqual(calls.filter { $0 == operation }.count,2,operation) }
+        for operation in ["import-psd","select-subject"] { XCTAssertEqual(calls.filter { $0 == operation }.count,2,operation) }
+        for task in result.activeTasks {
+            XCTAssertEqual(task.snapshot?.workingURL.deletingLastPathComponent().path,batch.generatedPSDDirectory.path)
+            XCTAssertEqual(try AIFileValidation.hash(task.sources.first.url.path), task.sources.first.fingerprint)
+        }
         let reopened = WorkflowExecutor(services: services)
         let restored = try await reopened.register(manifestURL: f.manifest)
         try await reopened.runPending(batchID: restored)
@@ -141,7 +146,7 @@ import XCTest
     }
     func testRealPSDImportThroughMatteAndGeometryWhenRequested() async throws {
         let env = ProcessInfo.processInfo.environment
-        guard let sourcePath = env["WORKFLOW_IMPORT_REAL_SOURCE"],let evidencePath = env["WORKFLOW_IMPORT_REAL_EVIDENCE"],let enginePath = env["WORKFLOW_IMPORT_REAL_ENGINE"] else {
+        guard let sourcePath = env["WORKFLOW_IMPORT_REAL_SOURCE"],let evidencePath = env["WORKFLOW_IMPORT_REAL_EVIDENCE"] else {
             throw XCTSkip("Real PSD import is opt-in and uses an isolated copy")
         }
         let source = URL(fileURLWithPath: sourcePath), evidence = URL(fileURLWithPath: evidencePath)
@@ -166,15 +171,9 @@ import XCTest
             catch { print("PSD import Photoshop error: \(error)"); throw error }
         })
         let snapshot = try await bridge.adoptStack(source: WorkflowSourceFile(url: document,fingerprint: originalHash),owner: owner)
-        let input = try await bridge.exportStackPNG(snapshot: snapshot)
-        let service = WorkflowMatteService(engine: URL(fileURLWithPath: enginePath),workspace: workspace)
-        let matte: MatteArtifact
-        do { matte = try await service.infer(input: input) } catch { await service.shutdown(); throw error }
-        await service.shutdown()
-        let installed = try await bridge.installMatte(snapshot: snapshot,matte: matte)
+        let installed = try await bridge.selectSubject(snapshot: snapshot)
         let roles = try await bridge.extractRoles(snapshot: installed)
-        let services = WorkflowExecutor.Services.live(bridge: bridge,matte: service)
-        try await services.validateInstalledMatte(roles,input,matte)
+        let services = WorkflowExecutor.Services.live(bridge: bridge)
         let geometry = try await services.analyze(roles,GeometryRequest())
         var final = installed
         if geometry.isApplicable {

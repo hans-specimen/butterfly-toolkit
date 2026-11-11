@@ -92,28 +92,6 @@ import Darwin
         do { _ = try await pending.value; XCTFail("Startup must be cancelled") } catch is CancellationError {}
         for pid in try f.starts() { XCTAssertEqual(kill(pid,0),-1) }
     }
-    func testPauseDuringInferenceWaitsForWorkerExit() async throws {
-        let f = try Fixture(); defer { f.remove() }
-        let workflow = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: workflow.batch.outputDirectory) }
-        let worker = AIInferenceWorker()
-        var services = workflow.services
-        let infer = services.infer
-        services.infer = { input in _ = try await worker.infer(f.request("hold")); return try await infer(input) }
-        services.endInferenceSession = { await worker.shutdown() }
-        let executor = WorkflowExecutor(services: services)
-        try await executor.register(batch: workflow.batch,manifestURL: workflow.manifest)
-        let running = Task { try await executor.runPending(batchID: workflow.batch.id) }
-        try await waitUntil { f.events().contains("hold") }
-        await executor.pause(batchID: workflow.batch.id)
-        try await running.value
-        let calls = await workflow.probe.values()
-        XCTAssertFalse(calls.contains("ai"),"Paused inference must not complete after its worker exits")
-        let paused = try await executor.batch(batchID: workflow.batch.id)
-        XCTAssertTrue(paused.isPaused)
-        XCTAssertTrue(paused.activeTasks.allSatisfy { $0[.matte].state != .failed })
-        for pid in try f.starts() { XCTAssertEqual(kill(pid,0),-1) }
-    }
     func testConcurrentIdleShutdownBothWaitForProcessExit() async throws {
         let f = try Fixture(); defer { f.remove() }
         let worker = AIInferenceWorker()
@@ -123,29 +101,6 @@ import Darwin
         await worker.shutdown()
         for pid in try f.starts() { XCTAssertEqual(kill(pid,0),-1,"Every shutdown caller must wait for exit, including idle sessions") }
         await first.value
-    }
-    func testExecutorDoesNotRestartCrashedWorkerForNextAutomaticFace() async throws {
-        let f = try Fixture(); defer { f.remove() }
-        let workflow = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: workflow.batch.outputDirectory) }
-        let worker = AIInferenceWorker()
-        var services = workflow.services
-        let infer = services.infer
-        services.infer = { input in
-            let mode = await workflow.probe.values().contains("user-retry") ? "success" : "exit"
-            _ = try await worker.infer(f.request(mode))
-            return try await infer(input)
-        }
-        services.endInferenceSession = { await worker.shutdown() }
-        let executor = WorkflowExecutor(services: services)
-        try await executor.register(batch: workflow.batch,manifestURL: workflow.manifest)
-        try await executor.runPending(batchID: workflow.batch.id)
-        XCTAssertEqual(try f.starts().count,1,"The next automatic face must not restart a crashed process")
-        await workflow.probe.record("user-retry")
-        try await executor.retry(batchID: workflow.batch.id,specimenIDs: workflow.batch.specimens.map(\.id),stage: .matte)
-        XCTAssertEqual(try f.starts().count,2,"An explicit retry may start a new session shared by both faces")
-        let recovered = try await executor.batch(batchID: workflow.batch.id)
-        XCTAssertTrue(recovered.activeTasks.allSatisfy { $0[.matte].state == .completed })
     }
     func testShutdownDuringFatalCleanupAllowsExplicitNewSession() async throws {
         let f = try Fixture(); defer { f.remove() }

@@ -241,9 +241,13 @@ nonisolated enum WorkflowStateMachine {
     }
 
     private static func canStart(_ stage: WorkflowStage, task: WorkflowSideTask, batch: WorkflowBatch) -> Bool {
+        if let kind = [WorkflowAssetKind.hd, .png4k].first(where: { $0.stage == stage }), task.requestedExports?[kind] != nil {
+            return task[.geometry].state == .completed
+        }
         let earlier = WorkflowStage.allCases.prefix { $0 != stage }
         guard earlier.allSatisfy({ task[$0].state == .completed }) else { return false }
-        // 堆栈与抠图设有整批屏障，任一面都须等待对应前置阶段整批完成后才能进入后续步骤。
+        if batch.manualFinalization == true { return true }
+        // 旧内部夹具保留原阶段协议；新照片流程逐面推进。
         if stage != .stack && !batch.activeTasks.allSatisfy({ $0[.stack].state == .completed }) { return false }
         if stage != .stack && stage != .matte && !batch.activeTasks.allSatisfy({ $0[.matte].state == .completed }) { return false }
         return true
@@ -286,6 +290,13 @@ nonisolated enum WorkflowStateMachine {
         }
         if stages.contains(.geometry) { task.exportHD = nil; task.geometryApplySourceVersion = nil }
         if stages.contains(.png4k) { task.fourKExportRequested = nil }
+        for kind in [WorkflowAssetKind.hd, .png4k] where stages.contains(kind.stage) {
+            task.requestedExports?.removeValue(forKey: kind)
+            if task.artifacts.contains(where: { $0.kind == kind }) {
+                if task.exportNotes == nil { task.exportNotes = [:] }
+                task.exportNotes?[kind] = "结果已变化，待重新导出"
+            }
+        }
         if stages.contains(.geometry) {
             task.geometrySolution = nil
             task.geometryRevalidationRequired = false

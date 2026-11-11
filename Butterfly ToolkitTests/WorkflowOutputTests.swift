@@ -3,6 +3,20 @@ import XCTest
 
 @MainActor
 final class WorkflowOutputTests: XCTestCase {
+    func testSkipPolicyAtPublicationPreservesReappearedOwnedFile() throws {
+        let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
+        let store = WorkflowArtifactStore()
+        let original = try store.publish(temp: f.roles.basePNG,artifact: f.artifact)
+        let bytes = try Data(contentsOf: original.url)
+        var next = f.artifact; next.sourceFingerprint = "new-version"
+        XCTAssertThrowsError(try store.publish(temp: f.roles.cutoutPNG,artifact: next,overwriteExisting: false)) { error in
+            XCTAssertEqual(error as? WorkflowArtifactError,.existingOutputSkipped)
+        }
+        XCTAssertEqual(try Data(contentsOf: original.url),bytes)
+        XCTAssertEqual(try store.recover(artifact: f.artifact),original)
+        XCTAssertEqual(try store.publish(temp: f.roles.cutoutPNG,artifact: f.artifact,overwriteExisting: false),original)
+    }
+
     func testPublicationDecodesCandidateOnceAndVerifiesCopiedBytes() throws {
         let f = try WorkflowAssetRendererTests.Fixture(); defer { f.remove() }
         let probe = WorkflowDecodeProbe(),store = WorkflowArtifactStore(read: probe.read)
@@ -150,11 +164,10 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testChangingCompleted4KDirectoryAllowsImmediateConfirmation() async throws {
-        for scheduling in [WorkflowMatteScheduling.interleaved,.phased] {
         let f = try ExecutorFixture(checks: false)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch; batch.checkGeometry = false; batch.check4K = false
-        let e = WorkflowExecutor(services: f.cachedServices,matteScheduling: scheduling)
+        let e = WorkflowExecutor(services: f.services)
         try await e.register(batch: batch, manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
         let before = try await e.batch(batchID: batch.id)
@@ -169,50 +182,8 @@ final class WorkflowOutputTests: XCTestCase {
         for task in before.activeTasks {
             XCTAssertTrue(FileManager.default.fileExists(atPath: task.artifacts.first { $0.kind == .png4k }!.url.path))
         }
-        }
     }
 
-    func testMatteFailureRetainsTemporaryPNGsAndSuccessCleansOnlyManagedFiles() async throws {
-        let f = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        let root = f.batch.outputDirectory
-        let managed = root.appendingPathComponent(".work/data/processed/input.png")
-        let alpha = root.appendingPathComponent(".work/AI/result/alpha.png")
-        let cutout = root.appendingPathComponent(".work/AI/result/cutout.png")
-        let external = root.appendingPathComponent("keep.png")
-        try Data("external".utf8).write(to: external)
-        var services = f.services
-        services.exportStack = { snapshot in
-            try FileManager.default.createDirectory(at: managed.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data("input".utf8).write(to: managed)
-            return StackPNG(snapshotVersion: snapshot.contentVersion, pngURL: managed, fingerprint: "input", pixelSize: snapshot.pixelSize, orientation: 1, colorProfile: "sRGB", validBackgroundAlphaURL: external)
-        }
-        services.infer = { input in
-            try FileManager.default.createDirectory(at: alpha.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try Data("alpha".utf8).write(to: alpha); try Data("cutout".utf8).write(to: cutout)
-            return MatteArtifact(inputPNGFingerprint: input.fingerprint, alphaURL: alpha, alphaFingerprint: "alpha", cutoutURL: cutout, cutoutFingerprint: "cutout", orientation: 1, pixelSize: input.pixelSize)
-        }
-        let install = services.install
-        services.install = { saved, matte in
-            guard await f.probe.values().contains("allow-install") else { throw WorkflowBridgeError.invalidImage("injected") }
-            return try await install(saved, matte)
-        }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: f.batch.id)
-        for url in [managed, alpha, cutout, external] { XCTAssertTrue(FileManager.default.fileExists(atPath: url.path)) }
-        await f.probe.record("allow-install")
-        try await e.retry(batchID: f.batch.id, specimenIDs: f.batch.specimens.map(\.id), stage: .matte)
-        for url in [managed, alpha, cutout] { XCTAssertFalse(FileManager.default.fileExists(atPath: url.path)) }
-        XCTAssertEqual(try Data(contentsOf: external), Data("external".utf8))
-        let b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0.stackPNG == nil && $0.matteArtifact == nil && $0.snapshot?.roles != nil })
-        let reloaded = WorkflowExecutor(services: services)
-        _ = try await reloaded.register(manifestURL: f.manifest)
-        try await reloaded.runPending(batchID: b.id)
-        let calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "install" }.count, 2)
-    }
 
     func testChosenOutputDirectoryRejectsNestedSymlinkEscape() throws {
         let f = try ExecutorFixture(checks: false)
@@ -228,20 +199,19 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testAllFourCheckpointSwitchCombinationsRespectReviewChoices() async throws {
-        for scheduling in [WorkflowMatteScheduling.interleaved, .phased] {
         for stackCheck in [false,true] { for matteCheck in [false,true] {
         for geometryCheck in [false, true] {
             for fourKCheck in [false, true] {
                 let f = try ExecutorFixture(checks: stackCheck,count: 2,checkMatte: matteCheck)
                 defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
                 var batch = f.batch; batch.checkGeometry = geometryCheck; batch.check4K = fourKCheck
-                let e = WorkflowExecutor(services: f.cachedServices,matteScheduling: scheduling)
+                let e = WorkflowExecutor(services: f.services)
                 try await e.register(batch: batch, manifestURL: f.manifest)
                 try await e.runPending(batchID: batch.id)
                 var result = try await e.batch(batchID: batch.id)
                 if stackCheck {
                     XCTAssertEqual(result.currentStage,.stack)
-                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("ai"))
+                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("select-subject"))
                     try await e.continueAfterReview(batchID: batch.id,stage: .stack,specimenIDs: batch.specimens.map(\.id))
                     result = try await e.batch(batchID: batch.id)
                 }
@@ -267,7 +237,6 @@ final class WorkflowOutputTests: XCTestCase {
             }
         }
         } }
-        }
     }
 
 }

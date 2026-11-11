@@ -37,22 +37,9 @@ import XCTest
             checkStack: false, checkMatte: false, manualFinalization: true)
         XCTAssertEqual(batch.effectiveMatteProvider, .photoshop)
         let bridge = PhotoshopWorkflowBridge(workspace: workspace.appendingPathComponent(".work"))
-        var services = WorkflowExecutor.Services.live(bridge: bridge, matte: WorkflowMatteService(engine: root.appendingPathComponent("no-engine"), workspace: workspace))
-        services.infer = { _ in XCTFail("PS path invoked external AI"); throw WorkflowStateError.invalidTransition }
-        services.exportStack = { _ in XCTFail("PS path exported AI input"); throw WorkflowStateError.invalidTransition }
-        services.install = { _,_ in XCTFail("PS path installed AI matte"); throw WorkflowStateError.invalidTransition }
+        var services = WorkflowExecutor.Services.live(bridge: bridge)
         let select = try XCTUnwrap(services.selectSubject)
         services.selectSubject = { snapshot in
-            let path = String(decoding: try JSONEncoder().encode(snapshot.workingURL.path), as: UTF8.self)
-            let stackBackground = try await PhotoshopExecutionCoordinator.shared.run(owner: snapshot.taskID) {
-                try await PhotoshopWorkflowBridge.execute("""
-                (function(){var d=app.open(new File(\(path)));try{
-                    var bg=d.layers[d.layers.length-1];
-                    return String(bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);
-                }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
-                """)
-            }
-            XCTAssertEqual(stackBackground, "true", "Stack output must already have a locked visible bottom BG")
             let result = try await select(snapshot)
             try JSONEncoder().encode(result).write(to: root.appendingPathComponent("\(snapshot.taskID)-selected.json"))
             return result
@@ -73,10 +60,16 @@ import XCTest
             let maskCheck = try await PhotoshopExecutionCoordinator.shared.run(owner: task.id) {
                 try await PhotoshopWorkflowBridge.execute("""
                 (function(){var d=app.open(new File(\(path)));try{
-                    var a=d.layerSets.getByName('共同调整'),c=a.artLayers.getByName('抠图');
-                    d.activeLayer=c;var r=new ActionReference();r.putProperty(charIDToTypeID('Prpr'),stringIDToTypeID('hasUserMask'));
-                    r.putEnumerated(charIDToTypeID('Lyr '),charIDToTypeID('Ordn'),charIDToTypeID('Trgt'));
-                    var editable=a.layers.length===2 && c.visible && executeActionGet(r).getBoolean(stringIDToTypeID('hasUserMask'));
+                    var a=d.layerSets.getByName('共同调整'),c=a.layers[0],o=a.layers[1],s=a.layers[2];
+                    function matches(layer,name,mask,color,visible){
+                        if(!layer || layer.name!==name || layer.visible!==visible)return false;
+                        var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);
+                        var desc=executeActionGet(ref),key=charIDToTypeID('Clr ');
+                        var userMask=stringIDToTypeID('hasUserMask');
+                        return (desc.hasKey(userMask) && desc.getBoolean(userMask))===mask && desc.getEnumerationValue(key)===charIDToTypeID(color);
+                    }
+                    var editable=a.layers.length===3 && matches(c,'Keying_Level',true,'Rd  ',true)
+                        && matches(o,'Keying_Origin',true,'Grn ',false) && matches(s,'Stack',false,'Bl  ',false);
                     var bg=d.layers[d.layers.length-1];
                     return String(editable && d.layers.length===3 && bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);
                 }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
@@ -98,7 +91,7 @@ import XCTest
         _ = try await PhotoshopExecutionCoordinator.shared.run(owner: task.id) {
             try await PhotoshopWorkflowBridge.execute("""
             (function(){var d=app.open(new File(\(path)));try{
-                d.activeLayer=d.layerSets.getByName('共同调整').artLayers.getByName('抠图');
+                d.activeLayer=d.layerSets.getByName('共同调整').artLayers.getByName('Keying_Level');
                 var r=new ActionReference(),a=new ActionDescriptor();
                 r.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));a.putReference(charIDToTypeID('null'),r);
                 executeAction(charIDToTypeID('slct'),a,DialogModes.NO);
@@ -112,8 +105,10 @@ import XCTest
         let edited = try await executor.batch(batchID: batch.id)
         let editedRoles = try XCTUnwrap(edited.task(id: task.id)?.roleImages)
         XCTAssertEqual(try WorkflowRaster.read(editedRoles.cutoutPNG).pixels[offset+3], 0)
-        try await executor.confirmFinalPSD(batchID: batch.id, specimenIDs: Set(batch.specimens.map(\.id)))
-        try await executor.confirm4K(batchID: batch.id, layouts: Dictionary(uniqueKeysWithValues: batch.activeTasks.map { ($0.id,SquareLayout.png4k) }))
+        let versions = try Dictionary(uniqueKeysWithValues: edited.activeTasks.map { ($0.id, try XCTUnwrap($0.snapshot?.contentVersion)) })
+        try await executor.confirmFinalTasks(batchID: batch.id, versions: versions)
+        try await executor.requestExports(batchID: batch.id, taskIDs: Set(versions.keys), kinds: [.hd,.png4k], policy: .skipExisting, layouts: [:])
+        try await executor.continueAutomatic(batchID: batch.id)
         let finished = try await executor.batch(batchID: batch.id)
         XCTAssertTrue(finished.activeTasks.allSatisfy { $0[.hd].state == .completed && $0[.png4k].state == .completed })
         for task in finished.activeTasks {

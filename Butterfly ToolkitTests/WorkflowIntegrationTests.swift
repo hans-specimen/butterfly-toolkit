@@ -2,21 +2,20 @@ import XCTest
 import CoreGraphics
 @testable import Butterfly_Toolkit
 
-/// PS/AI are injected; commands, state transitions, persistence and (where noted) pixels are real.
+/// Photoshop operations are injected; commands, state transitions, persistence and (where noted) pixels are real.
 @MainActor
 final class WorkflowIntegrationTests: XCTestCase {
     func testTwoSpecimensRespectAllFourCheckpointCombinationsAndPairConfirmations() async throws {
-        for scheduling in [WorkflowMatteScheduling.interleaved,.phased] {
         for stackCheck in [false, true] { for matteCheck in [false, true] {
             let f = try ExecutorFixture(checks: stackCheck, count: 2, checkMatte: matteCheck)
             defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-            let e = try await start(f,services: f.cachedServices,scheduling: scheduling)
+            let e = try await start(f)
             var b = try await e.batch(batchID: f.batch.id)
             if stackCheck {
                 XCTAssertTrue(b.activeTasks.allSatisfy { $0[.stack].state == .waitingReview })
                 let calls = await f.probe.values()
                 XCTAssertEqual(calls.filter { $0 == "stack" }.count, 4)
-                XCTAssertFalse(calls.contains("ai"))
+                XCTAssertFalse(calls.contains("select-subject"))
                 do {
                     try await e.continueAfterReview(batchID: b.id, stage: .stack, specimenIDs: [b.specimens[0].id])
                     XCTFail("Partial batch must not bypass the whole-batch checkpoint")
@@ -27,7 +26,7 @@ final class WorkflowIntegrationTests: XCTestCase {
             if matteCheck {
                 XCTAssertTrue(b.activeTasks.allSatisfy { $0[.matte].state == .waitingReview })
                 let calls = await f.probe.values()
-                XCTAssertEqual(calls.filter { $0 == "install" }.count, 4)
+                XCTAssertEqual(calls.filter { $0 == "select-subject" }.count, 4)
                 XCTAssertFalse(calls.contains("analyze"))
                 try await e.continueAfterReview(batchID: b.id, stage: .matte, specimenIDs: b.specimens.map(\.id))
             }
@@ -61,7 +60,6 @@ final class WorkflowIntegrationTests: XCTestCase {
                 XCTAssertEqual(try AIFileValidation.hash(source.url.path), source.fingerprint)
             }
         } }
-        }
     }
 
     func testSingleSideFailureBlocksAutomaticAdvanceAndRetryKeepsSuccessfulSides() async throws {
@@ -79,7 +77,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertEqual(b.task(id: failedID)?[.stack].state, .failed)
         XCTAssertEqual(b.activeTasks.filter { $0[.stack].state == .completed }.count, 3)
         var calls = await f.probe.values()
-        XCTAssertFalse(calls.contains("ai"))
+        XCTAssertFalse(calls.contains("select-subject"))
         let reopened = WorkflowExecutor(services: f.services)
         _ = try await reopened.register(manifestURL: f.manifest)
         try await reopened.retry(batchID: b.id, specimenIDs: [b.specimens[0].id], stage: .stack)
@@ -87,7 +85,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertTrue(b.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
         calls = await f.probe.values()
         XCTAssertEqual(calls.filter { $0 == "stack" }.count, 4, "Only the failed side is stacked after reload")
-        XCTAssertEqual(calls.filter { $0 == "ai" }.count, 4)
+        XCTAssertEqual(calls.filter { $0 == "select-subject" }.count, 4)
     }
 
     func testExplicitExclusionKeepsBothFacesAndOriginalNameMappingInSummary() async throws {
@@ -168,7 +166,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         try await e.runPending(batchID: before.id)
         try await confirm4K(f, e, margin: 384)
         let changed = try await e.batch(batchID: before.id), callsChanged = await f.probe.values()
-        for call in ["stack", "ai", "install", "analyze", "apply-save", "render-hd"] {
+        for call in ["stack", "select-subject", "analyze", "apply-save", "render-hd"] {
             XCTAssertEqual(callsChanged.filter { $0 == call }.count, callsCompleted.filter { $0 == call }.count, call)
         }
         XCTAssertEqual(changed.activeTasks.map { $0[.hd] }, hdBefore)
@@ -260,8 +258,8 @@ final class WorkflowIntegrationTests: XCTestCase {
         }
     }
 
-    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil, scheduling: WorkflowMatteScheduling = .interleaved) async throws -> WorkflowExecutor {
-        let e = WorkflowExecutor(services: services ?? f.services, coordinator: PhotoshopExecutionCoordinator(),matteScheduling: scheduling)
+    private func start(_ f: ExecutorFixture, services: WorkflowExecutor.Services? = nil) async throws -> WorkflowExecutor {
+        let e = WorkflowExecutor(services: services ?? f.services, coordinator: PhotoshopExecutionCoordinator())
         try await e.register(batch: f.batch, manifestURL: f.manifest)
         try await e.runPending(batchID: f.batch.id)
         return e

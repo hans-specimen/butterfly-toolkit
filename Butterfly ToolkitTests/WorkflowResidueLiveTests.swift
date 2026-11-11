@@ -1,4 +1,4 @@
-// 在独立素材副本上回放已有 AI 蒙版，验证默认成品的实际边界与可编辑备份。
+// 在独立素材副本上回放已有 AI 蒙版，验证透明结果的实际边界与两个可编辑蒙版。
 import XCTest
 import ImageIO
 import UniformTypeIdentifiers
@@ -67,38 +67,27 @@ final class WorkflowResidueLiveTests: XCTestCase {
             x0 = min(x0,x);y0 = min(y0,y);x1 = max(x1,x+1);y1 = max(y1,y+1)
         }
         let expected = CGRect(x: Double(x0)+savedRoles.coordinateOrigin.x,y: Double(y0)+savedRoles.coordinateOrigin.y,width: Double(x1-x0),height: Double(y1-y0))
-        let rawBounds: String
-        do { rawBounds = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
+        let savedLayers: String
+        do { savedLayers = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
             try await PhotoshopWorkflowBridge.execute("""
-            var d=app.open(new File(\(docPath))),result;
+            (function(){var d=app.open(new File(\(docPath)));
             try {
-                var g=d.layerSets.getByName('共同调整'),top=null;
-                for(var i=0;i<g.layers.length;i++)if(g.layers[i].name!=='底图'&&g.layers[i].visible){top=g.layers[i];break;}
-                if(!top)throw new Error('Missing cutout');
+                var g=d.layerSets.getByName('共同调整'),level=g.layers[0],origin=g.layers[1],stack=g.layers[2];
                 function hasMask(layer){var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);var desc=executeActionGet(ref);return desc.hasKey(stringIDToTypeID('hasUserMask'))&&desc.getBoolean(stringIDToTypeID('hasUserMask'));}
-                if(hasMask(top))throw new Error('Visible finished layer still has mask');
-                var editable=g.artLayers.getByName('抠图');
-                if(!hasMask(editable)||editable.visible)throw new Error('Editable mask backup missing or visible');
-                if(d.activeLayer.id!==top.id)throw new Error('Finished layer is not selected');
-                var b=top.bounds;result='['+[b[0].as('px'),b[1].as('px'),b[2].as('px'),b[3].as('px')].join(',')+']';
-                // 删除副本的蒙版而不应用，证明备份仍保留原底图像素，可恢复被遮住的区域。
-                var restored=editable.duplicate();d.activeLayer=restored;
-                var ref=new ActionReference();ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));
-                var desc=new ActionDescriptor();desc.putReference(charIDToTypeID('null'),ref);desc.putBoolean(charIDToTypeID('Aply'),false);
-                executeAction(charIDToTypeID('Dlt '),desc,DialogModes.NO);
-                if(restored.bounds[2].as('px')-restored.bounds[0].as('px')<=b[2].as('px')-b[0].as('px'))throw new Error('Backup lost recoverable background pixels');
-            }finally{d.close(SaveOptions.DONOTSAVECHANGES);}result;
+                return String(g.layers.length===3 && level.name==='Keying_Level' && level.visible && hasMask(level)
+                    && origin.name==='Keying_Origin' && !origin.visible && hasMask(origin)
+                    && stack.name==='Stack' && !stack.visible && !hasMask(stack));
+            }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
             """)
         }
-        } catch { XCTFail("Photoshop saved-layer bounds: \(String(reflecting: error))"); return }
-        let bounds = try JSONDecoder().decode([Double].self,from: Data(rawBounds.utf8))
-        for (actual,wanted) in zip(bounds,[expected.minX,expected.minY,expected.maxX,expected.maxY]) { XCTAssertEqual(actual,wanted,accuracy: 2) }
+        } catch { XCTFail("Photoshop saved-layer roles: \(String(reflecting: error))"); return }
+        XCTAssertEqual(savedLayers,"true")
         XCTAssertLessThan(expected.width,raster.size.width); XCTAssertLessThan(expected.height,raster.size.height)
         let final = try await bridge.captureFinalPSD(document: document,owner: owner)
         let finalRoles = try await bridge.extractRoles(snapshot: final)
         let finalRaster = try WorkflowRaster.read(finalRoles.cutoutPNG)
         XCTAssertEqual(finalRaster.size,applied.pixelSize)
-        // 最终导出首个可见成品，与严格蒙版回写结果在当前画布上逐像素一致。
+        // 最终导出的 Keying_Level 与蒙版回写结果在当前画布上逐像素一致。
         let fw = Int(finalRaster.size.width),fh = Int(finalRaster.size.height),rw = Int(raster.size.width)
         let ox = Int(savedRoles.coordinateOrigin.x),oy = Int(savedRoles.coordinateOrigin.y)
         var mismatch: Int?
@@ -113,7 +102,7 @@ final class WorkflowResidueLiveTests: XCTestCase {
         for (url,hash) in zip(originals,hashes) { XCTAssertEqual(try AIFileValidation.hash(url.path),hash) }
         let fixture: [String:Any] = ["sourceHash":hashes[1],"pixelSize":[before.size.width,before.size.height],"originalBatchCoordinateOrigin":[source.coordinateOrigin.x,source.coordinateOrigin.y],"replayCoordinateOrigin":[0,0],"originalMask":mask.path,"cleanedMask":matte.alphaURL.path,"removedPixelCount":removed.count,"review":"pending visual review"]
         try JSONSerialization.data(withJSONObject: fixture,options:[.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("fixture-index.json"))
-        let report: [String:Any] = ["removedMaskPixels":removed.count,"originalAlphaBounds":Self.alphaBounds(before,mask: true),"cleanedAlphaBounds":Self.alphaBounds(after,mask: true),"savedAlphaBoundsRaster":Self.alphaBounds(raster,mask: false),"sourceHashes":hashes,"sourceFiles":originals.map(\.path),"cleanupAlgorithmVersion":cleanup.algorithmVersion,"modelInferenceRun":false,"angleDegrees":solution.angleDegrees,"margins":[solution.actualMargins.left,solution.actualMargins.top,solution.actualMargins.right,solution.actualMargins.bottom],"exportSize":[4096,4096],"applicable":solution.isApplicable,"photoshopSavedLayerBounds":bounds,"cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"editableMaskAndRGBRetained":true,"savedLayerHasMask":false,"finalPixelsMatch":mismatch == nil,"workingCopy":document.path]
+        let report: [String:Any] = ["removedMaskPixels":removed.count,"originalAlphaBounds":Self.alphaBounds(before,mask: true),"cleanedAlphaBounds":Self.alphaBounds(after,mask: true),"savedAlphaBoundsRaster":Self.alphaBounds(raster,mask: false),"sourceHashes":hashes,"sourceFiles":originals.map(\.path),"cleanupAlgorithmVersion":cleanup.algorithmVersion,"modelInferenceRun":false,"angleDegrees":solution.angleDegrees,"margins":[solution.actualMargins.left,solution.actualMargins.top,solution.actualMargins.right,solution.actualMargins.bottom],"exportSize":[4096,4096],"applicable":solution.isApplicable,"savedRolesValid":savedLayers == "true","cropSize":[applied.pixelSize.width,applied.pixelSize.height],"originalsUnchanged":true,"editableMaskAndRGBRetained":true,"savedLayerHasMask":true,"finalPixelsMatch":mismatch == nil,"workingCopy":document.path]
         try JSONSerialization.data(withJSONObject: report,options:[.prettyPrinted,.sortedKeys]).write(to: root.appendingPathComponent("validation.json"))
     }
 

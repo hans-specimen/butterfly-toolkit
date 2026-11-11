@@ -48,7 +48,7 @@ import UniformTypeIdentifiers
         let roles = Self.roles(f.input),probe = PreparationProbe()
         let cache = WorkflowGeometryCache(prepare: { roles in await probe.record(); return try Self.prepare(roles) })
         let preview = WorkflowPreviewService(geometry: cache)
-        let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: f.directory),matte: WorkflowMatteService(engine: f.directory,workspace: f.directory),geometry: cache)
+        let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: f.directory),geometry: cache)
         let request = GeometryRequest(angleStrategy: .manual(degrees: 0))
         let first = try await preview.geometry(source: roles,request: request)
         let validated = try await services.validateGeometry(roles,first)
@@ -181,7 +181,7 @@ import UniformTypeIdentifiers
             let probe = PreparationProbe()
             let cache = WorkflowGeometryCache(prepare: { source in await probe.record(); return try Self.prepare(source) })
             let preview = WorkflowPreviewService(geometry: cache)
-            let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: evidence),matte: WorkflowMatteService(engine: evidence,workspace: evidence),geometry: cache)
+            let services = WorkflowExecutor.Services.live(bridge: PhotoshopWorkflowBridge(workspace: evidence),geometry: cache)
             for phase in ["preview","confirmation","revisit"] {
                 for task in batch.activeTasks {
                     let roles = try XCTUnwrap(task.roleImages),saved = try XCTUnwrap(task.geometrySolution)

@@ -1,6 +1,6 @@
 # AI 工作区
 
-核对日期：2026-11-09。本文依据当前 Toolkit 主线实现，说明本机 AI 工作区的使用方式及引擎接口。
+本文说明当前 Toolkit 的独立 AI 工作区及引擎接口。
 
 ## 连接与使用
 
@@ -51,16 +51,6 @@ Toolkit 与 AI 引擎独立维护。选择的目录至少需包含可执行的 `
 
 ## 与照片工作流的区别
 
-照片工作流使用批次自己的 `.work` 目录存放派生输入与输出，通过常驻 worker 连续处理标本面；独立 AI 工作区不传 `--workspace`，也不复用该 worker。
+外部 AI 引擎用于独立工作区的导入、抠图推理、结果比较与训练素材准备。照片工作流使用 Photoshop 选择主体和蒙版色阶，详见 [照片工作流](PHOTO-WORKFLOW.md)。
 
-```text
-.venv/bin/python -u -B scripts/toolkit_bridge.py --workspace <批次/.work> serve --device <mps|cpu>
-```
-
-- 模型与 Python 环境仍来自所选引擎目录，批次输入位于工作目录的 `data/processed/`。引擎必须兼容 `--workspace` 和 `serve`，不能通过删除参数来兼容旧引擎。
-- 首条响应必须为 `ready`，`protocol` 为 `1` 且没有 `requestID`。随后每个请求携带 `requestID` 和 `input`，响应必须匹配当前请求。
-- 同一连接固定引擎、工作目录和设备，按先进先出顺序一次处理一个请求。完成事件必须对应当前输入，输出目录须位于该工作目录的 `outputs/` 下，透明图与 Alpha 须直接属于该输出目录；路径检查会解析符号链接。
-- 工作流还会复核输入哈希、方向、尺寸、ICC，以及结果 Alpha 与前景像素的一致性。该校验属于工作流服务，不能等同于独立工作区的哈希检查。
-- 排队请求取消只移除自身；活动请求取消会关闭会话。进程或协议故障使会话失效，后续请求不能自动重新启动失败会话，需关闭后重建。
-
-常驻 worker 的历史真实推理与一致性验证见[照片工作流常驻推理验证记录](validation/2026-11-07-photo-workflow-performance-task-8.md)。该记录有明确的日期和测量范围，不代表当前安装或整批端到端流程已完成验收。
+原照片流程的常驻 worker 协议及实测保留在 [历史验证记录](validation/2026-11-07-photo-workflow-performance-task-8.md)。

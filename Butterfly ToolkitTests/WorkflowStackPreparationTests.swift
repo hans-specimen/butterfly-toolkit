@@ -17,15 +17,6 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
 }
 
 @MainActor final class WorkflowStackPreparationTests: XCTestCase {
-    func testCandidateIsOptIn() {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let bridge = PhotoshopWorkflowBridge(workspace: root)
-        let matte = WorkflowMatteService(engine: root, workspace: root)
-        let current = WorkflowExecutor.Services.live(bridge: bridge, matte: matte)
-        XCTAssertNil(current.stackWithInput); XCTAssertNil(current.validateStackInput)
-        let candidate = WorkflowExecutor.Services.live(bridge: bridge, matte: matte, prepareStackInput: true)
-        XCTAssertNotNil(candidate.stackWithInput); XCTAssertNotNil(candidate.validateStackInput)
-    }
     func testStackExportRunsAfterSaveBeforeClose() throws {
         let job = FocusStackJob(id: 0, sourceFiles: [], destinationURL: URL(fileURLWithPath: "/tmp/unused.psd"), butterflyName: "test", side: "D")
         for hook in [nil, "events.push('png');", "events.push('png');throw new Error('PNG failed');"] as [String?] {
@@ -45,109 +36,6 @@ private nonisolated final class PreparationMeasurements: @unchecked Sendable {
         }
     }
 
-    private func preparedServices(_ f: ExecutorFixture) -> WorkflowExecutor.Services {
-        var services = f.services
-        services.stackWithInput = { job, owner in
-            let snapshot = try await f.services.stack(job, owner)
-            await f.probe.record("prepared")
-            return WorkflowStackPreparation(snapshot: snapshot, input: StackPNG(snapshotVersion: snapshot.contentVersion,
-                pngURL: job.destinationURL.appendingPathExtension("png"), fingerprint: "prepared", pixelSize: snapshot.pixelSize, orientation: 1, colorProfile: "sRGB"))
-        }
-        return services
-    }
-    func testPreparedInputCannotBypassStackReview() async throws {
-        let f = try ExecutorFixture(checks: true)
-        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
-        let e = WorkflowExecutor(services: preparedServices(f))
-        try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: f.batch.id)
-        let b = try await e.batch(batchID: f.batch.id), calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "prepared" }.count, 2)
-        XCTAssertFalse(calls.contains("ai"))
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0.stackPNG?.fingerprint == "prepared" && $0[.stack].state == .waitingReview })
-        try await e.continueAfterReview(batchID: b.id, stage: .stack, specimenIDs: b.specimens.map(\.id))
-        let after = await f.probe.values()
-        XCTAssertEqual(after.filter { $0 == "ai" }.count, 2)
-        XCTAssertFalse(after.contains("export-stack"), "Approved prepared inputs should be reused")
-    }
-    func testEditedStackInvalidatesPreparedInput() async throws {
-        let f = try ExecutorFixture(checks: true)
-        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
-        let e = WorkflowExecutor(services: preparedServices(f))
-        try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: f.batch.id)
-        let b = try await e.batch(batchID: f.batch.id), face = b.activeTasks[0]
-        XCTAssertNotNil(face.stackPNG)
-        var edited = try XCTUnwrap(face.snapshot); edited.contentVersion = "edited"
-        try JSONEncoder().encode(edited).write(to: edited.workingURL)
-        do { try await e.continueAfterReview(batchID: b.id, stage: .stack, specimenIDs: b.specimens.map(\.id)); XCTFail("Edited PSD accepted") }
-        catch WorkflowStateError.staleVersion {}
-        try await e.refreshSavedPSD(batchID: b.id, taskID: face.id, change: .stackContent)
-        let refreshed = try await e.batch(batchID: b.id)
-        XCTAssertNil(refreshed.task(id: face.id)?.stackPNG)
-        XCTAssertNil(refreshed.task(id: face.id)?.matteArtifact)
-        let calls = await f.probe.values(); XCTAssertFalse(calls.contains("ai"))
-    }
-    func testResumeAfterStackPublicationOnlyRetriesPNG() async throws {
-        let f = try ExecutorFixture(checks: false, checkMatte: true)
-        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
-        var services = f.services
-        services.stackWithInput = { job, owner in
-            _ = try await f.services.stack(job, owner)
-            throw WorkflowBridgeError.invalidImage("simulated interruption after PSD publication")
-        }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: f.batch.id)
-        let interrupted = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(interrupted.activeTasks.allSatisfy { $0[.stack].state == .failed && $0.stackPNG == nil })
-        let resumed = WorkflowExecutor(services: services)
-        _ = try await resumed.register(manifestURL: f.manifest)
-        try await resumed.retry(batchID: f.batch.id, specimenIDs: f.batch.specimens.map(\.id), stage: .stack)
-        let calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "stack" }.count, 2)
-        XCTAssertEqual(calls.filter { $0 == "adopt" }.count, 2)
-        XCTAssertEqual(calls.filter { $0 == "export-stack" }.count, 2)
-    }
-    func testPreparedInputPreservesPublishedMatteRecovery() async throws {
-        let f = try ExecutorFixture(checks: false), interruption = PreparationMeasurements()
-        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
-        var services = preparedServices(f); let install = services.install
-        services.validateStackInput = { snapshot, _ in
-            let current = try JSONDecoder().decode(PSDSnapshot.self, from: Data(contentsOf: snapshot.workingURL))
-            guard current.contentVersion == snapshot.contentVersion else { throw WorkflowBridgeError.staleSource }
-            return true
-        }
-        services.install = { snapshot,matte in
-            guard try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: snapshot.workingURL)).contentVersion == snapshot.contentVersion else { throw WorkflowBridgeError.staleSource }
-            let saved = try await install(snapshot,matte)
-            if interruption.next() == 1 { throw WorkflowBridgeError.photoshop("exit after committed install") }
-            return saved
-        }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-        let b = try await e.batch(batchID: f.batch.id), oldCalls = await f.probe.values()
-        let reopened = WorkflowExecutor(services: services)
-        _ = try await reopened.register(manifestURL: f.manifest)
-        try await reopened.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .matte)
-        let after = try await reopened.batch(batchID: b.id), calls = await f.probe.values()
-        XCTAssertTrue(after.activeTasks.allSatisfy { $0[.matte].state == .completed })
-        XCTAssertEqual(calls.filter { $0 == "install" }.count,oldCalls.filter { $0 == "install" }.count)
-        XCTAssertEqual(calls.filter { $0 == "ai" }.count,oldCalls.filter { $0 == "ai" }.count)
-    }
-    func testInvalidPreparedPNGOnlyReexportsInput() async throws {
-        let f = try ExecutorFixture(checks: false, checkMatte: true)
-        defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
-        var services = preparedServices(f)
-        services.validateStackInput = { _, _ in false }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: f.batch.id)
-        let calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "stack" }.count, 2)
-        XCTAssertEqual(calls.filter { $0 == "export-stack" }.count, 2)
-        XCTAssertEqual(calls.filter { $0 == "ai" }.count, 2)
-    }
     private nonisolated static func png(_ url: URL, opaque: Bool = false) throws {
         var pixels: [UInt8] = [12,34,56,0,23,45,67,1,99,88,77,64,90,80,70,128,255,128,1,255]
         if opaque { for index in stride(from: 3, to: pixels.count, by: 4) { pixels[index] = 255 } }

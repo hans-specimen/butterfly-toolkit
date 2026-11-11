@@ -6,8 +6,17 @@ import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
 
-nonisolated enum WorkflowArtifactError: Error, Equatable {
-    case ownershipConflict, invalidImage, fingerprintMismatch, invalidArtifact
+nonisolated enum WorkflowArtifactError: LocalizedError, Equatable {
+    case ownershipConflict, invalidImage, fingerprintMismatch, invalidArtifact, existingOutputSkipped
+    var errorDescription: String? {
+        switch self {
+        case .ownershipConflict: "同名文件不属于此任务，已保留原文件。请选择其他导出目录。"
+        case .invalidImage: "导出图片的尺寸、格式或透明度校验失败。"
+        case .fingerprintMismatch: "导出文件内容已变化，请检查后重新导出。"
+        case .invalidArtifact: "导出记录或文件路径无效。"
+        case .existingOutputSkipped: "已有其他版本成品，已跳过。"
+        }
+    }
 }
 
 /// 归属凭据独立于 batch.json，先于图片写入；不能仅凭文件名推断归属。
@@ -40,7 +49,7 @@ nonisolated struct WorkflowArtifactStore: Sendable {
     }
 
     // MARK: - 发布与崩溃恢复
-    func publish(temp: URL, artifact: WorkflowArtifact) throws -> WorkflowArtifact {
+    func publish(temp: URL, artifact: WorkflowArtifact, overwriteExisting: Bool = true) throws -> WorkflowArtifact {
         Self.lock.lock(); defer { Self.lock.unlock() }
         try validateMetadata(artifact)
         guard temp.standardizedFileURL != artifact.url.standardizedFileURL else { throw WorkflowArtifactError.invalidArtifact }
@@ -48,6 +57,10 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         let original = try existingArtifact(at: artifact.url,receipt: receipt)
         if let existing = original {
             guard existing.ownerTaskID == artifact.ownerTaskID, existing.kind == artifact.kind else { throw WorkflowArtifactError.ownershipConflict }
+            if !overwriteExisting {
+                guard sameRecipe(existing,artifact) else { throw WorkflowArtifactError.existingOutputSkipped }
+                return existing
+            }
         }
         let validated = try validateCandidate(temp,kind: artifact.kind)
         let hash = validated.fingerprint

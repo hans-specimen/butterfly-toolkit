@@ -9,6 +9,11 @@ actor WorkflowBatchStore {
     // MARK: - 清单读写
     // 当前清单不可用时尝试上一份已校验清单，避免将损坏内容作为恢复依据。
     func load(from url: URL) throws -> WorkflowBatch {
+        if let data = try? Data(contentsOf: url),
+           let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let version = metadata["schemaVersion"] as? Int, version != 2 {
+            throw WorkflowStateError.invalidManifest("此批次使用旧流程，请新建批次；旧文件未作修改")
+        }
         if let batch = try? readValidBatch(from: url) { return try recoverInterruptedWork(batch) }
         if let batch = try? readValidBatch(from: url.appendingPathExtension("previous")) { return try recoverInterruptedWork(batch) }
         throw WorkflowStateError.invalidManifest("No valid batch manifest or previous manifest at \(url.path)")

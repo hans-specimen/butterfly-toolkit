@@ -67,7 +67,7 @@ nonisolated struct WorkflowAssetRenderer: Sendable {
                   abs(Int(a)-Int(cutout.pixels[i+3])) <= 1 else { throw WorkflowBridgeError.invalidImage("最终透明图的 Alpha 不一致") }
             visible = visible || a > 0; transparent = transparent || a == 0
         }
-        guard visible,transparent else { throw WorkflowBridgeError.invalidImage("最上方图层为空或没有透明背景，请检查最终透明图层") }
+        guard visible,transparent else { throw WorkflowBridgeError.invalidImage("Keying_Level 为空或没有透明背景，请检查图层及其蒙版") }
     }
 
     // MARK: - 已确认透明图的派生渲染
