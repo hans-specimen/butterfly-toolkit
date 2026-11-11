@@ -11,20 +11,15 @@ nonisolated enum WorkflowStateError: Error, Equatable {
 }
 
 nonisolated enum WorkflowPresetScope: Equatable, Sendable {
-    case geometry, png4k, derivative(WorkflowAssetKind)
+    case geometry, png4k
 }
 
 nonisolated enum WorkflowEvent: Sendable {
-    case mattePreparationStored(taskID: UUID, expectedVersion: Int)
     case stageStarted(taskID: UUID, stage: WorkflowStage, expectedVersion: Int)
     case stageCompleted(taskID: UUID, stage: WorkflowStage, expectedVersion: Int, outputVersion: String)
     case stageFailed(taskID: UUID, stage: WorkflowStage, expectedVersion: Int, reason: String)
-    case continueBatch(stage: WorkflowStage, expectedRevision: Int)
-    case confirmSelected(specimenIDs: Set<UUID>, stage: WorkflowStage, outputVersions: [UUID: String], expectedRevision: Int)
     case excludeSpecimens(ids: Set<UUID>, reason: String, expectedRevision: Int)
     case sourceChanged(taskID: UUID, sources: WorkflowSources, expectedVersion: Int)
-    case savedPSDChanged(taskID: UUID, snapshot: PSDSnapshot, change: WorkflowPSDChange,
-                         expectedSourceVersion: Int, expectedSnapshotVersion: String?)
     case presetChanged(scope: WorkflowPresetScope, preset: WorkflowPreset, expectedRevision: Int)
     case pause(expectedRevision: Int)
     case cancelRunning(expectedRevision: Int)
@@ -38,22 +33,6 @@ nonisolated enum WorkflowStateMachine {
         try batch.validate()
         var next = batch
         switch event {
-        case let .mattePreparationStored(id, expected):
-            guard !batch.isPaused else { throw WorkflowStateError.invalidTransition }
-            try updateTask(&next, id: id) { task in
-                try check(task[.matte].revision, expected)
-                guard task[.matte].state == .running, let snapshot = task.snapshot,
-                      snapshot.taskID == id, !snapshot.contentVersion.isEmpty,
-                      snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0 else { throw WorkflowStateError.invalidTransition }
-                // 恢复已回写的 PSD 时，不再要求存在已清理的输入文件。
-                if snapshot.roles?.isValid != true {
-                    guard let input = task.stackPNG, input.snapshotVersion == snapshot.contentVersion,
-                          input.pixelSize == snapshot.pixelSize, input.orientation == 1,
-                          !input.fingerprint.isEmpty, !input.colorProfile.isEmpty else { throw WorkflowStateError.invalidTransition }
-                }
-                task[.matte].state = .pending; task[.matte].revision += 1
-                task[.matte].error = nil; task[.matte].outputVersion = nil; task[.matte].confirmedVersion = nil
-            }
         case let .stageStarted(id, stage, expected):
             guard !batch.isPaused else { throw WorkflowStateError.invalidTransition }
             try updateTask(&next, id: id) { task in
@@ -74,7 +53,6 @@ nonisolated enum WorkflowStateMachine {
                 task[stage].confirmedVersion = nil
                 task[stage].revision += 1
                 task[stage].error = nil
-                if stage == .geometry { task.geometryRevalidationRequired = false }
             }
         case let .stageFailed(id, stage, expected, reason):
             guard !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WorkflowStateError.invalidTransition }
@@ -84,38 +62,6 @@ nonisolated enum WorkflowStateMachine {
                 task[stage].state = .failed
                 task[stage].revision += 1
                 task[stage].error = reason
-            }
-        case let .continueBatch(stage, expected):
-            try check(batch.revision, expected)
-            guard stage == .stack || stage == .matte, !batch.activeTasks.isEmpty,
-                  batch.activeTasks.allSatisfy({ $0[stage].state == .waitingReview }) else { throw WorkflowStateError.invalidTransition }
-            for id in batch.activeTasks.map(\.id) {
-                try updateTask(&next, id: id) { task in
-                    task[stage].state = .completed
-                    task[stage].confirmedVersion = task[stage].outputVersion
-                    task[stage].revision += 1
-                }
-            }
-        // 以整只标本的正反面共同确认，且必须匹配界面检查时看到的输出版本。
-        case let .confirmSelected(ids, stage, versions, expected):
-            try check(batch.revision, expected)
-            guard stage == .geometry || stage == .png4k, !ids.isEmpty,
-                  ids.isSubset(of: Set(batch.specimens.filter { !$0.isExcluded }.map(\.id))) else { throw WorkflowStateError.invalidTransition }
-            let tasks = batch.specimens.filter { ids.contains($0.id) }.flatMap { [$0.front, $0.back] }
-            guard Set(versions.keys) == Set(tasks.map(\.id)) else { throw WorkflowStateError.invalidTransition }
-            for task in tasks {
-                let ready = task[stage].state == .waitingReview ||
-                    (task[stage].state == .completed && task[stage].confirmedVersion == task[stage].outputVersion)
-                guard ready, versions[task.id] == task[stage].outputVersion else {
-                    throw WorkflowStateError.staleVersion
-                }
-            }
-            for id in tasks.map(\.id) {
-                try updateTask(&next, id: id) { task in
-                    task[stage].state = .completed
-                    task[stage].confirmedVersion = task[stage].outputVersion
-                    task[stage].revision += 1
-                }
             }
         case let .excludeSpecimens(ids, reason, expected):
             try check(batch.revision, expected)
@@ -143,44 +89,10 @@ nonisolated enum WorkflowStateMachine {
                 task.sourceRevision += 1
                 invalidate(&task, from: .stack)
             }
-        // 根据修改范围失效下游；仅改蒙版时保留旧构图候选以重新校验。
-        case let .savedPSDChanged(id, snapshot, change, expectedSource, expectedSnapshot):
-            try updateTask(&next, id: id) { task in
-                try check(task.sourceRevision, expectedSource)
-                guard task.snapshot?.contentVersion == expectedSnapshot else { throw WorkflowStateError.staleVersion }
-                guard snapshot.taskID == id, !snapshot.contentVersion.isEmpty,
-                      snapshot.contentVersion != expectedSnapshot,
-                      snapshot.workingURL.isFileURL, snapshot.snapshotURL.isFileURL,
-                      snapshot.workingURL != snapshot.snapshotURL,
-                      snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0,
-                      task[.stack].state == .completed || task[.stack].state == .waitingReview else {
-                    throw WorkflowStateError.invalidTransition
-                }
-                let savedGeometry = task.geometrySolution
-                task.snapshot = snapshot
-                task.roleImages = nil
-                task.lastPSDChange = change
-                switch change {
-                case .stackContent:
-                    invalidate(&task, from: .matte)
-                    task.stackPNG = nil
-                    task.matteArtifact = nil
-                    task[.stack].outputVersion = snapshot.contentVersion
-                    task[.stack].confirmedVersion = nil
-                    task[.stack].revision += 1
-                case .maskOnly:
-                    invalidate(&task, from: .geometry)
-                    task.geometrySolution = savedGeometry
-                    task.geometryRevalidationRequired = true
-                case .geometry:
-                    invalidate(&task, from: .geometry)
-                }
-            }
         case let .presetChanged(scope, preset, expected):
             try check(batch.revision, expected)
             guard preset.version > 0, !preset.fingerprint.isEmpty else { throw WorkflowStateError.invalidTransition }
             let stage: WorkflowStage
-            var onlyAsset: WorkflowAssetKind?
             switch scope {
             case .geometry:
                 guard preset.version > batch.presets.geometry.version else { throw WorkflowStateError.staleVersion }
@@ -188,23 +100,9 @@ nonisolated enum WorkflowStateMachine {
             case .png4k:
                 guard preset.version > batch.presets.png4k.version else { throw WorkflowStateError.staleVersion }
                 next.presets.png4k = preset; stage = .png4k
-            case let .derivative(kind):
-                switch kind {
-                case .xianyu:
-                    guard preset.version > batch.presets.xianyu.version else { throw WorkflowStateError.staleVersion }
-                    next.presets.xianyu = preset
-                case .white1k:
-                    guard preset.version > batch.presets.white1k.version else { throw WorkflowStateError.staleVersion }
-                    next.presets.white1k = preset
-                case .footage:
-                    guard preset.version > batch.presets.footage.version else { throw WorkflowStateError.staleVersion }
-                    next.presets.footage = preset
-                default: throw WorkflowStateError.invalidTransition
-                }
-                stage = .derivatives; onlyAsset = kind
             }
             for id in batch.activeTasks.map(\.id) {
-                try updateTask(&next, id: id) { invalidate(&$0, from: stage, onlyAsset: onlyAsset) }
+                try updateTask(&next, id: id) { invalidate(&$0, from: stage) }
             }
         case let .pause(expected):
             try check(batch.revision, expected)
@@ -224,7 +122,6 @@ nonisolated enum WorkflowStateMachine {
             try check(batch.revision, expected)
             next.isPaused = false
         }
-        establishBatchReviews(&next)
         next.revision += 1
         try next.validate()
         return next
@@ -246,32 +143,11 @@ nonisolated enum WorkflowStateMachine {
         if let kind = [WorkflowAssetKind.hd, .png4k].first(where: { $0.stage == stage }), task.requestedExports?[kind] != nil {
             return task[.geometry].state == .completed
         }
-        let earlier = WorkflowStage.allCases.prefix { $0 != stage }
-        guard earlier.allSatisfy({ task[$0].state == .completed }) else { return false }
-        if batch.manualFinalization == true { return true }
-        // 旧内部夹具保留原阶段协议；新照片流程逐面推进。
-        if stage != .stack && !batch.activeTasks.allSatisfy({ $0[.stack].state == .completed }) { return false }
-        if stage != .stack && stage != .matte && !batch.activeTasks.allSatisfy({ $0[.matte].state == .completed }) { return false }
-        return true
+        guard ![WorkflowStage.hd, .png4k, .derivatives].contains(stage) else { return false }
+        return WorkflowStage.allCases.prefix { $0 != stage }.allSatisfy { task[$0].state == .completed }
     }
 
-    private static func establishBatchReviews(_ batch: inout WorkflowBatch) {
-        for stage in [WorkflowStage.stack, .matte] {
-            let enabled = stage == .stack ? batch.checkAfterStack : batch.checkAfterMatte
-            guard enabled, !batch.activeTasks.isEmpty,
-                  batch.activeTasks.allSatisfy({ $0[stage].state == .completed || $0[stage].state == .waitingReview }),
-                  batch.activeTasks.contains(where: { $0[stage].state == .completed }),
-                  batch.activeTasks.contains(where: { $0[stage].state == .waitingReview || $0[stage].confirmedVersion == nil }) else { continue }
-            for index in batch.specimens.indices where !batch.specimens[index].isExcluded {
-                batch.specimens[index].front[stage].state = .waitingReview
-                batch.specimens[index].front[stage].revision += 1
-                batch.specimens[index].back[stage].state = .waitingReview
-                batch.specimens[index].back[stage].revision += 1
-            }
-        }
-    }
-
-    private static func invalidate(_ task: inout WorkflowSideTask, from stage: WorkflowStage, onlyAsset: WorkflowAssetKind? = nil) {
+    private static func invalidate(_ task: inout WorkflowSideTask, from stage: WorkflowStage) {
         let stages = Array(WorkflowStage.allCases.drop { $0 != stage })
         // 同时清除输出确认并递增修订，让正在执行的旧任务无法回写已失效阶段。
         for invalidStage in stages {
@@ -282,19 +158,17 @@ nonisolated enum WorkflowStateMachine {
             task[invalidStage].confirmedVersion = nil
             task[invalidStage].error = nil
         }
-        for index in task.artifacts.indices where stages.contains(task.artifacts[index].kind.stage) &&
-            (onlyAsset == nil || task.artifacts[index].kind == onlyAsset) {
+        for index in task.artifacts.indices where stages.contains(task.artifacts[index].kind.stage) {
             task.artifacts[index].state = .pending
         }
         if stage == .stack {
             task.stackAttemptURL = nil
-            task.snapshot = nil; task.stackPNG = nil; task.matteArtifact = nil; task.roleImages = nil
+            task.snapshot = nil; task.roleImages = nil
         }
         if stages.contains(.geometry) {
-            task.exportHD = nil; task.geometryApplySourceVersion = nil
-            task.acceptedFinalPSD = nil; task.finalPreparationError = nil; task.manualEditError = nil
+            task.geometryApplySourceVersion = nil
+            task.acceptedFinalPSD = nil; task.finalPreparationError = nil; task.manualEditError = nil; task.intermediatesCleared = false
         }
-        if stages.contains(.png4k) { task.fourKExportRequested = nil }
         for kind in [WorkflowAssetKind.hd, .png4k] where stages.contains(kind.stage) {
             task.requestedExports?.removeValue(forKey: kind)
             if task.artifacts.contains(where: { $0.kind == kind }) {
@@ -304,7 +178,6 @@ nonisolated enum WorkflowStateMachine {
         }
         if stages.contains(.geometry) {
             task.geometrySolution = nil
-            task.geometryRevalidationRequired = false
         }
     }
 }

@@ -355,7 +355,7 @@ final class MaskGeometryProcessorTests: XCTestCase {
     func testRealSavedMaskEvidenceWhenRequested() throws {
         guard let path = ProcessInfo.processInfo.environment["TASK3_EVIDENCE_DIR"] else { throw XCTSkip("Real-image evidence is opt-in") }
         let evidence = URL(fileURLWithPath: path); try FileManager.default.createDirectory(at: evidence,withIntermediateDirectories: true)
-        for side in WorkflowSide.allCases.map(\.legacyFileSuffix) {
+        for side in WorkflowSide.allCases.map(\.fileSuffix) {
             let root = URL(fileURLWithPath: "/tmp/butterfly-task2-real")
             let roles = try JSONDecoder().decode(RoleImages.self,from: Data(contentsOf: root.appendingPathComponent("\(side)-roles.json")))
             let saved = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: root.appendingPathComponent("\(side)-saved.json")))

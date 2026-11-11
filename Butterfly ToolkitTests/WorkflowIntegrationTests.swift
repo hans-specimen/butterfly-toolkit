@@ -5,65 +5,10 @@ import CoreGraphics
 /// Photoshop operations are injected; commands, state transitions, persistence and (where noted) pixels are real.
 @MainActor
 final class WorkflowIntegrationTests: XCTestCase {
-    func testTwoSpecimensRespectAllFourCheckpointCombinationsAndPairConfirmations() async throws {
-        for stackCheck in [false, true] { for matteCheck in [false, true] {
-            let f = try ExecutorFixture(checks: stackCheck, count: 2, checkMatte: matteCheck)
-            defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-            let e = try await start(f)
-            var b = try await e.batch(batchID: f.batch.id)
-            if stackCheck {
-                XCTAssertTrue(b.activeTasks.allSatisfy { $0[.stack].state == .waitingReview })
-                let calls = await f.probe.values()
-                XCTAssertEqual(calls.filter { $0 == "stack" }.count, 4)
-                XCTAssertFalse(calls.contains("select-subject"))
-                do {
-                    try await e.continueAfterReview(batchID: b.id, stage: .stack, specimenIDs: [b.specimens[0].id])
-                    XCTFail("Partial batch must not bypass the whole-batch checkpoint")
-                } catch WorkflowStateError.invalidTransition {}
-                try await e.continueAfterReview(batchID: b.id, stage: .stack, specimenIDs: b.specimens.map(\.id))
-            }
-            b = try await e.batch(batchID: b.id)
-            if matteCheck {
-                XCTAssertTrue(b.activeTasks.allSatisfy { $0[.matte].state == .waitingReview })
-                let calls = await f.probe.values()
-                XCTAssertEqual(calls.filter { $0 == "select-subject" }.count, 4)
-                XCTAssertFalse(calls.contains("analyze"))
-                try await e.continueAfterReview(batchID: b.id, stage: .matte, specimenIDs: b.specimens.map(\.id))
-            }
-            b = try await e.batch(batchID: b.id)
-            XCTAssertTrue(b.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
-            let front = b.specimens[0].front
-            do {
-                try await e.confirmGeometry(batchID: b.id, solutions: [front.id: front.geometrySolution!], exportHD: true)
-                XCTFail("One face cannot confirm its specimen")
-            } catch WorkflowStateError.invalidTransition {}
-            try await confirmGeometry(f, e, specimenIndex: 0)
-            b = try await e.batch(batchID: b.id)
-            XCTAssertEqual(b.specimens[1].front[.geometry].state, .waitingReview)
-            XCTAssertEqual(b.specimens[0].front[.png4k].state, .waitingReview)
-            let calls = await f.probe.values()
-            XCTAssertFalse(calls.contains("render-png4k"))
-            do {
-                try await e.confirm4K(batchID: b.id, layouts: [front.id: b.specimens[0].front.squareLayout])
-                XCTFail("One face cannot confirm 4K")
-            } catch WorkflowStateError.invalidTransition {}
-            try await confirm4K(f, e, specimenIndex: 0)
-            try await confirmGeometry(f, e, specimenIndex: 1)
-            try await confirm4K(f, e, specimenIndex: 1)
-            b = try await e.batch(batchID: b.id)
-            XCTAssertTrue(b.allSucceeded)
-            XCTAssertEqual(b.specimens.map(\.baseName), f.batch.specimens.map(\.baseName))
-            XCTAssertEqual(b.sideTasks.map(\.sources), f.batch.sideTasks.map(\.sources))
-            let disk = try await WorkflowBatchStore().load(from: f.manifest)
-            XCTAssertEqual(disk, b)
-            for source in f.batch.sideTasks.flatMap({ $0.sources.files }) {
-                XCTAssertEqual(try AIFileValidation.hash(source.url.path), source.fingerprint)
-            }
-        } }
-    }
 
-    func testSingleSideFailureBlocksAutomaticAdvanceAndRetryKeepsSuccessfulSides() async throws {
-        let f = try ExecutorFixture(checks: false, count: 2)
+
+    func testSingleSideFailureDoesNotBlockOthersAndRetryKeepsSuccessfulSides() async throws {
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let failedID = f.batch.specimens[0].front.id
         var services = f.services
@@ -77,10 +22,10 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertEqual(b.task(id: failedID)?[.stack].state, .failed)
         XCTAssertEqual(b.activeTasks.filter { $0[.stack].state == .completed }.count, 3)
         var calls = await f.probe.values()
-        XCTAssertFalse(calls.contains("select-subject"))
+        XCTAssertEqual(calls.filter { $0 == "select-subject" }.count, 3)
         let reopened = WorkflowExecutor(services: f.services)
         _ = try await reopened.register(manifestURL: f.manifest)
-        try await reopened.retry(batchID: b.id, specimenIDs: [b.specimens[0].id], stage: .stack)
+        try await reopened.retryTasks(batchID: b.id, taskIDs: Set([b.specimens[0].front.id, b.specimens[0].back.id]), stage: .stack)
         b = try await reopened.batch(batchID: b.id)
         XCTAssertTrue(b.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
         calls = await f.probe.values()
@@ -89,7 +34,7 @@ final class WorkflowIntegrationTests: XCTestCase {
     }
 
     func testExplicitExclusionKeepsBothFacesAndOriginalNameMappingInSummary() async throws {
-        let f = try ExecutorFixture(checks: false, count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let failedID = f.batch.specimens[0].back.id
         var services = f.services
@@ -109,26 +54,26 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertTrue([b.specimens[0].front, b.specimens[0].back].allSatisfy { $0[.stack].state == .excluded })
         XCTAssertEqual(b.activeTasks.count, 2)
         XCTAssertEqual(b.specimens[1].baseName, "sample1")
-        XCTAssertFalse(b.allSucceeded, "Excluded specimen remains visible and prevents an all-success claim")
+        XCTAssertTrue(b.allSucceeded, "Only explicitly active faces contribute to current completion")
         XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .completed })
     }
 
     func testUnsavedPSDPreventsRefreshAndResumeUntilSavedAndExplicitContinue() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let saved = IntegrationSavedState()
         var services = f.services
-        let refresh = services.refresh
-        services.refresh = { url, owner, sources in
+        let finalize = services.finalize!
+        services.finalize = { url, owner in
             if await saved.isUnsaved { throw WorkflowBridgeError.unsavedDocument }
-            return try await refresh(url, owner, sources)
+            return try await finalize(url, owner)
         }
         let e = try await start(f, services: services)
         let b = try await e.batch(batchID: f.batch.id), side = b.activeTasks[0]
         _ = try await e.beginManualEditing(batchID: b.id, taskID: side.id)
         await saved.setUnsaved(true)
         do {
-            try await e.refreshSavedPSD(batchID: b.id, taskID: side.id, change: .maskOnly)
+            try await e.refreshManualPSD(batchID: b.id, taskID: side.id)
             XCTFail("Unsaved document refreshed")
         } catch WorkflowBridgeError.unsavedDocument {}
         do {
@@ -139,7 +84,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         XCTAssertTrue(blocked.isPaused)
         XCTAssertEqual(blocked.task(id: side.id)?.snapshot, side.snapshot)
         await saved.setUnsaved(false)
-        try await e.refreshSavedPSD(batchID: b.id, taskID: side.id, change: .maskOnly)
+        try await e.refreshManualPSD(batchID: b.id, taskID: side.id)
         let refreshed = try await e.batch(batchID: b.id)
         XCTAssertTrue(refreshed.isPaused, "Refresh alone does not release the editing lease")
         try await e.continueAutomatic(batchID: b.id)
@@ -148,7 +93,7 @@ final class WorkflowIntegrationTests: XCTestCase {
     }
 
     func testRestartAt4KReviewDoesNotRepeatEarlierWorkAndOnly4KChangesInvalidateDescendants() async throws {
-        let f = try ExecutorFixture(checks: false, count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let first = try await start(f)
         try await confirmGeometry(f, first)
@@ -176,12 +121,12 @@ final class WorkflowIntegrationTests: XCTestCase {
     }
 
     func testForeignSameNamedHDIsNeverOverwrittenOrAdopted() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let image = try WorkflowAssetRendererTests.Fixture()
         defer { image.remove() }
         let renderer = WorkflowAssetRenderer(), store = WorkflowArtifactStore()
-        let foreign = f.batch.outputDirectory.appendingPathComponent("高清堆栈/sample0_D.jpg")
+        let foreign = f.batch.exportDirectory(for: .hd)!.appendingPathComponent("sample0_D.jpg")
         var services = f.services
         services.render = { kind, roles, layout, source, watermark, output in
             if kind == .hd { try renderer.renderHD(roles: image.roles, destination: output) }
@@ -210,15 +155,20 @@ final class WorkflowIntegrationTests: XCTestCase {
     }
 
     func testRealRendererAndPublisherFinishWithConfirmedTransparent4K() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let image = try WorkflowAssetRendererTests.Fixture(subject: CGRect(x: 10, y: 10, width: 80, height: 60))
         defer { image.remove() }
         let renderer = WorkflowAssetRenderer(), store = WorkflowArtifactStore()
+        let color = try XCTUnwrap(CGColorSpace(name: CGColorSpace.displayP3))
+        for url in [image.roles.basePNG, image.roles.cutoutPNG] {
+            try WorkflowAssetRendererTests.write(url, width: 100, height: 100, pixels: WorkflowRaster.read(url).pixels, colorSpace: color)
+        }
         var services = f.services
         services.extract = { snapshot in
             var roles = image.roles
             roles.snapshotVersion = snapshot.contentVersion
+            roles.isFinalized = snapshot.finalRoles != nil
             roles.cropViewport = CGRect(x: 0, y: 0, width: 100, height: 80)
             return roles
         }
@@ -244,7 +194,7 @@ final class WorkflowIntegrationTests: XCTestCase {
         let b = try await e.batch(batchID: f.batch.id)
         XCTAssertTrue(b.allSucceeded)
         for task in b.activeTasks {
-            XCTAssertEqual(task[.png4k].state, .completed)
+            XCTAssertEqual(task[.png4k].state, .completed, task[.png4k].error ?? "missing export")
             XCTAssertEqual(Set(task.artifacts.map(\.kind)), [.hd, .png4k])
             let four = try XCTUnwrap(task.artifacts.last { $0.kind == .png4k && $0.state == .completed })
             XCTAssertEqual(try AIFileValidation.hash(four.url.path), four.fileFingerprint)
@@ -268,7 +218,8 @@ final class WorkflowIntegrationTests: XCTestCase {
         let b = try await e.batch(batchID: f.batch.id)
         let specimens = specimenIndex.map { [b.specimens[$0]] } ?? b.specimens.filter { !$0.isExcluded }
         let tasks = specimens.flatMap { [$0.front, $0.back] }
-        try await e.confirmGeometry(batchID: b.id, solutions: Dictionary(uniqueKeysWithValues: tasks.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
+        try await e.confirmSavedTasks(batchID: b.id, taskIDs: Set(tasks.map(\.id)))
+        try await e.requestExports(batchID: b.id, taskIDs: Set(tasks.map(\.id)), kinds: [.hd], policy: .skipExisting, layouts: [:])
     }
     private func confirm4K(_ f: ExecutorFixture, _ e: WorkflowExecutor, specimenIndex: Int? = nil, margin: Int? = nil) async throws {
         let b = try await e.batch(batchID: f.batch.id)
@@ -278,7 +229,7 @@ final class WorkflowIntegrationTests: XCTestCase {
             if let margin { layout.safeMargin = margin }
             return (task.id, layout)
         })
-        try await e.confirm4K(batchID: b.id, layouts: layouts)
+        try await e.requestExports(batchID: b.id, taskIDs: Set(layouts.keys), kinds: [.png4k], policy: .overwrite, layouts: layouts)
     }
     private func bounds(_ raster: WorkflowRaster, alpha: Bool) -> CGRect? {
         let w = Int(raster.size.width), h = Int(raster.size.height)

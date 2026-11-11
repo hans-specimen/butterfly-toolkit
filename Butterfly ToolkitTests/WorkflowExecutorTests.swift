@@ -3,8 +3,8 @@ import XCTest
 
 @MainActor
 final class WorkflowExecutorTests: XCTestCase {
-    func testAutomaticUntilGeometryWhenOff() async throws {
-        let fixture = try ExecutorFixture(checks: false)
+    func testAutomaticStopsAtGeometryReview() async throws {
+        let fixture = try ExecutorFixture()
         let executor = WorkflowExecutor(services: fixture.services)
         try await executor.register(batch: fixture.batch, manifestURL: fixture.manifest)
         try await executor.runPending(batchID: fixture.batch.id)
@@ -35,22 +35,23 @@ actor ExecutorProbe {
 struct ExecutorFixture {
     let batch: WorkflowBatch
     let manifest: URL
-    let services: WorkflowExecutor.Services
+    var services: WorkflowExecutor.Services
     let probe: ExecutorProbe
-    nonisolated init(checks: Bool, count: Int = 1, checkMatte: Bool? = nil) throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("executor-\(UUID())")
+    nonisolated init(count: Int = 1, storageRoot: URL? = nil) throws {
+        let root = storageRoot.map { $0.appendingPathComponent(UUID().uuidString) } ?? FileManager.default.temporaryDirectory.appendingPathComponent("executor-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("素材", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
         let probe = ExecutorProbe(); self.probe = probe
         func sources(_ offset: Int) throws -> WorkflowSources {
             let files = try (offset..<(offset+3)).map { index -> WorkflowSourceFile in
-                let url = root.appendingPathComponent("\(index).jpg")
+                let url = source.appendingPathComponent("\(index).jpg")
                 try Data("source\(index)".utf8).write(to: url)
                 return try WorkflowSourceFile(url: url, fingerprint: AIFileValidation.hash(url.path))
             }
             return WorkflowSources(first: files[0], second: files[1], third: files[2])
         }
-        batch = try WorkflowBatch(sourceDirectory: root, outputDirectory: root,
-            checkAfterStack: checks, checkAfterMatte: checkMatte ?? checks,
+        batch = try WorkflowBatch(sourceDirectory: source.resolvingSymlinksInPath(), sourceDirectoryName: source.lastPathComponent, outputDirectory: root,
             specimens: (0..<count).map { index in
                 try WorkflowSpecimen(baseName: "sample\(index)",
                     front: WorkflowSideTask(side: .front, sources: sources(index*6)),
@@ -105,6 +106,29 @@ struct ExecutorFixture {
                 try JSONEncoder().encode(saved).write(to: snapshot.workingURL)
                 return saved
             })
+        services.verifyPublishedArtifact = { artifact in
+            let receipt = try JSONDecoder().decode(WorkflowArtifact.self, from: Data(contentsOf: artifact.url.appendingPathExtension("test-receipt")))
+            guard receipt == artifact, try AIFileValidation.hash(artifact.url.path) == artifact.fileFingerprint else { throw WorkflowArtifactError.ownershipConflict }
+        }
+        services.openDocuments = { [] }
+        services.verifyManualSaveOwnership = { url, owner in
+            let saved = try JSONDecoder().decode(PSDSnapshot.self, from: Data(contentsOf: url))
+            guard saved.taskID == owner else { throw WorkflowBridgeError.ownershipConflict }
+        }
+        services.prepareAcceptedFinalPSD = { accepted in
+            await probe.record("prepare-final")
+            var saved = try JSONDecoder().decode(PSDSnapshot.self, from: Data(contentsOf: accepted.snapshotURL))
+            saved.snapshotURL = accepted.snapshotURL; saved.contentVersion = accepted.contentVersion
+            saved.finalRoles = FinalPSDIdentifiers(adjustmentGroup: "final-a", baseLayer: "final-b", cutoutLayer: "final-c")
+            var roles = Self.roles(saved); roles.isFinalized = true
+            return (saved, roles)
+        }
+        services.finalize = { url, owner in
+            var saved = try JSONDecoder().decode(PSDSnapshot.self, from: Data(contentsOf: url))
+            guard saved.taskID == owner else { throw WorkflowBridgeError.ownershipConflict }
+            saved.finalRoles = FinalPSDIdentifiers(adjustmentGroup: "final-a", baseLayer: "final-b", cutoutLayer: "final-c")
+            return saved
+        }
     }
     nonisolated static func snapshot(_ id: UUID, _ url: URL, _ version: String, roles: Bool) -> PSDSnapshot {
         PSDSnapshot(taskID: id, workingURL: url, snapshotURL: url.appendingPathExtension("snapshot"), contentVersion: version,
@@ -112,7 +136,7 @@ struct ExecutorFixture {
     }
     nonisolated static func roles(_ snapshot: PSDSnapshot) -> RoleImages {
         RoleImages(snapshotVersion: snapshot.contentVersion, basePNG: snapshot.snapshotURL, cutoutPNG: snapshot.snapshotURL, maskPNG: snapshot.snapshotURL,
-            pixelSize: snapshot.pixelSize, coordinateOrigin: .zero, editableExtent: CGRect(origin: .zero, size: snapshot.pixelSize), cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize))
+            pixelSize: snapshot.pixelSize, coordinateOrigin: .zero, editableExtent: CGRect(origin: .zero, size: snapshot.pixelSize), cropViewport: CGRect(origin: .zero, size: snapshot.pixelSize), isFinalized: snapshot.finalRoles != nil)
     }
     nonisolated static func solution(_ version: String) -> GeometrySolution {
         GeometrySolution(sourceVersion: version, angleDegrees: 0, rotationPivot: CGPoint(x: 50,y: 40), subjectBounds: CGRect(x: 10,y: 10,width: 80,height: 60),
@@ -122,8 +146,8 @@ struct ExecutorFixture {
 }
 
 extension WorkflowExecutorTests {
-    private func ready(checks: Bool = false, count: Int = 1) async throws -> (ExecutorFixture, WorkflowExecutor) {
-        let f = try ExecutorFixture(checks: checks,count: count), e = WorkflowExecutor(services: f.services)
+    private func ready(count: Int = 1) async throws -> (ExecutorFixture, WorkflowExecutor) {
+        let f = try ExecutorFixture(count: count), e = WorkflowExecutor(services: f.services)
         try await e.register(batch: f.batch,manifestURL: f.manifest)
         try await e.runPending(batchID: f.batch.id)
         return (f,e)
@@ -131,66 +155,30 @@ extension WorkflowExecutorTests {
     private func geometry(_ f: ExecutorFixture, _ e: WorkflowExecutor, exportHD: Bool = true, count: Int? = nil) async throws {
         let b = try await e.batch(batchID: f.batch.id)
         let tasks = b.specimens.prefix(count ?? b.specimens.count).flatMap { [$0.front,$0.back] }
-        try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: tasks.map { ($0.id,$0.geometrySolution!) }),exportHD: exportHD)
+        try await e.confirmSavedTasks(batchID: b.id, taskIDs: Set(tasks.map(\.id)))
+        if exportHD { try await e.requestExports(batchID: b.id, taskIDs: Set(tasks.map(\.id)), kinds: [.hd], policy: .skipExisting, layouts: [:]) }
     }
     private func square(_ f: ExecutorFixture, _ e: WorkflowExecutor) async throws {
         let b = try await e.batch(batchID: f.batch.id)
-        try await e.confirm4K(batchID: b.id,layouts: Dictionary(uniqueKeysWithValues: b.activeTasks.filter { $0[.png4k].state == .waitingReview }.map { ($0.id,$0.squareLayout) }))
+        try await e.requestExports(batchID: b.id, taskIDs: Set(b.activeTasks.filter { $0[.geometry].state == .completed }.map(\.id)), kinds: [.png4k], policy: .skipExisting, layouts: [:])
     }
-    func testHappyPathBothCheckpointsOn() async throws {
-        let (f,e) = try await ready(checks: true)
-        var b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.stack].state == .waitingReview })
-        var calls = await f.probe.values(); XCTAssertEqual(calls.filter { $0 == "stack" }.count,2); XCTAssertFalse(calls.contains("select-subject"))
-        try await e.continueAfterReview(batchID: b.id,stage: .stack,specimenIDs: b.specimens.map(\.id))
-        b = try await e.batch(batchID: b.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.matte].state == .waitingReview })
-        calls = await f.probe.values(); XCTAssertFalse(calls.contains("analyze"))
-        try await e.continueAfterReview(batchID: b.id,stage: .matte,specimenIDs: b.specimens.map(\.id))
-        try await geometry(f,e); try await square(f,e)
-        b = try await e.batch(batchID: b.id); XCTAssertTrue(b.allSucceeded)
-        let disk = try await WorkflowBatchStore().load(from: f.manifest); XCTAssertEqual(disk,b)
-    }
+
     func testSaveAndReadbackBeforeHD() async throws {
         let (f,e) = try await ready(); try await geometry(f,e)
         let calls = await f.probe.values()
         let hd = try XCTUnwrap(calls.firstIndex(of: "render-hd")), save = try XCTUnwrap(calls.lastIndex(of: "apply-save"))
         XCTAssertLessThan(save,hd); XCTAssertTrue(calls[(save+1)..<hd].contains("extract"))
         let b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0.geometrySolution?.angleDegrees == 0 && $0.geometrySolution?.sourceVersion == $0.snapshot?.contentVersion })
+        XCTAssertTrue(b.activeTasks.allSatisfy { $0.acceptedFinalPSD?.contentVersion == $0.snapshot?.contentVersion && $0.roleImages?.isFinalized == true })
     }
-    func test4KRequiresSeparateConfirmation() async throws {
+    func testPNGRequiresExplicitExportRequest() async throws {
         let (f,e) = try await ready(); try await geometry(f,e)
         let calls = await f.probe.values(); XCTAssertFalse(calls.contains("render-png4k"))
         let b = try await e.batch(batchID: f.batch.id)
-        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .waitingReview && $0[.derivatives].state == .pending })
+        XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .pending && $0[.derivatives].state == .pending })
     }
-    func testSelectedSpecimenDoesNotApproveOthersOrOneSide() async throws {
-        let (f,e) = try await ready(count: 2)
-        let before = try await e.batch(batchID: f.batch.id), front = before.specimens[0].front
-        do { try await e.confirmGeometry(batchID: before.id,solutions: [front.id: front.geometrySolution!],exportHD: false); XCTFail("one side accepted") }
-        catch {}
-        try await geometry(f,e,exportHD: false,count: 1)
-        let b = try await e.batch(batchID: before.id)
-        XCTAssertEqual(b.specimens[1].front[.geometry].state,.waitingReview)
-        XCTAssertEqual(b.specimens[0].front[.hd].outputVersion,"not-selected")
-        XCTAssertFalse(b.specimens[0].front.artifacts.contains { $0.kind == .hd })
-    }
-    func testMaskEditDoesNotRerunSubjectSelection() async throws {
-        let (f,e) = try await ready(); try await geometry(f,e)
-        let b = try await e.batch(batchID: f.batch.id), side = b.specimens[0].front
-        var snapshot = side.snapshot!; snapshot.contentVersion = "mask-edited"
-        try JSONEncoder().encode(snapshot).write(to: snapshot.workingURL)
-        let callsBefore = await f.probe.values()
-        try await e.update(batchID: b.id,event: .savedPSDChanged(taskID: side.id,snapshot: snapshot,change: .maskOnly,expectedSourceVersion: side.sourceRevision,expectedSnapshotVersion: side.snapshot?.contentVersion))
-        try await e.runPending(batchID: b.id)
-        let callsAfter = await f.probe.values()
-        XCTAssertEqual(callsAfter.filter { $0 == "select-subject" }.count,callsBefore.filter { $0 == "select-subject" }.count)
-        XCTAssertEqual(callsAfter.filter { $0 == "analyze" }.count,callsBefore.filter { $0 == "analyze" }.count)
-        let after = try await e.batch(batchID: b.id)
-        XCTAssertEqual(after.task(id: side.id)?.geometrySolution?.angleDegrees,0)
-        XCTAssertEqual(after.task(id: side.id)?.geometrySolution?.sourceVersion,"mask-edited")
-    }
+
+
     func test4KLayoutChangeDoesNotTouchHD() async throws {
         let (f,e) = try await ready(); try await geometry(f,e); try await square(f,e)
         let before = try await e.batch(batchID: f.batch.id), calls = await f.probe.values()
@@ -199,7 +187,7 @@ extension WorkflowExecutorTests {
         let b = try await e.batch(batchID: before.id)
         var layouts = Dictionary(uniqueKeysWithValues: b.activeTasks.map { ($0.id,$0.squareLayout) })
         for id in layouts.keys { layouts[id]?.safeMargin = 300 }
-        try await e.confirm4K(batchID: b.id,layouts: layouts)
+        try await e.requestExports(batchID: b.id, taskIDs: Set(layouts.keys), kinds: [.png4k], policy: .overwrite, layouts: layouts)
         let afterCalls = await f.probe.values(), after = try await e.batch(batchID: b.id)
         XCTAssertEqual(afterCalls.filter { $0 == "render-hd" }.count,calls.filter { $0 == "render-hd" }.count)
         XCTAssertEqual(after.specimens[0].front[.hd],before.specimens[0].front[.hd])
@@ -211,7 +199,7 @@ extension WorkflowExecutorTests {
         XCTAssertTrue(b.activeTasks.allSatisfy { $0[.png4k].state == .failed })
         let old = await f.probe.values()
         await f.probe.fail([])
-        try await e.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .png4k)
+        try await e.retryTasks(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)), stage: .png4k)
         b = try await e.batch(batchID: b.id); XCTAssertTrue(b.allSucceeded)
         let calls = await f.probe.values()
         XCTAssertEqual(calls.filter { $0 == "render-hd" }.count,old.filter { $0 == "render-hd" }.count)
@@ -226,27 +214,27 @@ extension WorkflowExecutorTests {
         await f.probe.release(); try await job.value
         let after = try await e.batch(batchID: b.id)
         XCTAssertFalse(after.task(id: side.id)!.artifacts.contains { $0.kind == .hd && $0.state == .completed })
-        let file = b.outputDirectory.appendingPathComponent("高清堆栈/sample0_\(side.side.fileSuffix).jpg")
+        let file = b.exportDirectory(for: .hd)!.appendingPathComponent("sample0_\(side.side.fileSuffix).jpg")
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }
-    func testPausePreventsPublicationAndExplicitContinueResumes() async throws {
+    func testPauseFinishesDispatchedExportsBeforeResume() async throws {
         let (f,e) = try await ready(); await f.probe.block()
         let job = Task { try await self.geometry(f,e) }
         while !(await f.probe.values()).contains("render-hd") { await Task.yield() }
         await e.pause(batchID: f.batch.id); await f.probe.release(); try await job.value
         let paused = try await e.batch(batchID: f.batch.id)
         XCTAssertTrue(paused.isPaused)
-        XCTAssertFalse(paused.activeTasks.flatMap(\.artifacts).contains { $0.kind == .hd && $0.state == .completed })
+        XCTAssertTrue(paused.activeTasks.flatMap(\.artifacts).contains { $0.kind == .hd && $0.state == .completed })
         try await e.continueAutomatic(batchID: f.batch.id)
         let b = try await e.batch(batchID: f.batch.id); XCTAssertTrue(b.activeTasks.allSatisfy { $0[.hd].state == .completed })
     }
-    func testNoDerivativesSelectionSurvivesReload() async throws {
+    func testOnlyCurrentExportsRunAfterReload() async throws {
         let (f,e) = try await ready()
         let reopened = WorkflowExecutor(services: f.services)
         _ = try await reopened.register(manifestURL: f.manifest)
         try await geometry(f,reopened); try await square(f,reopened)
         let b = try await reopened.batch(batchID: f.batch.id)
-        XCTAssertEqual(b.selectedDerivativeKinds,[]); XCTAssertTrue(b.allSucceeded)
+        XCTAssertTrue(b.allSucceeded)
         let calls = await f.probe.values(); XCTAssertFalse(calls.contains("render-white1k"))
     }
 }
@@ -260,7 +248,7 @@ private nonisolated final class ExecutorInterruption: @unchecked Sendable {
 
 extension WorkflowExecutorTests {
     func testFileBeforeManifestRecoveryDoesNotRenderAgain() async throws {
-        let f = try ExecutorFixture(checks: false), interruption = ExecutorInterruption()
+        let f = try ExecutorFixture(), interruption = ExecutorInterruption()
         var services = f.services; let publish = services.publish
         services.publish = { temp, artifact in
             let disk = try JSONDecoder().decode(WorkflowBatch.self,from: Data(contentsOf: f.manifest))
@@ -278,13 +266,13 @@ extension WorkflowExecutorTests {
         XCTAssertTrue(b.activeTasks.contains { $0[.hd].state == .failed })
         let recovered = WorkflowExecutor(services: services)
         _ = try await recovered.register(manifestURL: f.manifest)
-        try await recovered.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .hd)
+        try await recovered.retryTasks(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)), stage: .hd)
         let after = await f.probe.values(), result = try await recovered.batch(batchID: b.id)
         XCTAssertEqual(after.filter { $0 == "render-hd" }.count,before.filter { $0 == "render-hd" }.count)
         XCTAssertTrue(result.activeTasks.allSatisfy { $0[.hd].state == .completed })
     }
     func testInterruptedStackAdoptsOnlyPersistedAttemptAndDoesNotTreatConflictAsSuccess() async throws {
-        let f = try ExecutorFixture(checks: false), interruption = ExecutorInterruption()
+        let f = try ExecutorFixture(), interruption = ExecutorInterruption()
         var services = f.services; let stack = services.stack
         services.stack = { job, owner in
             let result = try await stack(job,owner)
@@ -295,7 +283,7 @@ extension WorkflowExecutorTests {
         try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
         let b = try await e.batch(batchID: f.batch.id)
         XCTAssertTrue(b.activeTasks.contains { $0[.stack].state == .failed && $0.stackAttemptURL != nil })
-        try await e.retry(batchID: b.id,specimenIDs: b.specimens.map(\.id),stage: .stack)
+        try await e.retryTasks(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)), stage: .stack)
         let calls = await f.probe.values(); XCTAssertEqual(calls.filter { $0 == "stack" }.count,2); XCTAssertTrue(calls.contains("adopt"))
         let result = try await e.batch(batchID: b.id); XCTAssertTrue(result.activeTasks.allSatisfy { $0[.stack].state == .completed })
         var conflicted = b
@@ -304,46 +292,11 @@ extension WorkflowExecutorTests {
         services.refresh = { _,_,_ in throw WorkflowBridgeError.ownershipConflict }
         let blocked = WorkflowExecutor(services: services)
         try await blocked.register(batch: conflicted,manifestURL: f.manifest.appendingPathExtension("conflict"))
-        try await blocked.retry(batchID: conflicted.id,specimenIDs: conflicted.specimens.map(\.id),stage: .stack)
+        try await blocked.retryTasks(batchID: conflicted.id, taskIDs: Set(conflicted.activeTasks.map(\.id)), stage: .stack)
         let conflict = try await blocked.batch(batchID: conflicted.id)
         XCTAssertEqual(conflict.task(id: failedID)?[.stack].state,.failed)
     }
-    func testGeometryInterruptedSecondSideRequiresCurrentPoseRefreshWithoutDoubleAngle() async throws {
-        let f = try ExecutorFixture(checks: false), interruption = ExecutorInterruption()
-        var services = f.services; let apply = services.apply
-        services.apply = { snapshot, solution in
-            await f.probe.record("angle-\(solution.angleDegrees)-\(snapshot.contentVersion)")
-            if interruption.next() == 2 { throw WorkflowBridgeError.photoshop("interrupted apply") }
-            return try await apply(snapshot,solution)
-        }
-        services.refresh = { url,owner,_ in
-            let current = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: url))
-            if current.contentVersion == "matte" && interruption.value() >= 2 {
-                let saved = ExecutorFixture.snapshot(owner,url,"current-manual-pose",roles: true)
-                try JSONEncoder().encode(saved).write(to: url)
-                return saved
-            }
-            return current
-        }
-        let e = WorkflowExecutor(services: services)
-        try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-        let initial = try await e.batch(batchID: f.batch.id)
-        var solutions = Dictionary(uniqueKeysWithValues: initial.activeTasks.map { ($0.id,$0.geometrySolution!) })
-        for id in solutions.keys { solutions[id]?.angleDegrees = 5 }
-        do { try await e.confirmGeometry(batchID: initial.id,solutions: solutions,exportHD: true); XCTFail("interruption accepted") } catch {}
-        var b = try await e.batch(batchID: initial.id)
-        XCTAssertTrue(b.isPaused)
-        let uncertain = try XCTUnwrap(b.activeTasks.first { $0.geometryApplySourceVersion != nil })
-        do { try await e.confirmGeometry(batchID: b.id,solutions: solutions,exportHD: true); XCTFail("blind replay") } catch {}
-        try await e.refreshSavedPSD(batchID: b.id,taskID: uncertain.id,change: .geometry)
-        try await e.continueAutomatic(batchID: b.id)
-        b = try await e.batch(batchID: b.id)
-        XCTAssertEqual(b.task(id: uncertain.id)?.geometrySolution?.angleDegrees,0)
-        try await geometry(f,e)
-        let calls = await f.probe.values()
-        XCTAssertEqual(calls.filter { $0 == "angle-5.0-matte" }.count,2)
-        XCTAssertTrue(calls.contains("angle-0.0-current-manual-pose"))
-    }
+
     func testCancellationAtRenderNeverPublishes() async throws {
         let (f,e) = try await ready(); await f.probe.block()
         let job = Task { try await self.geometry(f,e) }
@@ -355,18 +308,18 @@ extension WorkflowExecutorTests {
         XCTAssertFalse(b.activeTasks.flatMap(\.artifacts).contains { $0.kind == .hd && $0.state == .completed })
     }
     func testDirtyManualRefreshKeepsLeaseUntilExplicitContinue() async throws {
-        let f = try ExecutorFixture(checks: false), coordinator = PhotoshopExecutionCoordinator()
+        let f = try ExecutorFixture(), coordinator = PhotoshopExecutionCoordinator()
         var services = f.services
-        let dirty = ExecutorInterruption(), refresh = services.refresh
-        services.refresh = { url,owner,sources in
+        let dirty = ExecutorInterruption(), finalize = services.finalize!
+        services.finalize = { url,owner in
             if dirty.value() == 0 { throw WorkflowBridgeError.unsavedDocument }
-            return try await refresh(url,owner,sources)
+            return try await finalize(url,owner)
         }
         let e = WorkflowExecutor(services: services,coordinator: coordinator)
         try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
         let before = try await e.batch(batchID: f.batch.id), side = before.activeTasks[0]
         _ = try await e.beginManualEditing(batchID: before.id,taskID: side.id)
-        do { try await e.refreshSavedPSD(batchID: before.id,taskID: side.id,change: .maskOnly); XCTFail("dirty PSD accepted") } catch WorkflowBridgeError.unsavedDocument {}
+        do { try await e.refreshManualPSD(batchID: before.id, taskID: side.id); XCTFail("dirty PSD accepted") } catch WorkflowBridgeError.unsavedDocument {}
         let queued = Task { try await coordinator.run(owner: side.id) { await f.probe.record("automatic-write") } }
         for _ in 0..<100 { await Task.yield() }
         let held = await f.probe.values(); XCTAssertFalse(held.contains("automatic-write"))
@@ -374,109 +327,31 @@ extension WorkflowExecutorTests {
         do { try await e.continueAutomatic(batchID: b.id); XCTFail("dirty Continue released manual lease") } catch WorkflowBridgeError.unsavedDocument {}
         let stillHeld = await f.probe.values(); XCTAssertFalse(stillHeld.contains("automatic-write"))
         _ = dirty.next()
-        try await e.refreshSavedPSD(batchID: b.id,taskID: side.id,change: .maskOnly)
+        try await e.refreshManualPSD(batchID: b.id, taskID: side.id)
         try await e.continueAutomatic(batchID: b.id); try await queued.value
         let resumed = await f.probe.values(); XCTAssertTrue(resumed.contains("automatic-write"))
     }
     func testInvalidationClearsAttemptsAndSavedAuthorizations() async throws {
-        var f = try ExecutorFixture(checks: false).batch
+        var f = try ExecutorFixture().batch
         let id = f.specimens[0].front.id
-        f.specimens[0].front.stackAttemptURL = f.outputDirectory.appendingPathComponent("old.psd")
+        f.specimens[0].front.stackAttemptURL = f.generatedPSDDirectory.appendingPathComponent("sample0_D.psd")
         f.specimens[0].front.geometryApplySourceVersion = "old"
-        f.specimens[0].front.fourKExportRequested = true
-        f.specimens[0].front.exportHD = true
+        f.specimens[0].front.requestedExports = [.hd: WorkflowExportRequest(snapshotVersion: "old", directory: f.exportDirectory(for: .hd)!, policy: .overwrite)]
         let source = f.specimens[0].front.sources
         let changed = try WorkflowStateMachine.reduce(batch: f,event: .sourceChanged(taskID: id,sources: source,expectedVersion: 1))
         XCTAssertNil(changed.task(id: id)?.stackAttemptURL); XCTAssertNil(changed.task(id: id)?.geometryApplySourceVersion)
-        XCTAssertNil(changed.task(id: id)?.fourKExportRequested); XCTAssertNil(changed.task(id: id)?.exportHD)
+        XCTAssertTrue(changed.task(id: id)?.requestedExports?.isEmpty == true)
     }
-    func testOneSideMaskReconfirmKeepsOtherSideAndReusesHDByContent() async throws {
-        let (f,e) = try await ready(count: 2); try await geometry(f,e)
-        var b = try await e.batch(batchID: f.batch.id)
-        let changed = b.specimens[0].front, opposite = b.specimens[0].back
-        var saved = changed.snapshot!; saved.contentVersion = "mask-current"
-        try JSONEncoder().encode(saved).write(to: saved.workingURL)
-        let oldCalls = await f.probe.values()
-        try await e.update(batchID: b.id,event: .savedPSDChanged(taskID: changed.id,snapshot: saved,change: .maskOnly,expectedSourceVersion: changed.sourceRevision,expectedSnapshotVersion: changed.snapshot?.contentVersion))
-        try await e.runPending(batchID: b.id)
-        b = try await e.batch(batchID: b.id)
-        let both = [b.specimens[0].front,b.specimens[0].back]
-        try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: both.map { ($0.id,$0.geometrySolution!) }),exportHD: true)
-        let after = try await e.batch(batchID: b.id), calls = await f.probe.values()
-        XCTAssertEqual(after.task(id: opposite.id)?.snapshot,opposite.snapshot)
-        XCTAssertEqual(calls.filter { $0 == "render-hd" }.count,oldCalls.filter { $0 == "render-hd" }.count)
-        XCTAssertEqual(calls.filter { $0 == "apply-save" }.count,oldCalls.filter { $0 == "apply-save" }.count+1)
-    }
+
 }
 
 extension WorkflowExecutorTests {
-    func testConfirmationUsesSingleVerifiedExtraction() async throws {
-        for phase in ["initialGeometry", "geometryAgain", "png4k"] {
-            let (f,initial) = try await ready(count: 2)
-            if phase != "initialGeometry" { try await geometry(f,initial,exportHD: false,count: 1) }
-            let before = try await initial.batch(batchID: f.batch.id)
-            let selected = [before.specimens[0].front,before.specimens[0].back]
-            let reads = ExecutorProbe()
-            var services = f.services
-            let refresh = services.refresh
-            services.refresh = { url,owner,sources in
-                await reads.record("refresh")
-                return try await refresh(url,owner,sources)
-            }
-            services.extract = { snapshot in
-                await reads.record("\(snapshot.taskID)/\(snapshot.contentVersion)")
-                var roles = ExecutorFixture.roles(snapshot)
-                roles.basePNG = snapshot.workingURL.appendingPathExtension("verified.png")
-                return roles
-            }
-            let e = WorkflowExecutor(services: services)
-            _ = try await e.register(manifestURL: f.manifest)
-            if phase != "png4k" {
-                try await e.confirmGeometry(batchID: before.id,solutions: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,$0.geometrySolution!) }),exportHD: false)
-            } else {
-                try await e.confirm4K(batchID: before.id,layouts: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,$0.squareLayout) }))
-            }
-            let calls = await reads.values(), after = try await e.batch(batchID: before.id)
-            XCTAssertEqual(calls.filter { $0 == "refresh" }.count,0)
-            for task in selected {
-                XCTAssertEqual(calls.filter { $0 == "\(task.id)/\(task.snapshot!.contentVersion)" }.count,1)
-                // First confirmation must still read the new saved version after applying geometry.
-                XCTAssertEqual(calls.filter { $0.hasPrefix("\(task.id)/") }.count,phase == "initialGeometry" ? 2 : 1)
-                XCTAssertEqual(after.task(id: task.id)?.roleImages?.basePNG,task.snapshot!.workingURL.appendingPathExtension("verified.png"))
-            }
-            XCTAssertEqual(after.specimens[1],before.specimens[1],"Confirmation must not approve or replace roles for an unselected specimen")
-        }
-    }
-    func testSavedPSDChangedOutsideExecutorRejectsGeometryConfirmation() async throws {
-        let (f,initial) = try await ready()
-        let before = try await initial.batch(batchID: f.batch.id)
-        var changed = before.activeTasks[0].snapshot!
-        changed.contentVersion = "unrefreshed-manual-edit"
-        try JSONEncoder().encode(changed).write(to: changed.workingURL)
-        var services = f.services
-        services.extract = { snapshot in
-            let saved = try JSONDecoder().decode(PSDSnapshot.self,from: Data(contentsOf: snapshot.workingURL))
-            guard saved == snapshot else { throw WorkflowBridgeError.staleSource }
-            return ExecutorFixture.roles(snapshot)
-        }
-        let e = WorkflowExecutor(services: services)
-        _ = try await e.register(manifestURL: f.manifest)
-        do { try await geometry(f,e); XCTFail("stale saved PSD accepted") }
-        catch WorkflowBridgeError.staleSource {} catch WorkflowStateError.staleVersion {}
-        let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
-    }
+
+
 }
 
 extension WorkflowExecutorTests {
-    func testLegacyManifestDecodesOptionalExecutionChoices() throws {
-        let f = try ExecutorFixture(checks: false)
-        let data = try JSONEncoder().encode(f.batch)
-        let decoded = try JSONDecoder().decode(WorkflowBatch.self,from: data)
-        XCTAssertNil(decoded.selectedDerivativeKinds); XCTAssertNil(decoded.watermarkURL)
-        XCTAssertNil(decoded.activeTasks[0].stackAttemptURL); XCTAssertNil(decoded.activeTasks[0].exportHD)
-        XCTAssertNil(decoded.activeTasks[0].geometryApplySourceVersion); XCTAssertNil(decoded.activeTasks[0].fourKExportRequested)
-        try decoded.validate()
-    }
+
 }
 
 private actor ExecutorBarrier {
@@ -487,74 +362,9 @@ private actor ExecutorBarrier {
 }
 
 extension WorkflowExecutorTests {
-    func testGeometryWholePairRejectsFirstSideInvalidationWhileSecondApplies() async throws {
-        for maskChange in [false,true] {
-            let f = try ExecutorFixture(checks: false), barrier = ExecutorBarrier()
-            let ordered = f.batch.activeTasks.sorted { $0.id.uuidString < $1.id.uuidString }
-            var services = f.services; let apply = services.apply
-            services.apply = { snapshot,solution in
-                if snapshot.taskID == ordered[1].id { await barrier.wait() }
-                return try await apply(snapshot,solution)
-            }
-            let e = WorkflowExecutor(services: services)
-            try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-            let work = Task { try await self.geometry(f,e) }
-            while !(await barrier.entered) { await Task.yield() }
-            let b = try await e.batch(batchID: f.batch.id), first = b.task(id: ordered[0].id)!
-            if maskChange {
-                var saved = first.snapshot!; saved.contentVersion = "concurrent-mask"
-                try await e.update(batchID: b.id,event: .savedPSDChanged(taskID: first.id,snapshot: saved,change: .maskOnly,
-                    expectedSourceVersion: first.sourceRevision,expectedSnapshotVersion: first.snapshot?.contentVersion))
-            } else {
-                try await e.update(batchID: b.id,event: .sourceChanged(taskID: first.id,sources: first.sources,expectedVersion: first.sourceRevision))
-            }
-            await barrier.release()
-            do { try await work.value; XCTFail("stale pair confirmed") } catch WorkflowStateError.staleVersion {}
-            let after = try await e.batch(batchID: b.id)
-            XCTAssertNil(after.task(id: first.id)?[.geometry].confirmedVersion)
-            XCTAssertFalse(after.activeTasks.flatMap(\.artifacts).contains { $0.kind == .hd && $0.state == .completed })
-        }
-    }
-    func test4KWholePairRejectsFirstSideInvalidationWhileSecondReads() async throws {
-        for presetChange in [false,true] {
-            let (f,initial) = try await ready(); try await geometry(f,initial)
-            let b = try await initial.batch(batchID: f.batch.id), barrier = ExecutorBarrier(), count = ExecutorInterruption()
-            var services = f.services; let extract = services.extract
-            services.extract = { snapshot in
-                let index = count.next()
-                if index == 1 { await f.probe.record("read-owner-\(snapshot.taskID.uuidString)") }
-                if index == 2 { await barrier.wait() }
-                return try await extract(snapshot)
-            }
-            let e = WorkflowExecutor(services: services)
-            _ = try await e.register(manifestURL: f.manifest)
-            let work = Task { try await self.square(f,e) }
-            while !(await barrier.entered) { await Task.yield() }
-            // Exactly the first-read side must change; the probe records extraction ordering deterministically.
-            let firstOwner = await servicesOwnerFromExtractOrder(f: f, batch: b)
-            if presetChange {
-                let current = try await e.batch(batchID: b.id)
-                try await e.update(batchID: b.id,event: .presetChanged(scope: .png4k,preset: WorkflowPreset(version: 2,fingerprint: "during-read"),expectedRevision: current.revision))
-            } else {
-                let first = b.task(id: firstOwner)!
-                var saved = first.snapshot!; saved.contentVersion = "mask-during-read"
-                try await e.update(batchID: b.id,event: .savedPSDChanged(taskID: first.id,snapshot: saved,change: .maskOnly,
-                    expectedSourceVersion: first.sourceRevision,expectedSnapshotVersion: first.snapshot?.contentVersion))
-            }
-            await barrier.release()
-            do { try await work.value; XCTFail("stale 4K approval accepted") } catch WorkflowStateError.staleVersion {}
-            let after = try await e.batch(batchID: b.id)
-            XCTAssertTrue(after.activeTasks.allSatisfy { $0.fourKExportRequested != true })
-            XCTAssertFalse(after.activeTasks.flatMap(\.artifacts).contains { $0.kind == .png4k && $0.state == .completed })
-        }
-    }
-    private func servicesOwnerFromExtractOrder(f: ExecutorFixture, batch: WorkflowBatch) async -> UUID {
-        let values = await f.probe.values()
-        let owner = values.last { $0.hasPrefix("read-owner-") }.map { String($0.dropFirst("read-owner-".count)) }
-        return owner.flatMap(UUID.init(uuidString:)) ?? batch.activeTasks[0].id
-    }
+
     func testRegistrationAndLoadRejectUnsafeNamesAndOutputSymlinkEscape() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         for name in ["../../escape","../escape","a/b","a\\b",".","..","\u{0}bad"] {
             var invalid = f.batch; invalid.specimens[0].baseName = name
             let e = WorkflowExecutor(services: f.services)
@@ -566,7 +376,7 @@ extension WorkflowExecutorTests {
         try valid.validate()
         let outside = f.batch.outputDirectory.deletingLastPathComponent().appendingPathComponent("outside-\(UUID())")
         try FileManager.default.createDirectory(at: outside,withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: f.batch.outputDirectory.appendingPathComponent("png 4k"),withDestinationURL: outside)
+        try FileManager.default.createSymbolicLink(at: f.batch.exportDirectory(for: .png4k)!,withDestinationURL: outside)
         do { try await WorkflowExecutor(services: f.services).register(batch: valid,manifestURL: f.manifest); XCTFail("symlink escape registered") } catch {}
         try JSONEncoder().encode(valid).write(to: f.manifest)
         do { _ = try await WorkflowExecutor(services: f.services).register(manifestURL: f.manifest); XCTFail("symlink escape loaded") } catch {}
@@ -576,7 +386,7 @@ extension WorkflowExecutorTests {
 
 extension WorkflowExecutorTests {
     func testCanonicalOutputAliasIsAllowedAndLateSymlinkWritesNothingOutside() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         let directory = "executor-alias-\(UUID())"
         let canonical = URL(fileURLWithPath: "/private/tmp").appendingPathComponent(directory)
         let alias = URL(fileURLWithPath: "/tmp").appendingPathComponent(directory)
@@ -587,32 +397,19 @@ extension WorkflowExecutorTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath: canonical.appendingPathComponent("batch.json").path))
         let outside = canonical.deletingLastPathComponent().appendingPathComponent("outside-\(UUID())")
         try FileManager.default.createDirectory(at: outside,withIntermediateDirectories: true)
-        try FileManager.default.createSymbolicLink(at: canonical.appendingPathComponent("PSD"),withDestinationURL: outside)
-        do { try await e.runPending(batchID: batch.id); XCTFail("late symlink used for stack output") } catch {}
+        try FileManager.default.createSymbolicLink(at: batch.generatedPSDDirectory,withDestinationURL: outside)
+        try await e.runPending(batchID: batch.id)
+        let result = try await e.batch(batchID: batch.id)
+        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.stack].state == .failed })
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
         do { try batch.validateOutputURL(alias.appendingPathComponent("../escape.psd")); XCTFail("normalized parent escaped output") } catch {}
     }
-    func testSavedManualChangeMustBeRefreshedBeforeContinueReleasesLease() async throws {
-        let (f,_) = try await ready(), coordinator = PhotoshopExecutionCoordinator()
-        let e = WorkflowExecutor(services: f.services,coordinator: coordinator)
-        _ = try await e.register(manifestURL: f.manifest)
-        let b = try await e.batch(batchID: f.batch.id), side = b.activeTasks[0]
-        _ = try await e.beginManualEditing(batchID: b.id,taskID: side.id)
-        var saved = side.snapshot!; saved.contentVersion = "manual-current"
-        try JSONEncoder().encode(saved).write(to: saved.workingURL)
-        let queued = Task { try await coordinator.run(owner: side.id) { await f.probe.record("manual-changed-write") } }
-        do { try await e.continueAutomatic(batchID: b.id); XCTFail("unrefreshed edit resumed") } catch WorkflowStateError.staleVersion {}
-        let stillPaused = try await e.batch(batchID: b.id); XCTAssertTrue(stillPaused.isPaused)
-        let blocked = await f.probe.values(); XCTAssertFalse(blocked.contains("manual-changed-write"))
-        try await e.refreshSavedPSD(batchID: b.id,taskID: side.id,change: .geometry)
-        try await e.continueAutomatic(batchID: b.id); try await queued.value
-        let calls = await f.probe.values(); XCTAssertTrue(calls.contains("manual-changed-write"))
-    }
+
 }
 
 extension WorkflowExecutorTests {
     func testPersistedAttemptRejectsParentNavigationThroughNestedSymlink() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         let outside = f.batch.outputDirectory.deletingLastPathComponent().appendingPathComponent("outside-\(UUID())")
         try FileManager.default.createDirectory(at: outside.appendingPathComponent("child"),withIntermediateDirectories: true)
         try FileManager.default.createSymbolicLink(at: f.batch.outputDirectory.appendingPathComponent("nested-link"),withDestinationURL: outside.appendingPathComponent("child"))
@@ -645,7 +442,7 @@ actor WorkflowRenderGate {
 extension WorkflowExecutorTests {
     func testExportsOverlapWithMaximumTwoActiveRenders() async throws {
         for kind in [WorkflowAssetKind.hd,.png4k] {
-            let f = try ExecutorFixture(checks: false,count: 2)
+            let f = try ExecutorFixture(count: 2)
             defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
             let entered = expectation(description: "Two independent renders entered"); entered.expectedFulfillmentCount = 2
             let gate = WorkflowRenderGate(entered),render = f.services.render
@@ -667,8 +464,8 @@ extension WorkflowExecutorTests {
             XCTAssertEqual(disk,after)
         }
     }
-    func testParallelExportPausePreventsLatePublication() async throws {
-        let f = try ExecutorFixture(checks: false,count: 2)
+    func testParallelExportPauseDrainsOnlyDispatchedFaces() async throws {
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let entered = expectation(description: "Two renders before pause"); entered.expectedFulfillmentCount = 2
         let gate = WorkflowRenderGate(entered),render = f.services.render
@@ -682,14 +479,14 @@ extension WorkflowExecutorTests {
         let count = await gate.counts(),paused = try await e.batch(batchID: f.batch.id)
         XCTAssertEqual(count.0,2,"Pause must stop dispatching the other two faces")
         XCTAssertTrue(paused.isPaused)
-        XCTAssertFalse(paused.sideTasks.flatMap(\.artifacts).contains { $0.state == .completed })
-        XCTAssertFalse(paused.sideTasks.flatMap(\.artifacts).contains { FileManager.default.fileExists(atPath: $0.url.path) })
+        XCTAssertEqual(paused.sideTasks.flatMap(\.artifacts).filter { $0.state == .completed }.count, 2)
+        XCTAssertEqual(paused.sideTasks.flatMap(\.artifacts).filter { FileManager.default.fileExists(atPath: $0.url.path) }.count, 2)
         try await e.continueAutomatic(batchID: paused.id)
         let resumed = try await e.batch(batchID: paused.id)
         XCTAssertTrue(resumed.activeTasks.allSatisfy { $0[.hd].state == .completed })
     }
     func testParallelExportFailureKeepsSuccessfulSide() async throws {
-        let f = try ExecutorFixture(checks: false,count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let failed = f.batch.activeTasks[0].id,render = f.services.render
         var services = f.services
@@ -706,7 +503,7 @@ extension WorkflowExecutorTests {
         let artifacts = before.sideTasks.filter { $0.id != failed }.flatMap(\.artifacts)
         let reopened = WorkflowExecutor(services: f.services)
         _ = try await reopened.register(manifestURL: f.manifest)
-        try await reopened.retry(batchID: before.id,specimenIDs: before.specimens.map(\.id),stage: .hd)
+        try await reopened.retryTasks(batchID: before.id, taskIDs: Set(before.activeTasks.map(\.id)), stage: .hd)
         let after = try await reopened.batch(batchID: before.id),calls = await f.probe.values()
         XCTAssertTrue(after.activeTasks.allSatisfy { $0[.hd].state == .completed })
         XCTAssertEqual(after.sideTasks.filter { $0.id != failed }.flatMap(\.artifacts),artifacts)
@@ -716,9 +513,9 @@ extension WorkflowExecutorTests {
 
 extension WorkflowExecutorTests {
     func testManualLeaseWaitsForNativeMatteCheckpointAfterPause() async throws {
-        let f = try ExecutorFixture(checks: false,count: 2), ps = PhotoshopExecutionCoordinator()
+        let f = try ExecutorFixture(count: 2), ps = PhotoshopExecutionCoordinator()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        var batch = f.batch
         let id = batch.activeTasks[0].id, gate = ExecutorBarrier(), probe = f.probe
         var services = f.services
         let select = try XCTUnwrap(services.selectSubject)
@@ -763,7 +560,7 @@ extension WorkflowExecutorTests {
 
 extension WorkflowExecutorTests {
     func testResumeCannotChangeStateUntilPausedRunDrains() async throws {
-        let f = try ExecutorFixture(checks: false),entered = expectation(description: "Two renders before resume")
+        let f = try ExecutorFixture(),entered = expectation(description: "Two renders before resume")
         entered.expectedFulfillmentCount = 2
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let gate = WorkflowRenderGate(entered),render = f.services.render
@@ -775,10 +572,58 @@ extension WorkflowExecutorTests {
         await fulfillment(of: [entered],timeout: 2); await e.pause(batchID: f.batch.id)
         do { try await e.continueAutomatic(batchID: f.batch.id); XCTFail("Resume before drain must be rejected") }
         catch WorkflowStateError.invalidTransition { }
-        let paused = try await e.batch(batchID: f.batch.id); XCTAssertTrue(paused.isPaused)
+        let pausing = try await e.batch(batchID: f.batch.id); XCTAssertFalse(pausing.isPaused, "Pause becomes durable only after the current saved work drains")
         await e.pause(batchID: f.batch.id); await gate.release(); try await run.value
         try await e.continueAutomatic(batchID: f.batch.id)
         let resumed = try await e.batch(batchID: f.batch.id)
         XCTAssertFalse(resumed.isPaused); XCTAssertTrue(resumed.activeTasks.allSatisfy { $0[.hd].state == .completed })
+    }
+}
+
+private actor PublicationValidationGate {
+    let entered: XCTestExpectation
+    private var armed = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    init(_ entered: XCTestExpectation) { self.entered = entered }
+    func arm() { armed = true }
+    func observe() async {
+        guard armed else { return }
+        armed = false
+        await withCheckedContinuation { continuation = $0; entered.fulfill() }
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+extension WorkflowExecutorTests {
+    func testExportRootReplacedDuringFinalRoleReadCannotPublishOutsideSource() async throws {
+        let f = try ExecutorFixture()
+        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        let entered = expectation(description: "Final role read before publication")
+        let gate = PublicationValidationGate(entered)
+        var services = f.services
+        let extract = services.extract, render = services.render
+        services.extract = { saved in
+            await gate.observe()
+            return try await extract(saved)
+        }
+        services.render = { kind, roles, layout, source, watermark, destination in
+            try await render(kind, roles, layout, source, watermark, destination)
+            await gate.arm()
+        }
+        let executor = WorkflowExecutor(services: services, coordinator: PhotoshopExecutionCoordinator())
+        try await executor.register(batch: f.batch, manifestURL: f.manifest)
+        try await executor.runPending(batchID: f.batch.id)
+        let id = f.batch.specimens[0].front.id
+        try await executor.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
+        let export = Task {
+            try await executor.requestExports(batchID: f.batch.id, taskIDs: [id], kinds: [.hd], policy: .overwrite, layouts: [:])
+        }
+        await fulfillment(of: [entered], timeout: 3)
+        let outside = f.batch.outputDirectory.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: f.batch.exportDirectory(for: .hd)!, withDestinationURL: outside)
+        await gate.release()
+        _ = try? await export.value
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty, "Neither output nor owner receipt may be written through the replaced root")
     }
 }

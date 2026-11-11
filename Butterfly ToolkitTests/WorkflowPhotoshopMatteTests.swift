@@ -6,9 +6,9 @@ import JavaScriptCore
 @MainActor
 final class WorkflowPhotoshopMatteTests: XCTestCase {
     func testNativeBatchUsesSavedSubjectMaskForGeometry() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var native = f.batch; native.manualFinalization = true
+        var native = f.batch
         var services = f.services
         services.selectSubject = { snapshot in
             await f.probe.record("select-subject")
@@ -28,25 +28,25 @@ final class WorkflowPhotoshopMatteTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0 == "apply-save" }.count, 2)
         let result = try await executor.batch(batchID: native.id)
         XCTAssertTrue(result.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
-        XCTAssertTrue(result.activeTasks.allSatisfy { $0.matteArtifact == nil && $0.stackPNG == nil })
-        let expectedDirectory = native.outputDirectory.appendingPathComponent("PSD",isDirectory: true)
+        XCTAssertTrue(result.activeTasks.allSatisfy { $0.snapshot?.roles?.isValid == true })
+        let expectedDirectory = native.sourceDirectory.resolvingSymlinksInPath().appendingPathComponent(native.sourceDirectory.lastPathComponent + "_psd",isDirectory: true)
         XCTAssertTrue(result.activeTasks.allSatisfy { $0.snapshot?.workingURL.deletingLastPathComponent().path == expectedDirectory.path })
         let loaded = try await WorkflowBatchStore().load(from: f.manifest)
         XCTAssertEqual(loaded.generatedPSDDirectory, expectedDirectory)
     }
-    func testDraftPersistsNewSchemaAndBatchOwnedPSDDirectory() throws {
-        let f = try ExecutorFixture(checks: false)
+    func testDraftPersistsNewSchemaAndSourcePSDSubdirectory() throws {
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
         let workspace = f.batch.outputDirectory.appendingPathComponent("new")
-        let batch = try draft.freeze(names: "sample", output: workspace, checkStack: false, checkMatte: false, manualFinalization: true)
+        let batch = try draft.freeze(names: "sample", output: workspace)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(batch)) as? [String: Any])
-        XCTAssertEqual(object["schemaVersion"] as? Int, 2)
-        XCTAssertEqual(object["manualFinalization"] as? Bool, true)
-        XCTAssertEqual(batch.generatedPSDDirectory.path, workspace.appendingPathComponent("PSD").path)
+        XCTAssertEqual(object["schemaVersion"] as? Int, WorkflowBatch.currentSchemaVersion)
+        XCTAssertNil(object["manualFinalization"])
+        XCTAssertEqual(batch.generatedPSDDirectory.path, batch.sourceDirectory.resolvingSymlinksInPath().appendingPathComponent(batch.sourceDirectory.lastPathComponent + "_psd").path)
     }
     func testOldSchemaIsRejectedWithoutRewritingManifest() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var old = f.batch; old.schemaVersion = 1
         let bytes = try JSONEncoder().encode(old)
@@ -61,9 +61,9 @@ final class WorkflowPhotoshopMatteTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: f.manifest), bytes)
     }
     func testPhotoshopFailureStopsTheFacesBeforeGeometry() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        var batch = f.batch
         var services = f.services
         services.selectSubject = { _ in throw WorkflowBridgeError.invalidImage("没有识别到主体") }
         let executor = WorkflowExecutor(services: services)
@@ -75,9 +75,9 @@ final class WorkflowPhotoshopMatteTests: XCTestCase {
         XCTAssertFalse(calls.contains("analyze"))
     }
     func testPublishedPhotoshopMaskRecoversAfterManifestWriteWasInterrupted() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        var batch = f.batch
         var services = f.services
         services.selectSubject = { snapshot in
             let current = try JSONDecoder().decode(PSDSnapshot.self, from: Data(contentsOf: snapshot.workingURL))
@@ -103,10 +103,10 @@ final class WorkflowPhotoshopMatteTests: XCTestCase {
         XCTAssertEqual(calls.filter { $0 == "select-subject" }.count, 2, "Reuse both saved masks without rerunning subject selection")
     }
     func testPSDSubdirectoryRejectsSymlinkEscapeAndUnexpectedName() throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         let outside = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory); try? FileManager.default.removeItem(at: outside) }
-        var batch = f.batch; batch.psdSubdirectory = true
+        var batch = f.batch
         // Keep internal records elsewhere so the source cannot pass as the workspace.
         batch.outputDirectory = batch.sourceDirectory.appendingPathComponent("records")
         let allowed = batch.generatedPSDDirectory.appendingPathComponent("sample0_D.psd")

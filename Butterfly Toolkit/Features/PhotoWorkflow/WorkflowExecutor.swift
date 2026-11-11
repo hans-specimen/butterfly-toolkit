@@ -19,6 +19,8 @@ actor WorkflowExecutor {
         var publish: @Sendable (URL, WorkflowArtifact) throws -> WorkflowArtifact
         var recover: @Sendable (WorkflowArtifact) throws -> WorkflowArtifact?
         var contentFingerprint: @Sendable (RoleImages) async throws -> String
+        var verifyPublishedArtifact: @Sendable (WorkflowArtifact) throws -> Void = { try WorkflowArtifactStore().verifyPublished(artifact: $0) }
+        var removeIntermediates: @Sendable (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) }
 
         var publishSkippingExisting: (@Sendable (URL, WorkflowArtifact) throws -> WorkflowArtifact)? = nil
         var adoptManualMask: (@Sendable (URL, UUID) async throws -> PSDSnapshot)? = nil
@@ -27,7 +29,6 @@ actor WorkflowExecutor {
         var taskDocument: (@Sendable (UUID, URL, @escaping @Sendable () async throws -> Void) async throws -> Void)? = nil
         var selectSubject: (@Sendable (PSDSnapshot) async throws -> PSDSnapshot)? = nil
         var finalize: (@Sendable (URL, UUID) async throws -> PSDSnapshot)? = nil
-        var applyForFinalization: (@Sendable (PSDSnapshot, GeometrySolution) async throws -> PSDSnapshot)? = nil
         var openDocuments: (@Sendable () async throws -> [WorkflowOpenPhotoshopDocument])? = nil
         var verifyManualSaveOwnership: (@Sendable (URL, UUID) throws -> Void)? = nil
         var prepareAcceptedFinalPSD: (@Sendable (WorkflowAcceptedFinalPSD) async throws -> (PSDSnapshot, RoleImages))? = nil
@@ -66,7 +67,6 @@ actor WorkflowExecutor {
             services.restoreCheckpoint = { try await bridge.restoreCheckpoint(snapshot: $0,destination: $1) }
             services.acknowledgeManualResult = { try await bridge.acknowledgeManualResult(snapshot: $0) }
             services.finalize = { try await bridge.captureFinalPSD(document: $0,owner: $1) }
-            services.applyForFinalization = { try await bridge.applyGeometry(snapshot: $0,solution: $1,createFinishedLayer: true) }
             services.openDocuments = { try await bridge.openDocuments() }
             services.verifyManualSaveOwnership = { try bridge.verifyManualSaveOwnership(document: $0, owner: $1) }
             services.prepareAcceptedFinalPSD = { try await bridge.prepareAcceptedFinalPSD($0) }
@@ -91,25 +91,23 @@ actor WorkflowExecutor {
     private var acceptingSavedReview: Set<UUID> = []
     private var reprocessing: Set<UUID> = []
     private var acquiringManual: Set<UUID> = []
-    private var stageRuns: [UUID: [UUID: Task<Void,Error>]] = [:]
     private let exportLimit: Int
+    private let intermediateStorageRoot: URL
+    private var cleaningIntermediates: Set<UUID> = []
 
     init(store: WorkflowBatchStore = WorkflowBatchStore(), services: Services,
-         coordinator: PhotoshopExecutionCoordinator = .shared, exportLimit: Int = 2) {
+         coordinator: PhotoshopExecutionCoordinator = .shared, exportLimit: Int = 2,
+         intermediateStorageRoot: URL = WorkflowIntermediateCleanup.storageRoot) {
         self.store = store; self.services = services; self.coordinator = coordinator
         self.exportLimit = max(1,min(2,exportLimit))
+        self.intermediateStorageRoot = intermediateStorageRoot
     }
 
     // MARK: - 批次登记与输出配置
     func register(batch: WorkflowBatch, manifestURL: URL) async throws {
         guard batches[batch.id] == nil else { throw WorkflowStateError.invalidTransition }
-        var value = batch
-        value.selectedDerivativeKinds = []
-        value.watermarkURL = nil
-        if value.manualFinalization == true {
-            value.checkAfterStack = false; value.checkAfterMatte = false; value.checkGeometry = true; value.check4K = true
-        }
-        try value.validate(); try value.validateStart(); try value.validateOutputURL(manifestURL)
+        let value = batch
+        try value.validate(); try value.validateOutputURL(manifestURL)
         for task in value.sideTasks {
             if let saved = task.snapshot { try value.validateOutputURL(saved.workingURL) }
         }
@@ -142,6 +140,7 @@ actor WorkflowExecutor {
 
     /// 事件更新使用预期版本进行乐观校验，集中处理来源、预设和明确排除等状态变更。
     func update(batchID: UUID, event: WorkflowEvent) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         if case .excludeSpecimens = event, acquiringManual.contains(batchID) || reprocessing.contains(batchID) { throw WorkflowStateError.invalidTransition }
         if case let .excludeSpecimens(ids,_,_) = event, let owner = manual[batchID],
            try batch(batchID: batchID).specimens.contains(where: { ids.contains($0.id) && ($0.front.id == owner || $0.back.id == owner) }) {
@@ -150,16 +149,16 @@ actor WorkflowExecutor {
         let protectingReview = batchReviewLeases[batchID] != nil || acquiringManual.contains(batchID) ||
             acceptingSavedReview.contains(batchID) || preparingFinal.contains(batchID)
         switch event {
-        case .sourceChanged, .savedPSDChanged, .presetChanged:
-            // 旧版几何或 4K 确认可以被这些事件失效，写回前仍需重新核对版本。
+        case .sourceChanged, .presetChanged:
             guard !protectingReview else { throw WorkflowBridgeError.manualReviewActive }
-        case .excludeSpecimens, .resume, .continueBatch, .confirmSelected:
+        case .excludeSpecimens, .resume:
             guard !protectingReview, !confirming.contains(batchID) else { throw WorkflowBridgeError.manualReviewActive }
         default: break
         }
         try reduce(batchID,event); try await persist(batchID)
     }
     func setExportDirectory(batchID: UUID, kind: WorkflowAssetKind, directory: URL) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard kind == .hd || kind == .png4k, directory.isFileURL,
               !running.contains(batchID), !confirming.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
               !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
@@ -188,8 +187,6 @@ actor WorkflowExecutor {
                         }
                         task[kind.stage].revision += 1
                         task.requestedExports?.removeValue(forKey: kind)
-                        if kind == .hd && task[.geometry].state == .completed { task.exportHD = true }
-                        if kind == .png4k { task.fourKExportRequested = nil }
                     }
                     if side == .front { batch.specimens[index].front = task } else { batch.specimens[index].back = task }
                 }
@@ -198,45 +195,10 @@ actor WorkflowExecutor {
         try await persist(batchID)
     }
 
-    // MARK: - 人工定稿与旧批次迁移
-    func migrateToFinalization(batchID: UUID) async throws {
-        guard !running.contains(batchID), !confirming.contains(batchID), !acquiringManual.contains(batchID),
-              batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        let value = try batch(batchID: batchID)
-        guard value.manualFinalization != true else { return }
-        guard !value.activeTasks.isEmpty,value.activeTasks.allSatisfy({ $0[.matte].state == .completed }) else {
-            throw WorkflowBridgeError.invalidImage("请先在原流程完成本批次 AI 抠图及检查，再切换到人工定稿")
-        }
-        guard let manifest = manifests[batchID] else { throw WorkflowStateError.invalidTransition }
-        let backup = manifest.deletingLastPathComponent().appendingPathComponent("batch-before-finalization-\(UUID()).json")
-        try FileManager.default.copyItem(at: manifest,to: backup)
-        try edit(batchID) { batch in
-            batch.manualFinalization = true; batch.checkAfterStack = false; batch.checkAfterMatte = false
-            batch.checkGeometry = true; batch.check4K = true
-            for index in batch.specimens.indices where !batch.specimens[index].isExcluded {
-                for side in WorkflowSide.allCases {
-                    var task = side == .front ? batch.specimens[index].front : batch.specimens[index].back
-                    task.historicalArtifacts = (task.historicalArtifacts ?? []) + task.artifacts; task.artifacts = []
-                    task.exportHD = nil; task.fourKExportRequested = nil
-                    for stage in [WorkflowStage.hd,.png4k] {
-                        task[stage].state = .pending; task[stage].outputVersion = nil; task[stage].confirmedVersion = nil
-                        task[stage].error = nil; task[stage].revision += 1
-                    }
-                    // 已完成 AI 的旧 PSD 可能被人工修改；迁移不能自动再次旋转或裁切。
-                    if task[.matte].state == .completed,let snapshot = task.snapshot {
-                        task[.geometry].state = .waitingReview; task[.geometry].outputVersion = snapshot.contentVersion
-                        task[.geometry].confirmedVersion = nil; task[.geometry].revision += 1
-                    }
-                    if side == .front { batch.specimens[index].front = task } else { batch.specimens[index].back = task }
-                }
-            }
-        }
-        try await persist(batchID)
-    }
-
+    // MARK: - 人工定稿
     func refreshFinalPSD(batchID: UUID,taskID: UUID, adoptingCurrent: Bool = false) async throws {
-        guard try batch(batchID: batchID).manualFinalization == true,
-              batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID),
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
+        guard batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID),
               manual[batchID] == nil || manual[batchID] == taskID,
               let finalize = services.finalize else { throw WorkflowStateError.invalidTransition }
         let before = try task(batchID,taskID)
@@ -264,7 +226,7 @@ actor WorkflowExecutor {
                 task[.matte].state = .completed; task[.matte].outputVersion = saved.contentVersion
                 task[.matte].error = nil; task[.matte].revision += 1
             }
-            task.geometryRevalidationRequired = false; task.lastPSDChange = nil; task.geometrySolution = nil
+            task.geometrySolution = nil
             if changed {
                 task[.geometry].state = .waitingReview; task[.geometry].outputVersion = saved.contentVersion
                 task[.geometry].confirmedVersion = nil; task[.geometry].error = nil; task[.geometry].revision += 1
@@ -273,7 +235,7 @@ actor WorkflowExecutor {
                     task[stage].error = nil; task[stage].revision += 1
                 }
                 for i in task.artifacts.indices { task.artifacts[i].state = .pending }
-                task.fourKExportRequested = nil; task.exportHD = nil; task.requestedExports = nil
+                task.requestedExports = nil
                 task.exportNotes = Dictionary(task.artifacts.map { ($0.kind, "PSD 已更新，待重新导出") }, uniquingKeysWith: { _, latest in latest })
             }
         }
@@ -282,6 +244,7 @@ actor WorkflowExecutor {
 
     /// 早期检查点允许仅查看后退出，修补蒙版后继续矫正；不会隐式接受未完成的几何步骤。
     func refreshManualPSD(batchID: UUID, taskID: UUID) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         let before = try task(batchID,taskID)
         if [.waitingReview,.completed].contains(before[.geometry].state) {
             try await refreshFinalPSD(batchID: batchID,taskID: taskID); return
@@ -319,72 +282,8 @@ actor WorkflowExecutor {
         try await refreshFinalPSD(batchID: batchID,taskID: taskID,adoptingCurrent: true)
     }
 
-    /// 确认读取最终保存版本；此处只进入导出预览，不发布文件。
-    func confirmFinalPSD(batchID: UUID,specimenIDs: Set<UUID>) async throws {
-        guard !running.contains(batchID),!confirming.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        let value = try batch(batchID: batchID)
-        let selected = value.specimens.filter { specimenIDs.contains($0.id) && !$0.isExcluded }
-        guard value.manualFinalization == true,!selected.isEmpty,selected.count == specimenIDs.count,
-              selected.flatMap({ [$0.front,$0.back] }).allSatisfy({ $0.acceptedFinalPSD == nil && $0[.matte].state == .completed && [.waitingReview,.completed,.failed].contains($0[.geometry].state) }) else { throw WorkflowStateError.invalidTransition }
-        confirming.insert(batchID); defer { confirming.remove(batchID) }
-        if let owner = manual[batchID] {
-            try await refreshManualPSD(batchID: batchID,taskID: owner)
-            manual.removeValue(forKey: batchID); await coordinator.endManualEditing(owner: owner)
-        }
-        let ids = selected.flatMap { [$0.front.id,$0.back.id] }
-        for id in ids { try await refreshFinalPSD(batchID: batchID,taskID: id) }
-        let expected = try Dictionary(uniqueKeysWithValues: ids.map { ($0,try task(batchID,$0)) })
-        let presets = try batch(batchID: batchID).presets
-        for id in ids {
-            guard let snapshot = expected[id]?.snapshot else { throw WorkflowStateError.invalidTransition }
-            _ = try await services.extract(snapshot)
-            try checkSelection(batchID,expected,stage: .geometry,presets: presets,allowPaused: true)
-        }
-        try edit(batchID) { batch in
-            batch.isPaused = false
-            for index in batch.specimens.indices where specimenIDs.contains(batch.specimens[index].id) {
-                for side in WorkflowSide.allCases {
-                    var task = side == .front ? batch.specimens[index].front : batch.specimens[index].back
-                    task[.geometry].state = .completed; task[.geometry].outputVersion = task.snapshot!.contentVersion
-                    task[.geometry].confirmedVersion = task[.geometry].outputVersion; task[.geometry].revision += 1
-                    task[.png4k].state = .waitingReview; task[.png4k].outputVersion = task.snapshot!.contentVersion
-                    task[.png4k].confirmedVersion = nil; task[.png4k].revision += 1; task.fourKExportRequested = nil
-                    task.exportHD = true
-                    if side == .front { batch.specimens[index].front = task } else { batch.specimens[index].back = task }
-                }
-            }
-        }
-        try await persist(batchID)
-    }
-
-    /// 确认单面预览对应的确切保存版本；不隐式启动导出或恢复暂停队列。
-    func confirmFinalTasks(batchID: UUID, versions: [UUID: String]) async throws {
-        guard !versions.isEmpty, !confirming.contains(batchID), !reprocessing.contains(batchID), manual[batchID] == nil,
-              batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        let value = try batch(batchID: batchID)
-        guard value.manualFinalization == true, Set(versions.keys).isSubset(of: Set(value.activeTasks.map(\.id))) else { throw WorkflowStateError.invalidTransition }
-        for (id, version) in versions {
-            let before = try task(batchID, id)
-            guard before[.geometry].state == .waitingReview || before[.geometry].state == .completed,
-                  before.manualAdoptionRequired != true, before.geometryApplySourceVersion == nil,
-                  before.acceptedFinalPSD == nil, before.snapshot?.contentVersion == version else { throw WorkflowStateError.staleVersion }
-        }
-        confirming.insert(batchID); defer { confirming.remove(batchID) }
-        for (id, version) in versions {
-            try await refreshFinalPSD(batchID: batchID, taskID: id)
-            guard try task(batchID, id).snapshot?.contentVersion == version else { throw WorkflowStateError.staleVersion }
-        }
-        for (id, version) in versions {
-            try mutateTask(batchID, id) { task in
-                task[.geometry].state = .completed
-                task[.geometry].outputVersion = version; task[.geometry].confirmedVersion = version
-                task[.geometry].revision += 1
-            }
-        }
-        try await persist(batchID)
-    }
-
     func requestExports(batchID: UUID, taskIDs: Set<UUID>, kinds: Set<WorkflowAssetKind>, policy: WorkflowExportPolicy, layouts: [UUID: SquareLayout]) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         let value = try batch(batchID: batchID)
         guard !taskIDs.isEmpty, !kinds.isEmpty, kinds.isSubset(of: [.hd, .png4k]),
               taskIDs.isSubset(of: Set(value.activeTasks.map(\.id))), !confirming.contains(batchID), !reprocessing.contains(batchID),
@@ -398,6 +297,9 @@ actor WorkflowExecutor {
                       layout.center.x.isFinite, layout.center.y.isFinite else { throw WorkflowStateError.invalidTransition }
             }
             for kind in kinds { guard value.exportDirectory(for: kind) != nil else { throw WorkflowStateError.invalidTransition } }
+        }
+        try edit(batchID) { batch in
+            batch.selectedExportKinds = kinds
         }
         for id in taskIDs {
             try mutateTask(batchID, id) { task in
@@ -417,6 +319,7 @@ actor WorkflowExecutor {
     }
 
     func retryTasks(batchID: UUID, taskIDs: Set<UUID>, stage: WorkflowStage? = nil) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !confirming.contains(batchID),
               !preparingFinal.contains(batchID) else { throw WorkflowBridgeError.manualReviewActive }
         let value = try batch(batchID: batchID)
@@ -434,6 +337,7 @@ actor WorkflowExecutor {
 
     /// 重新处理在新工作文件上开始，旧 PSD、阶段快照和已导出文件全部保留。
     func reprocessTask(batchID: UUID, taskID: UUID, from stage: WorkflowStage, expectedVersion: String?) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard !running.contains(batchID), !reprocessing.contains(batchID), !confirming.contains(batchID), !acquiringManual.contains(batchID), manual[batchID] == nil,
               batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID),
               [WorkflowStage.stack,.matte,.geometry].contains(stage) else { throw WorkflowStateError.invalidTransition }
@@ -456,8 +360,7 @@ actor WorkflowExecutor {
             invalidateOutputs(&task, from: stage)
             task.snapshot = restored; task.stackAttemptURL = destination; task.roleImages = nil
             task.geometrySolution = nil; task.geometryApplySourceVersion = nil; task.manualAdoptionRequired = false
-            task.acceptedFinalPSD = nil; task.finalPreparationError = nil; task.manualEditError = nil
-            task.geometryRevalidationRequired = false; task.lastPSDChange = nil
+            task.acceptedFinalPSD = nil; task.finalPreparationError = nil; task.manualEditError = nil; task.intermediatesCleared = false
             task.requestedExports = nil; task.exportNotes = [.hd:"已重新处理，待重新确认",.png4k:"已重新处理，待重新确认"]
             for step in [WorkflowStage.stack,.matte,.geometry].drop(while: { $0 != stage }) { task.checkpoints?.removeValue(forKey: step) }
         }
@@ -466,6 +369,7 @@ actor WorkflowExecutor {
     }
 
     func endManualEditing(batchID: UUID) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard batchReviewLeases[batchID] == nil else { throw WorkflowBridgeError.manualReviewActive }
         guard let owner = manual[batchID] else { return }
         try await refreshManualPSD(batchID: batchID, taskID: owner)
@@ -478,46 +382,27 @@ actor WorkflowExecutor {
     // MARK: - 暂停与人工编辑协调
     func pause(batchID: UUID) async {
         guard let value = batches[batchID] else { return }
-        if value.manualFinalization == true {
-            if running.contains(batchID) { pauseRequests.insert(batchID) }
-            else { try? reduce(batchID,.pause(expectedRevision: value.revision)); try? await persist(batchID) }
-            return
-        }
-        try? reduce(batchID,.cancelRunning(expectedRevision: value.revision))
-        for run in stageRuns[batchID]?.values ?? [:].values { run.cancel() }
-        try? await persist(batchID)
+        if running.contains(batchID) { pauseRequests.insert(batchID) }
+        else { try? reduce(batchID,.pause(expectedRevision: value.revision)); try? await persist(batchID) }
     }
     func continueAutomatic(batchID: UUID) async throws {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard !running.contains(batchID), !reprocessing.contains(batchID), !acquiringManual.contains(batchID),
               batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID), !confirming.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        if let owner = manual[batchID],try batch(batchID: batchID).manualFinalization == true {
+        if let owner = manual[batchID] {
             try await refreshManualPSD(batchID: batchID,taskID: owner)
             manual.removeValue(forKey: batchID); await coordinator.endManualEditing(owner: owner)
-        }
-        if let owner = manual[batchID] {
-            let before = try task(batchID,owner)
-            guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
-            let saved = try await services.refresh(snapshot.workingURL,owner,nil)
-            try check(batchID,before,stage: .geometry,allowPaused: true)
-            guard saved.contentVersion == snapshot.contentVersion, saved.roles == snapshot.roles,
-                  saved.pixelSize == snapshot.pixelSize, saved.structureSummary == snapshot.structureSummary,
-                  manual[batchID] == owner else { throw WorkflowStateError.staleVersion }
-            if saved.roles != nil {
-                _ = try await services.extract(saved)
-                try check(batchID,before,stage: .geometry,allowPaused: true)
-            }
-            manual.removeValue(forKey: batchID)
-            await coordinator.endManualEditing(owner: owner)
         }
         let value = try batch(batchID: batchID)
         try reduce(batchID,.resume(expectedRevision: value.revision)); try await persist(batchID)
         try await runPending(batchID: batchID)
     }
     func beginManualEditing(batchID: UUID, taskID: UUID) async throws -> URL {
+        guard !cleaningIntermediates.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         guard !confirming.contains(batchID), !reprocessing.contains(batchID), !acquiringManual.contains(batchID),
               batchReviewLeases[batchID] == nil, !preparingFinal.contains(batchID) else { throw WorkflowStateError.invalidTransition }
         acquiringManual.insert(batchID); defer { acquiringManual.remove(batchID) }
-        if try batch(batchID: batchID).manualFinalization == true,let owner = manual[batchID],owner != taskID {
+        if let owner = manual[batchID],owner != taskID {
             try await refreshManualPSD(batchID: batchID,taskID: owner)
             manual.removeValue(forKey: batchID); await coordinator.endManualEditing(owner: owner)
         }
@@ -531,28 +416,6 @@ actor WorkflowExecutor {
         guard let latest = try self.task(batchID,taskID).snapshot else { throw WorkflowStateError.invalidTransition }
         return latest.workingURL
     }
-    /// 调用方提供编辑类型，桥接层在人工编辑租约内校验已保存且稳定的角色结构。
-    func refreshSavedPSD(batchID: UUID, taskID: UUID, change: WorkflowPSDChange) async throws {
-        guard batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
-            throw WorkflowBridgeError.manualReviewActive
-        }
-        let before = try task(batchID,taskID)
-        guard let old = before.snapshot else { throw WorkflowStateError.invalidTransition }
-        let saved = try await services.refresh(old.workingURL,taskID,nil)
-        try check(batchID,before,stage: .geometry,allowPaused: true)
-        if saved.contentVersion != old.contentVersion {
-            try reduce(batchID,.savedPSDChanged(taskID: taskID,snapshot: saved,change: change,
-                expectedSourceVersion: before.sourceRevision,expectedSnapshotVersion: old.contentVersion))
-        }
-        try mutateTask(batchID,taskID) { $0.geometryApplySourceVersion = nil }
-        if saved.roles != nil {
-            let roles = try await services.extract(saved)
-            guard try task(batchID,taskID).snapshot?.contentVersion == saved.contentVersion else { throw WorkflowStateError.staleVersion }
-            try mutateTask(batchID,taskID) { $0.roleImages = roles }
-        }
-        try await persist(batchID)
-    }
-
     // MARK: - 阶段队列与抠图子阶段
     func runPending(batchID: UUID) async throws {
         guard !confirming.contains(batchID) else { return }
@@ -562,11 +425,12 @@ actor WorkflowExecutor {
         guard !running.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
               !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else { return }
         _ = try batch(batchID: batchID); running.insert(batchID); defer { running.remove(batchID); pauseRequests.remove(batchID) }
+        var dispatchedExport = false
         do {
             while !(try batch(batchID: batchID)).isPaused {
                 try Task.checkCancellation()
                 var advanced = false
-                if try batch(batchID: batchID).manualFinalization == true {
+                do {
                     // 每面走完自动阶段后才开始下一面，失败只阻止该面的后续步骤。
                     let ids = try batch(batchID: batchID).activeTasks.map(\.id)
                     for id in ids {
@@ -582,11 +446,11 @@ actor WorkflowExecutor {
                     }
                 }
                 for stage in WorkflowStage.processingStages {
-                    if try batch(batchID: batchID).manualFinalization == true,
-                       [WorkflowStage.stack, .matte, .geometry].contains(stage) { continue }
+                    if [WorkflowStage.stack, .matte, .geometry].contains(stage) { continue }
                     let value = try batch(batchID: batchID)
                     let ids = value.activeTasks.filter { $0[stage].state == .pending && eligible($0,stage: stage,batch: value) }.map(\.id)
                     if !ids.isEmpty {
+                        dispatchedExport = true
                         let limit = stage == .hd || stage == .png4k ? exportLimit : 1
                         try await runStageTasks(batchID: batchID,stage: stage,taskIDs: ids,limit: limit)
                         advanced = true
@@ -594,17 +458,16 @@ actor WorkflowExecutor {
                     try await finishRequestedPause(batchID)
                     if try batch(batchID: batchID).isPaused { break }
                 }
-                try await finish4KIntents(batchID)
-                if try await advanceUncheckedReviews(batchID) { advanced = true }
                 if !advanced { break }
             }
+            if dispatchedExport { await cleanIntermediatesAfterExport(batchID) }
         } catch is CancellationError {
                 let value = try batch(batchID: batchID)
             try reduce(batchID,.cancelRunning(expectedRevision: value.revision)); try await persist(batchID)
             throw CancellationError()
         } catch {
             let value = try batch(batchID: batchID)
-            if value.manualFinalization == true { try reduce(batchID,.pause(expectedRevision: value.revision)); try await persist(batchID) }
+            try reduce(batchID,.pause(expectedRevision: value.revision)); try await persist(batchID)
             throw error
         }
     }
@@ -627,7 +490,6 @@ actor WorkflowExecutor {
     }
 
     private func runStageTasks(batchID: UUID,stage: WorkflowStage,taskIDs: [UUID],limit: Int) async throws {
-        defer { stageRuns[batchID] = nil }
         do {
             try await withThrowingTaskGroup(of: UUID.self) { group in
                 var pending = taskIDs.makeIterator(), exhausted = false, active = 0
@@ -640,14 +502,13 @@ actor WorkflowExecutor {
                         guard let item = value.activeTasks.first(where: { $0.id == id }),item[stage].state == .pending,
                               eligible(item,stage: stage,batch: value) else { continue }
                         let run = Task { try await self.execute(batchID,id,stage: stage) }
-                        stageRuns[batchID,default: [:]][id] = run
                         group.addTask {
                             try await withTaskCancellationHandler { try await run.value } onCancel: { run.cancel() }
                             return id
                         }
                         active += 1
                     }
-                    if active > 0,let id = try await group.next() { stageRuns[batchID]?[id] = nil; active -= 1 }
+                    if active > 0, try await group.next() != nil { active -= 1 }
                 }
             }
         } catch is CancellationError {
@@ -657,209 +518,6 @@ actor WorkflowExecutor {
         }
     }
 
-    private func advanceUncheckedReviews(_ batchID: UUID) async throws -> Bool {
-        let value = try batch(batchID: batchID)
-        guard !value.isPaused,value.manualFinalization != true else { return false }
-        var advanced = false
-        for specimen in value.specimens where !specimen.isExcluded {
-            let pair = [specimen.front, specimen.back]
-            if value.checkGeometry == false && pair.allSatisfy({ $0[.geometry].state == .waitingReview }) {
-                guard pair.allSatisfy({ $0.geometrySolution?.isApplicable == true }) else {
-                    throw WorkflowBridgeError.invalidImage("\(specimen.baseName) 的自动构图未通过检查，请手动调整后确认")
-                }
-                try await applyGeometryConfirmation(batchID: batchID, solutions: Dictionary(uniqueKeysWithValues: pair.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
-                advanced = true
-            }
-            if value.check4K == false && value.exportDirectory(for: .png4k) != nil && pair.allSatisfy({ $0[.png4k].state == .waitingReview && $0.fourKExportRequested != true }) {
-                try await prepare4KExport(batchID: batchID, layouts: Dictionary(uniqueKeysWithValues: pair.map { ($0.id, $0.squareLayout) }))
-                advanced = true
-            }
-        }
-        return advanced
-    }
-
-    func continueAfterReview(batchID: UUID, stage: WorkflowStage, specimenIDs: [UUID]) async throws {
-        guard batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
-            throw WorkflowBridgeError.manualReviewActive
-        }
-        let value = try batch(batchID: batchID)
-        guard Set(specimenIDs) == Set(value.specimens.filter { !$0.isExcluded }.map(\.id)) else { throw WorkflowStateError.invalidTransition }
-        guard stage == .stack || stage == .matte else { throw WorkflowStateError.invalidTransition }
-        for before in value.activeTasks {
-            guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
-            let saved = try await services.refresh(snapshot.workingURL,before.id,nil)
-            try check(batchID,before,stage: stage,allowPaused: true)
-            guard saved.contentVersion == snapshot.contentVersion, saved.roles == snapshot.roles,
-                  saved.pixelSize == snapshot.pixelSize else { throw WorkflowStateError.staleVersion }
-        }
-        let expected = Dictionary(uniqueKeysWithValues: value.activeTasks.map { ($0.id,$0) })
-        try checkSelection(batchID,expected,stage: stage,presets: value.presets,allowPaused: true)
-        if let owner = manual.removeValue(forKey: batchID) { await coordinator.endManualEditing(owner: owner) }
-        var current = try batch(batchID: batchID)
-        if current.isPaused { try reduce(batchID,.resume(expectedRevision: current.revision)); current = try batch(batchID: batchID) }
-        try reduce(batchID,.continueBatch(stage: stage,expectedRevision: current.revision))
-        try await persist(batchID); try await runPending(batchID: batchID)
-    }
-
-    func confirmGeometry(batchID: UUID, solutions: [UUID: GeometrySolution], exportHD: Bool) async throws {
-        guard try batch(batchID: batchID).manualFinalization != true else { throw WorkflowStateError.invalidTransition }
-        guard !confirming.contains(batchID), !running.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        confirming.insert(batchID); defer { confirming.remove(batchID) }
-        try await applyGeometryConfirmation(batchID: batchID, solutions: solutions, exportHD: exportHD)
-        try await runStages(batchID: batchID)
-    }
-
-    private func applyGeometryConfirmation(batchID: UUID, solutions: [UUID: GeometrySolution], exportHD: Bool) async throws {
-        let ids = try selectedSpecimens(batchID,sideIDs: Set(solutions.keys),stage: .geometry)
-        guard manual[batchID] == nil, !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.invalidTransition }
-        let presets = try batch(batchID: batchID).presets
-        var expected = try Dictionary(uniqueKeysWithValues: solutions.keys.map { ($0,try task(batchID,$0)) })
-        var validated = solutions
-        for id in solutions.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
-            let before = expected[id]!
-            guard before.roleImages != nil, let solution = solutions[id],
-                  before.geometryApplySourceVersion == nil, solution.sourceVersion == before.snapshot?.contentVersion,
-                  solution.isApplicable else { throw WorkflowStateError.staleVersion }
-            let currentRoles = try await readCurrentRoles(batchID,before,stage: .geometry)
-            try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-            validated[id] = try await services.validateGeometry(currentRoles,solution)
-            try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-        }
-        for id in solutions.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
-            try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-            var before = try task(batchID,id)
-            let solution = validated[id]!
-            if before[.geometry].state == .completed, before.geometrySolution == solution {
-                try mutateTask(batchID,id) { $0.exportHD = exportHD }
-                if exportHD && before[.hd].outputVersion == "not-selected" { try invalidateOutputs(batchID,id,from: .hd) }
-                expected[id] = try task(batchID,id)
-                continue
-            }
-            if before[.geometry].state == .completed {
-                try mutateTask(batchID,id) { $0[.geometry].state = .waitingReview; $0[.geometry].confirmedVersion = nil; $0[.geometry].revision += 1 }
-                try invalidateOutputs(batchID,id,from: .hd)
-                before = try task(batchID,id)
-            }
-            guard let snapshot = before.snapshot, solution.sourceVersion == snapshot.contentVersion,
-                  before[.geometry].state == .waitingReview else { throw WorkflowStateError.staleVersion }
-            try mutateTask(batchID,id) { $0.exportHD = exportHD; $0.geometryApplySourceVersion = snapshot.contentVersion }
-            expected[id] = try task(batchID,id)
-            try await persist(batchID)
-            do {
-                try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                let saved = try await services.apply(snapshot,solution).carryingCleanup(from: snapshot,geometry: solution)
-                try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                // 几何写入中断后禁止盲目重试，避免再次叠加旋转或裁切。
-                let roles = try await services.extract(saved)
-                try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                // 写回后坐标原点已随裁切移动；将增量角度归零，防止下一次确认重复旋转。
-                var currentFit = solution
-                currentFit.sourceVersion = saved.contentVersion; currentFit.angleDegrees = 0
-                currentFit.rotationPivot = CGPoint(x: roles.cropViewport.midX,y: roles.cropViewport.midY)
-                currentFit.subjectBounds = solution.subjectBounds.offsetBy(dx: -solution.sourceCropRect.minX,dy: -solution.sourceCropRect.minY)
-                currentFit.sourceCropRect = roles.cropViewport; currentFit.outputSize = roles.cropViewport.size
-                guard saved.pixelSize == solution.outputSize, roles.snapshotVersion == saved.contentVersion else { throw WorkflowBridgeError.invalidStructure }
-                currentFit = try await services.validateGeometry(roles,currentFit)
-                try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-                try mutateTask(batchID,id) {
-                    $0.snapshot = saved; $0.roleImages = roles; $0.geometrySolution = currentFit
-                    $0.geometryApplySourceVersion = nil; $0[.geometry].outputVersion = saved.contentVersion
-                    $0[.geometry].revision += 1
-                }
-                expected[id] = try task(batchID,id)
-                try await persist(batchID)
-                try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-            } catch {
-                await pause(batchID: batchID)
-                throw error
-            }
-        }
-        try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-        let value = try batch(batchID: batchID)
-        var versions: [UUID: String] = [:]
-        for id in solutions.keys {
-            guard let version = value.task(id: id)?[.geometry].outputVersion else { throw WorkflowStateError.staleVersion }
-            versions[id] = version
-        }
-        try reduce(batchID,.confirmSelected(specimenIDs: ids,stage: .geometry,outputVersions: versions,expectedRevision: value.revision))
-        expected = try Dictionary(uniqueKeysWithValues: solutions.keys.map { ($0,try task(batchID,$0)) })
-        try await persist(batchID)
-        try checkSelection(batchID,expected,stage: .geometry,presets: presets)
-    }
-
-    func confirm4K(batchID: UUID, layouts: [UUID: SquareLayout]) async throws {
-        guard batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
-            throw WorkflowBridgeError.manualReviewActive
-        }
-        guard try batch(batchID: batchID).exportDirectory(for: .png4k) != nil else {
-            throw WorkflowBridgeError.invalidImage("请先选择 PNG4K 输出文件夹")
-        }
-        guard !confirming.contains(batchID), !running.contains(batchID) else { throw WorkflowStateError.invalidTransition }
-        confirming.insert(batchID); defer { confirming.remove(batchID) }
-        try await prepare4KExport(batchID: batchID, layouts: layouts)
-        try await runStages(batchID: batchID)
-    }
-
-    private func prepare4KExport(batchID: UUID, layouts: [UUID: SquareLayout]) async throws {
-        _ = try selectedSpecimens(batchID,sideIDs: Set(layouts.keys),stage: .png4k)
-        guard manual[batchID] == nil, !(try batch(batchID: batchID)).isPaused else { throw WorkflowStateError.invalidTransition }
-        let presets = try batch(batchID: batchID).presets
-        var expected = try Dictionary(uniqueKeysWithValues: layouts.keys.map { ($0,try task(batchID,$0)) })
-        for layout in layouts.values {
-            guard layout.canvasSide == 4096, layout.safeMargin >= 0, layout.safeMargin < 2048,
-                  layout.center.x.isFinite, layout.center.y.isFinite else { throw WorkflowStateError.invalidTransition }
-        }
-        for id in layouts.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
-            _ = try await readCurrentRoles(batchID,expected[id]!,stage: .png4k)
-            try checkSelection(batchID,expected,stage: .png4k,presets: presets)
-        }
-        try checkSelection(batchID,expected,stage: .png4k,presets: presets)
-        for (id,layout) in layouts {
-            try invalidateOutputs(batchID,id,from: .png4k)
-            if try batch(batchID: batchID).manualFinalization == true {
-                try mutateTask(batchID,id) { task in
-                    if task[.hd].state == .failed { task[.hd].state = .pending; task[.hd].error = nil; task[.hd].revision += 1 }
-                }
-            }
-            try mutateTask(batchID,id) {
-                $0.squareLayout = layout; $0.fourKExportRequested = true
-                $0[.png4k].state = .pending; $0[.png4k].confirmedVersion = nil; $0[.png4k].revision += 1
-            }
-            expected[id] = try task(batchID,id)
-        }
-        try await persist(batchID)
-        do { try checkSelection(batchID,expected,stage: .png4k,presets: presets) }
-        catch {
-            for (id,authorized) in expected {
-                let current = try task(batchID,id)
-                if current[.png4k].revision == authorized[.png4k].revision, current.fourKExportRequested == true {
-                    try mutateTask(batchID,id) { $0.fourKExportRequested = nil }
-                }
-            }
-            try await persist(batchID)
-            throw error
-        }
-    }
-
-    func retry(batchID: UUID, specimenIDs: [UUID], stage: WorkflowStage) async throws {
-        guard batchReviewLeases[batchID] == nil, !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
-            throw WorkflowBridgeError.manualReviewActive
-        }
-        let value = try batch(batchID: batchID)
-        guard WorkflowStage.processingStages.contains(stage), !specimenIDs.isEmpty, Set(specimenIDs).isSubset(of: Set(value.specimens.filter { !$0.isExcluded }.map(\.id))) else { throw WorkflowStateError.invalidTransition }
-        let stages: [WorkflowStage] = value.manualFinalization == true && stage == .png4k ? [.hd,.png4k] : [stage]
-        for specimen in value.specimens where specimenIDs.contains(specimen.id) {
-            for side in [specimen.front,specimen.back] {
-                for retryStage in stages where side[retryStage].state == .failed {
-                    guard side.geometryApplySourceVersion == nil else { throw WorkflowStateError.invalidTransition }
-                    try mutateTask(batchID,side.id) { $0[retryStage].state = .pending; $0[retryStage].error = nil; $0[retryStage].revision += 1 }
-                }
-            }
-        }
-        try await persist(batchID); try await runPending(batchID: batchID)
-    }
-
-    // MARK: - 单面阶段执行与失败记录
     private func execute(_ batchID: UUID, _ id: UUID, stage: WorkflowStage) async throws {
         try Task.checkCancellation()
         let value = try batch(batchID: batchID)
@@ -884,7 +542,7 @@ actor WorkflowExecutor {
                 let value = try batch(batchID: batchID)
                 let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
                 if before.stackAttemptURL == nil {
-                    let attempt = before.sources.isPSD && value.manualFinalization != true ? before.sources.first.url : value.generatedPSDDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
+                    let attempt = value.generatedPSDDirectory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).psd")
                     try value.validateOutputURL(attempt)
                     try mutateTask(batchID,id) { $0.stackAttemptURL = attempt }; try await persist(batchID)
                     before = try task(batchID,id)
@@ -896,7 +554,10 @@ actor WorkflowExecutor {
                     guard let adopt = services.adoptStack else { throw WorkflowStateError.invalidTransition }
                     let source = before.sources.first
                     guard try AIFileValidation.hash(source.url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
-                    if url != source.url {
+                    guard url.resolvingSymlinksInPath().standardizedFileURL != source.url.resolvingSymlinksInPath().standardizedFileURL else {
+                        throw WorkflowBridgeError.ownershipConflict
+                    }
+                    do {
                         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),withIntermediateDirectories: true)
                         if FileManager.default.fileExists(atPath: url.path) {
                             // 重试只能恢复已有归属凭据的工作文件，内容相同不构成认领授权。
@@ -907,8 +568,6 @@ actor WorkflowExecutor {
                             guard try AIFileValidation.hash(url.path) == source.fingerprint else { throw WorkflowBridgeError.staleSource }
                             saved = try await adopt(WorkflowSourceFile(url: url,fingerprint: source.fingerprint),id)
                         }
-                    } else {
-                        saved = try await adopt(source,id)
                     }
                 } else if FileManager.default.fileExists(atPath: url.path) {
                     saved = try await services.refresh(url,id,before.sources.files)
@@ -921,7 +580,7 @@ actor WorkflowExecutor {
                 }
                 try check(batchID,before,stage: stage)
                 guard saved.taskID == id, saved.workingURL == url else { throw WorkflowBridgeError.ownershipConflict }
-                try mutateTask(batchID,id) { $0.snapshot = saved; $0.stackPNG = nil; if $0.checkpoints == nil { $0.checkpoints = [:] }; $0.checkpoints?[.stack] = saved }; output = saved.contentVersion
+                try mutateTask(batchID,id) { $0.snapshot = saved; if $0.checkpoints == nil { $0.checkpoints = [:] }; $0.checkpoints?[.stack] = saved }; output = saved.contentVersion
             case .matte:
                 guard let snapshot = before.snapshot else { throw WorkflowStateError.invalidTransition }
                 let saved: PSDSnapshot
@@ -933,7 +592,7 @@ actor WorkflowExecutor {
                 }
                 try check(batchID,before,stage: stage)
                 guard saved.roles?.isValid == true else { throw WorkflowBridgeError.invalidStructure }
-                try mutateTask(batchID,id) { $0.snapshot = saved; $0.stackPNG = nil; $0.matteArtifact = nil; $0.manualAdoptionRequired = false; if $0.checkpoints == nil { $0.checkpoints = [:] }; $0.checkpoints?[.matte] = saved }
+                try mutateTask(batchID,id) { $0.snapshot = saved; $0.manualAdoptionRequired = false; if $0.checkpoints == nil { $0.checkpoints = [:] }; $0.checkpoints?[.matte] = saved }
                 output = saved.contentVersion
             case .geometry:
                 guard let saved = before.snapshot else { throw WorkflowStateError.invalidTransition }
@@ -946,28 +605,10 @@ actor WorkflowExecutor {
                 let roles = try await services.extract(saved)
                 try check(batchID,before,stage: stage)
                 guard roles.snapshotVersion == saved.contentVersion else { throw WorkflowStateError.staleVersion }
-                if before.geometryRevalidationRequired, var candidate = before.geometrySolution {
-                    // 已保存 PSD 已包含此前的几何变换，此处只重新校验当前构图适配性。
-                    candidate.sourceVersion = saved.contentVersion; candidate.angleDegrees = 0
-                    candidate.rotationPivot = CGPoint(x: roles.cropViewport.midX,y: roles.cropViewport.midY)
-                    candidate.sourceCropRect = roles.cropViewport; candidate.outputSize = roles.cropViewport.size
-                    do { candidate = try await services.validateGeometry(roles,candidate) }
-                    catch { candidate.isApplicable = false; candidate.reason = error.localizedDescription }
-                    solution = candidate
-                } else if before.lastPSDChange == .geometry {
-                    var candidate = before.geometrySolution ?? GeometrySolution(sourceVersion: saved.contentVersion,angleDegrees: 0,
-                        rotationPivot: CGPoint(x: roles.cropViewport.midX,y: roles.cropViewport.midY),subjectBounds: roles.cropViewport,
-                        sourceCropRect: roles.cropViewport,outputSize: roles.cropViewport.size,
-                        actualMargins: WorkflowMargins(left: 0,top: 0,right: 0,bottom: 0),isApplicable: true)
-                    candidate.sourceVersion = saved.contentVersion; candidate.angleDegrees = 0
-                    candidate.sourceCropRect = roles.cropViewport; candidate.outputSize = roles.cropViewport.size
-                    do { candidate = try await services.validateGeometry(roles,candidate) }
-                    catch { candidate.isApplicable = false; candidate.reason = error.localizedDescription }
-                    solution = candidate
-                } else { solution = try await services.analyze(roles,before.geometryRequest) }
+                solution = try await services.analyze(roles,before.geometryRequest)
                 }
                 try check(batchID,before,stage: stage)
-                if try batch(batchID: batchID).manualFinalization == true,solution.isApplicable {
+                if solution.isApplicable {
                     try mutateTask(batchID,id) { $0.geometryApplySourceVersion = saved.contentVersion; $0.geometrySolution = solution }
                     try await persist(batchID)
                     let apply = services.apply
@@ -995,21 +636,15 @@ actor WorkflowExecutor {
                     let roles = try await services.extract(saved)
                     try check(batchID,before,stage: stage)
                     try mutateTask(batchID,id) { $0.roleImages = roles; $0.geometrySolution = solution }
-                    if try batch(batchID: batchID).manualFinalization == true, !solution.isApplicable {
+                    if !solution.isApplicable {
                         throw WorkflowBridgeError.invalidImage(solution.reason ?? "无法可靠应用矫正，请在 PS 检查后采用当前姿态")
                     }
                     output = saved.contentVersion
                 }
-            case .hd:
-                if before.requestedExports?[.hd] != nil { output = try await asset(batchID,id,kind: .hd).fileFingerprint }
-                else if before.exportHD == false { output = "not-selected" }
-                else {
-                    guard before.exportHD == true else { throw WorkflowStateError.invalidTransition }
-                    output = try await asset(batchID,id,kind: .hd).fileFingerprint
-                }
-            case .png4k:
-                if before.requestedExports?[.png4k] != nil || before.fourKExportRequested == true { output = try await asset(batchID,id,kind: .png4k).fileFingerprint }
-                else { output = try Self.fingerprint([before.snapshot?.contentVersion ?? "",Self.encoded(before.squareLayout)]) }
+            case .hd, .png4k:
+                let kind: WorkflowAssetKind = stage == .hd ? .hd : .png4k
+                guard before.requestedExports?[kind] != nil else { throw WorkflowStateError.invalidTransition }
+                output = try await asset(batchID,id,kind: kind).fileFingerprint
             case .derivatives:
                 throw WorkflowStateError.invalidTransition
             }
@@ -1087,19 +722,13 @@ actor WorkflowExecutor {
             guard request.snapshotVersion == before.snapshot?.contentVersion, request.directory == directory,
                   before[.geometry].confirmedVersion == request.snapshotVersion else { throw WorkflowStateError.staleVersion }
         }
-        let roles: RoleImages
-        if value.manualFinalization == true { roles = try await readCurrentRoles(batchID,before,stage: stage) }
-        else {
-            guard let cached = before.roleImages, cached.snapshotVersion == before.snapshot?.contentVersion else { throw WorkflowStateError.staleVersion }
-            roles = cached
-        }
+        let roles = try await readCurrentRoles(batchID,before,stage: stage)
         let source: String
         if kind == .hd { source = try Self.fingerprint([roles.snapshotVersion,try await services.contentFingerprint(roles)]) }
-        else if value.manualFinalization == true {
+        else {
             // 同一 PSD 升级选层规则后也必须更新成品，不能恢复旧 Keying_Level 的发布凭据。
             source = try Self.fingerprint([roles.snapshotVersion,"final-top-layer-v1",Self.encoded(before.snapshot?.finalRoles),Self.encoded(before.geometrySolution)])
         }
-        else { source = try Self.fingerprint([roles.snapshotVersion,Self.encoded(before.geometrySolution)]) }
         let preset = try presetFingerprint(kind,batch: value,task: before)
         let specimen = value.specimens.first { $0.front.id == id || $0.back.id == id }!
         let url = directory.appendingPathComponent("\(specimen.baseName)_\(before.side.fileSuffix).\(kind == .hd ? "jpg" : "png")")
@@ -1108,7 +737,7 @@ actor WorkflowExecutor {
         try check(batchID,before,stage: stage)
         if request?.policy != .overwrite, let existing = before.artifacts.last(where: { Self.sameRecipe($0,recipe) && $0.state == .completed }),
            let recovered = try services.recover(existing) {
-            if value.manualFinalization == true { _ = try await readCurrentRoles(batchID,before,stage: stage) }
+            _ = try await readCurrentRoles(batchID,before,stage: stage)
             try check(batchID,before,stage: stage)
             if request != nil { try mutateTask(batchID,id) { $0.exportNotes?[kind] = "当前版本已导出，已跳过" } }
             return recovered
@@ -1117,13 +746,15 @@ actor WorkflowExecutor {
         if !before.artifacts.contains(where: { Self.sameRecipe($0,recipe) }) {
             try mutateTask(batchID,id) { $0.artifacts.append(recipe) }; try await persist(batchID)
         }
+        try check(batchID,before,stage: stage)
+        try batch(batchID: batchID).validateArtifactURL(url, kind: kind)
         let recovered = try services.recover(recipe)
         if request?.policy == .skipExisting, recovered == nil, FileManager.default.fileExists(atPath: url.path) {
             throw ExportOutcome.skippedOutdated(kind)
         }
         if let recovered, request?.policy != .overwrite {
             if request != nil { try mutateTask(batchID,id) { $0.exportNotes?[kind] = "当前版本已导出，已跳过" } }
-            if value.manualFinalization == true { _ = try await readCurrentRoles(batchID,before,stage: stage) }
+            _ = try await readCurrentRoles(batchID,before,stage: stage)
             try check(batchID,before,stage: stage)
             try recordArtifact(batchID,id,recovered); try await persist(batchID); return recovered
         }
@@ -1139,11 +770,16 @@ actor WorkflowExecutor {
             guard try presetFingerprint(kind,batch: latest,task: current) == preset,
                   current.artifacts.contains(where: { Self.sameRecipe($0,recipe) }) else { throw WorkflowStateError.staleVersion }
             try latest.validateArtifactURL(url, kind: kind); try latest.validateOutputURL(temp)
-            if value.manualFinalization == true {
+            do {
                 let verified = try await readCurrentRoles(batchID,before,stage: stage)
                 guard verified == roles else { throw WorkflowStateError.staleVersion }
                 try check(batchID,before,stage: stage)
             }
+            // 最后一次异步读取结束后同步复查路径，避免等待期间链接替换绕过发布边界。
+            try check(batchID,before,stage: stage)
+            let publishing = try batch(batchID: batchID)
+            try publishing.validateArtifactURL(url, kind: kind)
+            try publishing.validateOutputURL(temp)
             // 版本校验与发布之间没有 await，避免 actor 重入后发布过时内容。
             let result: WorkflowArtifact
             do {
@@ -1160,22 +796,6 @@ actor WorkflowExecutor {
         }
     }
 
-    private func finish4KIntents(_ batchID: UUID) async throws {
-        let value = try batch(batchID: batchID)
-        guard !value.isPaused else { return }
-        let selected = value.specimens.filter { !$0.isExcluded && [$0.front,$0.back].allSatisfy { task in
-            task.fourKExportRequested == true && task[.png4k].state == .waitingReview &&
-            task.artifacts.contains { artifact in artifact.kind == .png4k && artifact.state == .completed && artifact.fileFingerprint == task[.png4k].outputVersion }
-        } }
-        guard !selected.isEmpty else { return }
-        let tasks = selected.flatMap { [$0.front,$0.back] }
-        let versions = Dictionary(uniqueKeysWithValues: tasks.map { ($0.id,$0[.png4k].outputVersion!) })
-        try reduce(batchID,.confirmSelected(specimenIDs: Set(selected.map(\.id)),stage: .png4k,outputVersions: versions,expectedRevision: value.revision))
-        for task in tasks { try mutateTask(batchID,task.id) { $0.fourKExportRequested = false } }
-        try await persist(batchID)
-    }
-
-    // MARK: - 版本约束与持久化
     private func readCurrentRoles(_ batchID: UUID, _ before: WorkflowSideTask, stage: WorkflowStage) async throws -> RoleImages {
         guard let snapshot = before.snapshot, before.pendingFinalPSD == nil else { throw WorkflowStateError.invalidTransition }
         if let accepted = before.acceptedFinalPSD { try verifyAcceptedFiles(accepted, batchID: batchID) }
@@ -1186,44 +806,12 @@ actor WorkflowExecutor {
         try mutateTask(batchID,before.id) { $0.roleImages = roles }
         return roles
     }
-    private func selectedSpecimens(_ batchID: UUID, sideIDs: Set<UUID>, stage: WorkflowStage) throws -> Set<UUID> {
-        let value = try batch(batchID: batchID)
-        let selected = value.specimens.filter { sideIDs.contains($0.front.id) || sideIDs.contains($0.back.id) }
-        let tasks = selected.flatMap { [$0.front,$0.back] }
-        guard !selected.isEmpty, selected.allSatisfy({ !$0.isExcluded }), Set(tasks.map(\.id)) == sideIDs,
-              tasks.allSatisfy({ ($0[stage].state == .waitingReview || (value.manualFinalization == true && stage == .png4k && $0[stage].state == .failed) || ($0[stage].state == .completed && $0[stage].confirmedVersion == $0[stage].outputVersion)) && $0.snapshot != nil && $0.roleImages?.snapshotVersion == $0.snapshot?.contentVersion }) else {
-            throw WorkflowStateError.invalidTransition
-        }
-        return Set(selected.map(\.id))
-    }
     private func eligible(_ task: WorkflowSideTask, stage: WorkflowStage, batch: WorkflowBatch) -> Bool {
         if let kind = [WorkflowAssetKind.hd, .png4k].first(where: { $0.stage == stage }), task.requestedExports?[kind] != nil {
             return !batch.isPaused && task[.geometry].state == .completed
         }
-        if batch.manualFinalization == true, [.hd,.png4k].contains(stage), task.fourKExportRequested != true { return false }
-        if stage == .hd && task.exportHD != false && batch.exportDirectory(for: .hd) == nil { return false }
-        if batch.manualFinalization == true && stage == .hd && task.fourKExportRequested != true { return false }
-        guard !batch.isPaused, WorkflowStage.processingStages.prefix(while: { $0 != stage }).allSatisfy({
-            (batch.manualFinalization == true && stage == .png4k && $0 == .hd && task.fourKExportRequested != true) || task[$0].state == .completed
-        }) else { return false }
-        if batch.manualFinalization != true {
-            if stage != .stack, !batch.activeTasks.allSatisfy({ $0[.stack].state == .completed }) { return false }
-            if stage != .stack && stage != .matte, !batch.activeTasks.allSatisfy({ $0[.matte].state == .completed }) { return false }
-        }
-        return true
-    }
-    private func checkSelection(_ batchID: UUID, _ expected: [UUID: WorkflowSideTask], stage: WorkflowStage, presets: WorkflowPresets, allowPaused: Bool = false) throws {
-        guard try batch(batchID: batchID).presets == presets else { throw WorkflowStateError.staleVersion }
-        for (id,before) in expected {
-            try check(batchID,before,stage: stage,allowPaused: allowPaused)
-            let current = try task(batchID,id)
-            guard current[stage] == before[stage], current.stackAttemptURL == before.stackAttemptURL,
-                  current.geometryApplySourceVersion == before.geometryApplySourceVersion,
-                  current.exportHD == before.exportHD, current.fourKExportRequested == before.fourKExportRequested,
-                  current.geometrySolution == before.geometrySolution, current.squareLayout == before.squareLayout else {
-                throw WorkflowStateError.staleVersion
-            }
-        }
+        guard !batch.isPaused, ![WorkflowStage.hd, .png4k, .derivatives].contains(stage) else { return false }
+        return WorkflowStage.processingStages.prefix(while: { $0 != stage }).allSatisfy { task[$0].state == .completed }
     }
     // 每次跨越异步服务后重检来源、阶段修订与快照，拒绝暂停、排除或编辑前启动的旧结果。
     private func check(_ batchID: UUID, _ before: WorkflowSideTask, stage: WorkflowStage, allowPaused: Bool = false) throws {
@@ -1264,7 +852,6 @@ actor WorkflowExecutor {
             task[stage].outputVersion = nil; task[stage].confirmedVersion = nil; task[stage].error = nil
         }
         for index in task.artifacts.indices where stages.contains(task.artifacts[index].kind.stage) { task.artifacts[index].state = .pending }
-        if stages.contains(.png4k) { task.fourKExportRequested = nil }
     }
     private func recordArtifact(_ batchID: UUID, _ id: UUID, _ artifact: WorkflowArtifact) throws {
         try mutateTask(batchID,id) { task in
@@ -1274,13 +861,9 @@ actor WorkflowExecutor {
     }
     private func presetFingerprint(_ kind: WorkflowAssetKind, batch: WorkflowBatch, task: WorkflowSideTask) throws -> String {
         let preset: WorkflowPreset
-        switch kind { case .hd: preset = batch.presets.hd; case .png4k: preset = batch.presets.png4k; case .xianyu: preset = batch.presets.xianyu; case .white1k: preset = batch.presets.white1k; case .footage: preset = batch.presets.footage }
+        switch kind { case .hd: preset = batch.presets.hd; case .png4k: preset = batch.presets.png4k; default: throw WorkflowStateError.invalidTransition }
         var parts = [preset.fingerprint,String(preset.version)]
         if kind == .png4k { parts.append(try Self.encoded(task.squareLayout)) }
-        if kind == .xianyu {
-            if let url = batch.watermarkURL { parts.append((try? AIFileValidation.hash(url.path)) ?? "unreadable-watermark") }
-            else { parts.append("missing-watermark") }
-        }
         return Self.fingerprint(parts)
     }
     private nonisolated static func sameRecipe(_ a: WorkflowArtifact, _ b: WorkflowArtifact) -> Bool {
@@ -1473,7 +1056,7 @@ extension WorkflowExecutor {
 
     private func reviewTasks(_ batch: WorkflowBatch, ids: Set<UUID>) throws -> [WorkflowSideTask] {
         let selected = batch.activeTasks.filter { ids.contains($0.id) }
-        guard batch.manualFinalization == true, !ids.isEmpty, selected.count == ids.count,
+        guard !ids.isEmpty, selected.count == ids.count,
               selected.allSatisfy({ $0.snapshot?.taskID == $0.id && $0[.stack].state == .completed &&
                   $0[.matte].state == .completed && [.waitingReview, .completed].contains($0[.geometry].state) &&
                   $0.geometryApplySourceVersion == nil && $0.manualAdoptionRequired != true }) else {
@@ -1601,18 +1184,18 @@ extension WorkflowExecutor {
                 return
             }
             let changedVersion = side.finalPSDVersion != version.hash
-            side.acceptedFinalPSD = receipt; side.finalPreparationError = nil; side.roleImages = nil
+            side.acceptedFinalPSD = receipt; side.finalPreparationError = nil; side.roleImages = nil; side.intermediatesCleared = false
             side[.geometry].state = .completed; side[.geometry].outputVersion = version.hash
             side[.geometry].confirmedVersion = version.hash; side[.geometry].error = nil; side[.geometry].revision += 1
             if changedVersion {
-                side.geometrySolution = nil; side.geometryRevalidationRequired = false; side.lastPSDChange = nil
+                side.geometrySolution = nil
                 side.squareLayout = .png4k
                 for stage in [WorkflowStage.hd, .png4k] {
                     side[stage].state = .pending; side[stage].outputVersion = nil; side[stage].confirmedVersion = nil
                     side[stage].error = nil; side[stage].revision += 1
                 }
                 for i in side.artifacts.indices { side.artifacts[i].state = .pending }
-                side.fourKExportRequested = nil; side.exportHD = nil; side.requestedExports = nil
+                side.requestedExports = nil
                 side.exportNotes = Dictionary(side.artifacts.map { ($0.kind, "PSD 已更新，待重新导出") },
                                               uniquingKeysWith: { _, latest in latest })
             }
@@ -1651,8 +1234,17 @@ extension WorkflowExecutor {
         guard before[.geometry].confirmedVersion == expectedVersion, before.finalPSDVersion == expectedVersion else {
             throw WorkflowStateError.staleVersion
         }
-        guard let accepted = before.acceptedFinalPSD else { return }
+        guard let accepted = before.acceptedFinalPSD else { throw WorkflowStateError.invalidTransition }
         do {
+            if before.intermediatesCleared {
+                let value = try batch(batchID: batchID)
+                try value.validateOutputURL(accepted.workingURL)
+                try value.validateAcceptedFinalURL(accepted.snapshotURL, taskID: before.id, contentVersion: expectedVersion)
+                try verifyReviewOwnership(accepted.workingURL, before.id)
+                let version = try Self.reviewFileVersion(accepted.workingURL)
+                guard version.hash == accepted.contentVersion else { throw WorkflowBridgeError.staleSource }
+                try Self.copyReviewVersion(accepted.workingURL, to: accepted.snapshotURL, version: version)
+            }
             try verifyAcceptedFiles(accepted, batchID: batchID)
             guard before.pendingFinalPSD != nil else {
                 if before.finalPreparationError != nil {
@@ -1673,7 +1265,7 @@ extension WorkflowExecutor {
             try verifyAcceptedFiles(accepted, batchID: batchID)
             try Task.checkCancellation()
             try mutateTask(batchID, before.id) {
-                $0.snapshot = snapshot; $0.roleImages = roles; $0.finalPreparationError = nil
+                $0.snapshot = snapshot; $0.roleImages = roles; $0.finalPreparationError = nil; $0.intermediatesCleared = false
             }
             try await persist(batchID)
         } catch is CancellationError { throw CancellationError() }
@@ -1683,6 +1275,82 @@ extension WorkflowExecutor {
                 try await persist(batchID)
             }
             throw error
+        }
+    }
+
+    // MARK: - 整批导出后的中转清理
+    private func cleanIntermediatesAfterExport(_ batchID: UUID) async {
+        guard let before = batches[batchID], before.allSucceeded, !before.isPaused,
+              !pauseRequests.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
+              !acquiringManual.contains(batchID), !preparingFinal.contains(batchID), !confirming.contains(batchID),
+              !reprocessing.contains(batchID), !cleaningIntermediates.contains(batchID),
+              before.sideTasks.allSatisfy({ $0.manualEdit == nil }), let manifest = manifests[batchID] else { return }
+        cleaningIntermediates.insert(batchID); defer { cleaningIntermediates.remove(batchID) }
+        var deletionStarted = false
+        do {
+            let directory = try WorkflowIntermediateCleanup.directory(batch: before, manifest: manifest, storageRoot: intermediateStorageRoot)
+            try verifyCleanupDeliverables(before)
+            try edit(batchID) { batch in
+                batch.intermediateCleanupError = nil
+                for index in batch.specimens.indices {
+                    for side in WorkflowSide.allCases {
+                        var task = side == .front ? batch.specimens[index].front : batch.specimens[index].back
+                        task.roleImages = nil; task.checkpoints = nil
+                        task.snapshot?.cleanupReportURL = nil; task.snapshot?.cleanupReportFingerprint = nil
+                        task.snapshot?.cleanupAlgorithmVersion = nil; task.snapshot?.cleanupSnapshotVersion = nil; task.snapshot?.cleanupGeometry = nil
+                        task.intermediatesCleared = task.acceptedFinalPSD != nil
+                        if side == .front { batch.specimens[index].front = task } else { batch.specimens[index].back = task }
+                    }
+                }
+            }
+            let revision = try batch(batchID: batchID).revision
+            // 两份清单都承认缓存将被删除，损坏回退不会误把旧缓存声明为有效。
+            try await persist(batchID)
+            try await persist(batchID)
+            let current = try batch(batchID: batchID)
+            guard current.revision == revision, cleaningIntermediates.contains(batchID), current.allSucceeded,
+                  !pauseRequests.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
+                  !acquiringManual.contains(batchID), !preparingFinal.contains(batchID), !confirming.contains(batchID) else {
+                throw WorkflowStateError.staleVersion
+            }
+            try verifyCleanupDeliverables(current)
+            guard try WorkflowIntermediateCleanup.directory(batch: current, manifest: manifest, storageRoot: intermediateStorageRoot) == directory else {
+                throw WorkflowStateError.staleVersion
+            }
+            for url in [manifest, manifest.appendingPathExtension("previous")] {
+                let recorded = try JSONDecoder().decode(WorkflowBatch.self, from: Data(contentsOf: url))
+                guard recorded == current else { throw WorkflowStateError.staleVersion }
+            }
+            if FileManager.default.fileExists(atPath: directory.path) {
+                deletionStarted = true
+                try services.removeIntermediates(directory)
+            }
+        } catch {
+            // 清理是成功导出的后续工作，保存或删除失败不能改写成品阶段为失败。
+            if let latest = batches[batchID] {
+                var value = deletionStarted ? latest : before
+                value.intermediateCleanupError = "成品已导出，中转清理未完成：" + error.localizedDescription
+                value.revision = latest.revision + 1
+                if pauseRequests.contains(batchID) { value.isPaused = true }
+                batches[batchID] = value
+                try? await persist(batchID)
+            }
+        }
+    }
+
+    private func verifyCleanupDeliverables(_ batch: WorkflowBatch) throws {
+        for task in batch.activeTasks {
+            guard let accepted = task.acceptedFinalPSD else { throw WorkflowStateError.invalidTransition }
+            try batch.validateOutputURL(accepted.workingURL)
+            try verifyReviewOwnership(accepted.workingURL, task.id)
+            guard try Self.reviewFileVersion(accepted.workingURL).hash == accepted.contentVersion else { throw WorkflowBridgeError.staleSource }
+            for kind in batch.selectedExportKinds {
+                guard let artifact = task.artifacts.last(where: { $0.kind == kind && $0.state == .completed && $0.fileFingerprint == task[kind.stage].outputVersion }) else {
+                    throw WorkflowArtifactError.invalidArtifact
+                }
+                try batch.validateArtifactURL(artifact.url, kind: kind)
+                try services.verifyPublishedArtifact(artifact)
+            }
         }
     }
 

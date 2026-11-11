@@ -43,7 +43,8 @@ python3 scripts/version.py check
 | --- | --- |
 | 逐面处理 | [WorkflowPerImageTests](<../Butterfly ToolkitTests/WorkflowPerImageTests.swift>) 覆盖逐面顺序、失败隔离、安全暂停、人工接管、单面确认、重跑和独立导出。 |
 | 批量精修与定稿 | [WorkflowFinalizationTests](<../Butterfly ToolkitTests/WorkflowFinalizationTests.swift>) 覆盖多文档分别保存关闭、打开观察与重启恢复、接收凭据、延后角色准备、导出版本冻结和已确认面重新处理。 |
-| 状态和文件 | [WorkflowStateTests](<../Butterfly ToolkitTests/WorkflowStateTests.swift>)、[WorkflowOutputTests](<../Butterfly ToolkitTests/WorkflowOutputTests.swift>)、[WorkflowPSDImportTests](<../Butterfly ToolkitTests/WorkflowPSDImportTests.swift>) 覆盖状态、清单、输出目录、PSD 配对及保护。 |
+| 状态和文件 | [WorkflowStateTests](<../Butterfly ToolkitTests/WorkflowStateTests.swift>)、[WorkflowOutputTests](<../Butterfly ToolkitTests/WorkflowOutputTests.swift>)、[WorkflowPSDImportTests](<../Butterfly ToolkitTests/WorkflowPSDImportTests.swift>)、[WorkflowPSDLocationTests](<../Butterfly ToolkitTests/WorkflowPSDLocationTests.swift>) 覆盖当前清单恢复、拒绝旧清单且不改写文件、三个默认子目录、同名隔离、符号链接边界和 PSD 原件保护。 |
+| 导出后清理 | [WorkflowIntermediateCleanupTests](<../Butterfly ToolkitTests/WorkflowIntermediateCleanupTests.swift>) 使用独立临时存储根，覆盖整批所选格式成功后清理、部分／失败保留、其它批次保护、清单与删除失败、缓存重建及再次精修导出。 |
 | Photoshop 桥接 | [WorkflowBridgeTests](<../Butterfly ToolkitTests/WorkflowBridgeTests.swift>) 与 [WorkflowDocumentSessionTests](<../Butterfly ToolkitTests/WorkflowDocumentSessionTests.swift>) 覆盖角色、同一工作文档、独立快照读回、归属、未保存保护和写入恢复。 |
 | 预览与几何 | [WorkflowPreviewTests](<../Butterfly ToolkitTests/WorkflowPreviewTests.swift>)、[WorkflowGeometryCacheTests](<../Butterfly ToolkitTests/WorkflowGeometryCacheTests.swift>)、[MaskGeometryProcessorTests](<../Butterfly ToolkitTests/MaskGeometryProcessorTests.swift>) 覆盖确认门槛、缓存、翅顶、主体和坐标。 |
 | 渲染与发布 | [WorkflowAssetRendererTests](<../Butterfly ToolkitTests/WorkflowAssetRendererTests.swift>) 覆盖 ICC、Alpha、布局、归属凭据、原子发布与历史版本。 |

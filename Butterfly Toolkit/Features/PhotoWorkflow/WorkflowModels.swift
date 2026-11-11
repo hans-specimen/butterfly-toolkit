@@ -7,20 +7,12 @@ import Darwin
 // MARK: - 阶段与固定源映射
 nonisolated enum WorkflowStage: String, Codable, CaseIterable, Sendable {
     case stack, matte, geometry, hd, png4k, derivatives
-    // 保留旧派生阶段以兼容清单解码，但不再将其纳入处理流程。
     static let processingStages: [Self] = [.stack, .matte, .geometry, .hd, .png4k]
-}
-
-nonisolated enum WorkflowMatteProvider: String, Codable, CaseIterable, Sendable {
-    case photoshop, aiEngine
-    var title: String { self == .photoshop ? "Photoshop 智能识别" : "AI 引擎" }
 }
 
 nonisolated enum WorkflowSide: String, Codable, CaseIterable, Sendable {
     case front, back
     var fileSuffix: String { self == .front ? "D" : "V" }
-    // 仅供旧清单定位已保存文件；新生成名称统一使用 D/V。
-    var legacyFileSuffix: String { self == .front ? "F" : "U" }
 }
 
 nonisolated enum WorkflowAssetKind: String, Codable, CaseIterable, Sendable {
@@ -55,7 +47,7 @@ nonisolated struct WorkflowSourceFile: Codable, Equatable, Sendable {
     var fingerprint: String
 }
 
-/// 每面冻结三张照片或一份已合成 PSD，不受队列位置或排除操作影响；可选槽位兼容旧三图清单。
+/// 每面冻结三张照片或一份已合成 PSD，不受队列位置或排除操作影响。
 nonisolated struct WorkflowSources: Codable, Equatable, Sendable {
     var first: WorkflowSourceFile
     var second: WorkflowSourceFile?
@@ -85,13 +77,6 @@ nonisolated struct WorkflowPresets: Codable, Equatable, Sendable {
     var geometry = WorkflowPreset(fingerprint: "geometry-adaptive-margin-0.1-v1")
     var png4k = WorkflowPreset(fingerprint: "square-4096-margin-256-v1")
     var hd = WorkflowPreset(fingerprint: "jpeg-quality-0.82-v1")
-    var xianyu = WorkflowPreset(fingerprint: "xianyu-2000-rgb238-v1")
-    var white1k = WorkflowPreset(fingerprint: "white-1000-margin-10-v1")
-    var footage = WorkflowPreset(fingerprint: "transparent-tight-v1")
-}
-
-nonisolated enum WorkflowPSDChange: String, Codable, Equatable, Sendable {
-    case stackContent, maskOnly, geometry
 }
 
 // MARK: - 单面任务与批次记录
@@ -135,29 +120,23 @@ nonisolated struct WorkflowSideTask: Codable, Equatable, Identifiable, Sendable 
     var records: [WorkflowStage: WorkflowStageRecord] = Dictionary(uniqueKeysWithValues:
         WorkflowStage.allCases.map { ($0, WorkflowStageRecord(stage: $0)) })
     var stackAttemptURL: URL?
-    var exportHD: Bool?
     var checkpoints: [WorkflowStage: PSDSnapshot]?
     var manualAdoptionRequired: Bool?
     var geometryApplySourceVersion: String?
-    var fourKExportRequested: Bool?
     var snapshot: PSDSnapshot?
-    var stackPNG: StackPNG?
-    var matteArtifact: MatteArtifact?
     var geometryRequest: GeometryRequest = GeometryRequest()
     var geometrySolution: GeometrySolution?
-    /// 仅修改蒙版时重新校验已保存候选，不重新估算角度或裁切。
-    var geometryRevalidationRequired: Bool = false
-    var lastPSDChange: WorkflowPSDChange?
     var roleImages: RoleImages?
     var squareLayout: SquareLayout = .png4k
     var artifacts: [WorkflowArtifact] = []
-    var historicalArtifacts: [WorkflowArtifact]?
     var requestedExports: [WorkflowAssetKind: WorkflowExportRequest]?
     var exportNotes: [WorkflowAssetKind: String]?
     var manualEdit: WorkflowManualEdit?
     var manualEditError: String?
     var acceptedFinalPSD: WorkflowAcceptedFinalPSD?
     var finalPreparationError: String?
+    /// 主动清理后只允许从相同归属与哈希的工作 PSD 重建缓存。
+    var intermediatesCleared: Bool = false
 
     var finalPSDVersion: String? { acceptedFinalPSD?.contentVersion ?? snapshot?.contentVersion }
     var pendingFinalPSD: WorkflowAcceptedFinalPSD? {
@@ -190,32 +169,30 @@ nonisolated struct WorkflowOutputLocations: Codable, Equatable, Sendable {
 }
 
 nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
-    var schemaVersion: Int = 2
+    static let currentSchemaVersion = 3
+    var schemaVersion: Int = Self.currentSchemaVersion
     var id: UUID = UUID()
     var sourceDirectory: URL
+    /// 冻结用户选择的名称；真实目录固定后，不再随入口链接重指改变生成位置。
+    var sourceDirectoryName: String
     /// 保存内部批次记录与可恢复的工作数据，不代表用户选择的导出目录。
     var outputDirectory: URL
     var outputLocations: WorkflowOutputLocations?
-    var checkAfterStack: Bool = true
-    var checkAfterMatte: Bool = true
-    var checkGeometry: Bool?
-    var check4K: Bool?
     var specimens: [WorkflowSpecimen]
-    /// nil 保留旧版默认语义；空数组明确表示不选择派生图片。
-    var selectedDerivativeKinds: [WorkflowAssetKind]?
-    var watermarkURL: URL?
     var presets: WorkflowPresets = WorkflowPresets()
     var revision: Int = 0
     var isPaused: Bool = false
-    /// nil 保持旧批次行为；新流程必须经过人工定稿才可导出。
-    var manualFinalization: Bool?
-    /// 缺字段的旧批次继续使用外部引擎及原 PSD 位置。
-    var matteProvider: WorkflowMatteProvider?
-    var psdSubdirectory: Bool?
-    var effectiveMatteProvider: WorkflowMatteProvider { matteProvider ?? .aiEngine }
+    var selectedExportKinds: Set<WorkflowAssetKind> = []
+    var intermediateCleanupError: String?
+    /// 同名批次在建批时固定隔离目录；恢复时不能再根据文件是否存在改变位置。
+    var psdBatchSubdirectory: Bool = false
+    private var sourcePSDDirectory: URL {
+        sourceDirectory.resolvingSymlinksInPath().appendingPathComponent(sourceDirectoryName + "_psd",isDirectory: true)
+    }
     var generatedPSDDirectory: URL {
-        if manualFinalization == true { return outputDirectory.appendingPathComponent("PSD",isDirectory: true) }
-        return psdSubdirectory == true ? sourceDirectory.appendingPathComponent(sourceDirectory.lastPathComponent + "_psd", isDirectory: true) : sourceDirectory
+        return psdBatchSubdirectory
+            ? sourcePSDDirectory.appendingPathComponent("批次-\(id)",isDirectory: true)
+            : sourcePSDDirectory
     }
 
     var sideTasks: [WorkflowSideTask] { specimens.flatMap { [$0.front, $0.back] } }
@@ -240,41 +217,26 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     /// 从各面的持久记录推导阶段，使已确认的部分标本可以独立推进。
     var currentStage: WorkflowStage? {
         let stage = WorkflowStage.processingStages.first { stage in activeTasks.contains { $0[stage].state != .completed } }
-        return manualFinalization == true && stage == .hd ? .png4k : stage
+        return stage == .hd ? .png4k : stage
     }
     var allSucceeded: Bool {
-        if manualFinalization == true {
-            return !activeTasks.isEmpty && activeTasks.allSatisfy { task in
-                task[.geometry].state == .completed && (task.requestedExports ?? [:]).isEmpty &&
-                !task.records.values.contains { $0.state == .failed || $0.state == .running } &&
-                task.artifacts.contains { $0.state == .completed } &&
-                !task.artifacts.contains { $0.state == .pending }
+        !activeTasks.isEmpty && !selectedExportKinds.isEmpty && activeTasks.allSatisfy { task in
+            task[.geometry].state == .completed && (task.requestedExports ?? [:]).allSatisfy { kind, _ in
+                !selectedExportKinds.contains(kind) && task[kind.stage].state == .failed
+            } &&
+            !task.records.values.contains { $0.state == .running } &&
+            [WorkflowStage.stack, .matte, .geometry].allSatisfy { task[$0].state == .completed } &&
+            selectedExportKinds.allSatisfy { kind in
+                task[kind.stage].state == .completed && task.artifacts.contains { $0.kind == kind && $0.state == .completed && $0.fileFingerprint == task[kind.stage].outputVersion }
             }
         }
-        return !specimens.isEmpty && !specimens.contains(where: \.isExcluded) &&
-            sideTasks.allSatisfy { task in WorkflowStage.processingStages.allSatisfy { task[$0].state == .completed } }
     }
     func task(id: UUID) -> WorkflowSideTask? { sideTasks.first { $0.id == id } }
 
-    var hasCheckpoints: Bool { manualFinalization == true || checkAfterStack || checkAfterMatte || checkGeometry != false || check4K != false }
-    func validateStart() throws {
-        if !hasCheckpoints && (exportDirectory(for: .hd) == nil || exportDirectory(for: .png4k) == nil) {
-            throw WorkflowBridgeError.invalidImage("取消全部检查点时，请先选择堆栈原图和 PNG4K 输出文件夹")
-        }
-    }
-
     func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
         if let selected = kind == .hd ? outputLocations?.hd : kind == .png4k ? outputLocations?.png4k : nil { return selected }
-        if manualFinalization == true {
-            guard kind == .hd || kind == .png4k else { return nil }
-            return sourceDirectory.appendingPathComponent(sourceDirectory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
-        }
-        if let outputLocations {
-            return kind == .hd ? outputLocations.hd : kind == .png4k ? outputLocations.png4k : nil
-        }
-        // 旧版清单使用批次目录内的子文件夹。
-        let folders: [WorkflowAssetKind: String] = [.hd: "高清堆栈", .png4k: "png 4k", .xianyu: "闲鱼产品图", .white1k: "1K 白底", .footage: "png 素材"]
-        return outputDirectory.appendingPathComponent(folders[kind]!)
+        guard kind == .hd || kind == .png4k else { return nil }
+        return sourceDirectory.appendingPathComponent(sourceDirectoryName + (kind == .hd ? "_堆栈原图" : "_4K_PNG"), isDirectory: true)
     }
 
     // MARK: - 输出路径与清单校验
@@ -301,8 +263,15 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
 
     private func validateExportRoot(_ kind: WorkflowAssetKind) throws {
+        if let root = exportDirectory(for: kind) {
+            let work = outputDirectory.appendingPathComponent(".work", isDirectory: true)
+            guard root.resolvingSymlinksInPath().standardizedFileURL != work.resolvingSymlinksInPath().standardizedFileURL,
+                  !Self.isContained(root, in: work) else {
+                throw WorkflowStateError.invalidManifest("导出目录不能位于批次中转目录内")
+            }
+        }
         let selected = kind == .hd ? outputLocations?.hd : outputLocations?.png4k
-        if manualFinalization == true, selected == nil, let root = exportDirectory(for: kind),
+        if selected == nil, let root = exportDirectory(for: kind),
            !Self.isContained(root,in: sourceDirectory) {
             throw WorkflowStateError.invalidManifest("默认导出目录不能通过链接指向素材目录之外")
         }
@@ -310,31 +279,47 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
 
     func validateArtifactURL(_ url: URL, kind: WorkflowAssetKind) throws {
         try validateExportRoot(kind)
+        let work = outputDirectory.appendingPathComponent(".work", isDirectory: true)
         guard let root = exportDirectory(for: kind), Self.isContained(url, in: root),
-              manualFinalization == true || outputLocations != nil || Self.isContained(url, in: outputDirectory) else {
+              url.resolvingSymlinksInPath().standardizedFileURL != work.resolvingSymlinksInPath().standardizedFileURL,
+              !Self.isContained(url, in: work) else {
             throw WorkflowStateError.invalidManifest("Export destination escapes its selected directory")
         }
     }
 
     func validateOutputURL(_ url: URL) throws {
-        for kind in [WorkflowAssetKind.hd,.png4k] {
-            if let root = exportDirectory(for: kind), url.standardizedFileURL.path.hasPrefix(root.standardizedFileURL.path + "/") { try validateExportRoot(kind) }
+        // 先验证工作子目录，避免链接借内部记录／导出目录的授权绕过本批次的边界。
+        if url.standardizedFileURL.pathComponents.starts(with: sourcePSDDirectory.standardizedFileURL.pathComponents) {
+            guard isGeneratedPSDURL(url) else { throw WorkflowStateError.invalidManifest("工作 PSD 路径不属于本批次或包含链接") }
+            return
         }
         if Self.isContained(url, in: outputDirectory) { return }
-        if manualFinalization == true || outputLocations != nil {
-            for kind in [WorkflowAssetKind.hd, .png4k] {
-                if let root = exportDirectory(for: kind), Self.isContained(url, in: root) { try validateExportRoot(kind); return }
-            }
-        }
-        // PSD 必须严格使用批次冻结的目录、标本名和正反面后缀。
-        let allowed = specimens.flatMap { specimen in
-            WorkflowSide.allCases.flatMap { side in
-                [side.fileSuffix,side.legacyFileSuffix].map { generatedPSDDirectory.appendingPathComponent("\(specimen.baseName)_\($0).psd") }
-            }
-        }
-        let imported = sideTasks.filter { $0.sources.isPSD }.map { $0.sources.first.url.standardizedFileURL }
-        if Self.isContained(url, in: sourceDirectory), (allowed + imported).contains(url.standardizedFileURL) { return }
+        if isGeneratedPSDURL(url) { return }
         throw WorkflowStateError.invalidManifest("Output destination is outside the batch's authorized locations")
+    }
+
+    /// 工作副本可位于批次隔离或重新处理目录；仅授权本批次的固定文件名，不能放开整个原图目录。
+    private func isGeneratedPSDURL(_ url: URL) -> Bool {
+        let root = sourcePSDDirectory.standardizedFileURL
+        guard Self.isContained(root,in: sourceDirectory),
+              Self.isContained(url,in: root), Self.isContained(url,in: sourceDirectory) else { return false }
+        let components = url.standardizedFileURL.pathComponents
+        guard components.starts(with: root.pathComponents) else { return false }
+        guard let source = Self.canonicalComponents(sourceDirectory),
+              Self.canonicalComponents(url) == source + [sourceDirectoryName + "_psd"] + Array(components.dropFirst(root.pathComponents.count)) else { return false }
+        var relative = Array(components.dropFirst(root.pathComponents.count))
+        guard let name = relative.popLast(), specimens.contains(where: { specimen in
+            WorkflowSide.allCases.contains { side in
+                name == "\(specimen.baseName)_\(side.fileSuffix).psd"
+            }
+        }) else { return false }
+        if psdBatchSubdirectory {
+            guard relative.first == "批次-\(id)" else { return false }
+            relative.removeFirst()
+        }
+        if relative.isEmpty { return true }
+        guard relative.count == 1, relative[0].hasPrefix("重新处理-") else { return false }
+        return UUID(uuidString: String(relative[0].dropFirst("重新处理-".count))) != nil
     }
     private static func isSafeBaseName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -343,12 +328,15 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
     }
 
     func validate() throws {
-        guard schemaVersion == 2, revision >= 0, sourceDirectory.isFileURL, outputDirectory.isFileURL else {
+        guard schemaVersion == Self.currentSchemaVersion, revision >= 0, sourceDirectory.isFileURL, outputDirectory.isFileURL,
+              Self.isSafeBaseName(sourceDirectoryName), sourceDirectory.standardizedFileURL == sourceDirectory.resolvingSymlinksInPath().standardizedFileURL else {
             throw WorkflowStateError.invalidManifest("此批次使用旧流程或清单已损坏，请新建批次；旧文件未作修改")
         }
-        for folder in ["PSD", ".work", "高清堆栈", "png 4k", "闲鱼产品图", "1K 白底", "png 素材"] {
+        guard selectedExportKinds.isSubset(of: [.hd, .png4k]) else { throw WorkflowStateError.invalidManifest("Invalid selected exports") }
+        for folder in [".work"] {
             try validateOutputURL(outputDirectory.appendingPathComponent(folder))
         }
+        for kind in [WorkflowAssetKind.hd, .png4k] { try validateExportRoot(kind) }
         for directory in [outputLocations?.hd, outputLocations?.png4k].compactMap({ $0 }) {
             guard directory.isFileURL else { throw WorkflowStateError.invalidManifest("Invalid export directory") }
         }
@@ -366,10 +354,14 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                 throw WorkflowStateError.invalidManifest("Invalid specimen mapping")
             }
             for task in [specimen.front, specimen.back] {
-                if let attempt = task.stackAttemptURL { try validateOutputURL(attempt) }
+                if let attempt = task.stackAttemptURL {
+                    guard isGeneratedPSDURL(attempt) else { throw WorkflowStateError.invalidManifest("工作 PSD 不属于当前批次目录") }
+                }
+                if let saved = task.snapshot {
+                    guard isGeneratedPSDURL(saved.workingURL) else { throw WorkflowStateError.invalidManifest("工作 PSD 不属于当前批次目录") }
+                }
                 for artifact in task.artifacts {
-                    if (manualFinalization == true || outputLocations != nil) && artifact.kind.stage != .derivatives { try validateArtifactURL(artifact.url, kind: artifact.kind) }
-                    else { try validateOutputURL(artifact.url) }
+                    try validateArtifactURL(artifact.url, kind: artifact.kind)
                 }
                 guard task.sourceRevision > 0, Set(task.records.keys) == Set(WorkflowStage.allCases),
                       task.sources.isPSD || task.sources.files.count == 3,
@@ -378,8 +370,10 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                 }
                 if task.sources.isPSD {
                     guard Self.isContained(task.sources.first.url,in: sourceDirectory),
-                          task.stackAttemptURL == nil || task.stackAttemptURL == task.sources.first.url || Self.isContained(task.stackAttemptURL!,in: outputDirectory),
-                          task.snapshot == nil || task.snapshot?.workingURL == task.sources.first.url || Self.isContained(task.snapshot!.workingURL,in: outputDirectory) else {
+                          task.stackAttemptURL.map({ Self.canonicalComponents($0) != Self.canonicalComponents(task.sources.first.url) }) ?? true,
+                          task.snapshot.map({ Self.canonicalComponents($0.workingURL) != Self.canonicalComponents(task.sources.first.url) }) ?? true,
+                          task.stackAttemptURL == nil || isGeneratedPSDURL(task.stackAttemptURL!),
+                          task.snapshot == nil || isGeneratedPSDURL(task.snapshot!.workingURL) else {
                         throw WorkflowStateError.invalidManifest("Imported PSD must retain its frozen source path")
                     }
                 }
@@ -399,13 +393,13 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                 }
                 if task[.matte].state == .completed || task[.matte].state == .waitingReview {
                     guard let snapshot = task.snapshot, snapshot.taskID == task.id,
-                          (snapshot.roles?.isValid == true || (manualFinalization == true && snapshot.finalRoles?.isValid == true)),
+                          (snapshot.roles?.isValid == true || snapshot.finalRoles?.isValid == true),
                           snapshot.pixelSize.width > 0, snapshot.pixelSize.height > 0 else {
                         throw WorkflowStateError.invalidManifest("Matte requires a saved PSD with role identities")
                     }
                 }
                 if let review = task.manualEdit {
-                    guard manualFinalization == true, !specimen.isExcluded,
+                    guard !specimen.isExcluded,
                           review.workingURL == task.snapshot?.workingURL,
                           WorkflowPSDFileVersion.isHash(review.baseline.hash),
                           review.baseline.modificationDate.timeIntervalSinceReferenceDate.isFinite,
@@ -417,7 +411,7 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                     try validateOutputURL(review.workingURL)
                 }
                 if let accepted = task.acceptedFinalPSD {
-                    guard manualFinalization == true, !specimen.isExcluded,
+                    guard !specimen.isExcluded,
                           accepted.taskID == task.id, accepted.sourceRevision == task.sourceRevision,
                           accepted.workingURL == task.snapshot?.workingURL,
                           task[.geometry].state == .completed,
@@ -427,7 +421,10 @@ nonisolated struct WorkflowBatch: Codable, Equatable, Identifiable, Sendable {
                     try validateOutputURL(accepted.workingURL)
                     try validateAcceptedFinalURL(accepted.snapshotURL, taskID: task.id, contentVersion: accepted.contentVersion)
                 }
-                if manualFinalization == true && task[.geometry].state == .completed && task.pendingFinalPSD == nil {
+                if task[.geometry].state == .completed {
+                    guard task.acceptedFinalPSD != nil else { throw WorkflowStateError.invalidManifest("Final confirmation requires an accepted saved PSD") }
+                }
+                if task[.geometry].state == .completed && task.pendingFinalPSD == nil {
                     guard task.snapshot?.finalRoles?.isValid == true,task.roleImages?.isFinalized == true,
                           task[.geometry].confirmedVersion == task.snapshot?.contentVersion else {
                         throw WorkflowStateError.invalidManifest("Final export requires confirmation of the saved final PSD")

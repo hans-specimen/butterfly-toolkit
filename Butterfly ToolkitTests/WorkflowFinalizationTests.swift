@@ -6,13 +6,13 @@ import CryptoKit
 final class WorkflowFinalizationTests: XCTestCase {
 
     func testLegacyPNGReceiptIsNotRecoveredAfterTopLayerRuleChange() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        var batch = f.batch
         let executor = WorkflowExecutor(services: finalServices(f))
         try await executor.register(batch: batch,manifestURL: f.manifest)
         try await executor.runPending(batchID: batch.id)
-        try await executor.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await executor.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         let id = batch.specimens[0].front.id
         try await executor.requestExports(batchID: batch.id,taskIDs: [id],kinds: [.png4k],policy: .overwrite,layouts: [:])
         var saved = try await executor.batch(batchID: batch.id)
@@ -31,8 +31,8 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     func testAppliedGeometryMovesWingTipsIntoSavedCanvasCoordinates() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         var services = f.services
         services.analyze = { roles,_ in
             var result = ExecutorFixture.solution(roles.snapshotVersion)
@@ -48,9 +48,9 @@ final class WorkflowFinalizationTests: XCTestCase {
         XCTAssertEqual(fit.leftWingTip,CGPoint(x: 70,y: 60)); XCTAssertEqual(fit.rightWingTip,CGPoint(x: 50,y: 60))
         XCTAssertEqual(fit.angleDegrees,0)
     }
-    func testAutomaticGeometryStopsForMandatoryReviewEvenWhenOldChecksAreOff() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true; batch.checkGeometry = false; batch.check4K = false
+    func testAutomaticGeometryStopsForMandatorySavedReview() async throws {
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let e = WorkflowExecutor(services: f.services)
         try await e.register(batch: batch,manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
@@ -65,8 +65,8 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     func testManualRefreshReopenAndConfirmDoNotReprocessAndExportBothAssets() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let e = WorkflowExecutor(services: finalServices(f))
         try await e.register(batch: batch,manifestURL: f.manifest); try await e.runPending(batchID: batch.id)
         let id = batch.specimens[0].front.id
@@ -77,10 +77,12 @@ final class WorkflowFinalizationTests: XCTestCase {
         let refreshed = try await e.batch(batchID: batch.id)
         XCTAssertTrue(refreshed.isPaused)
         XCTAssertEqual(refreshed.task(id: id)?.snapshot?.finalRoles?.cutoutLayer,"final-c")
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await e.endManualEditing(batchID: batch.id)
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         var result = try await e.batch(batchID: batch.id)
-        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.geometry].state == .completed && $0[.png4k].state == .waitingReview && $0.artifacts.isEmpty })
-        try await e.confirm4K(batchID: batch.id,layouts: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id,$0.squareLayout) }))
+        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.geometry].state == .completed && $0[.png4k].state == .pending && $0.artifacts.isEmpty })
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(result.activeTasks.map(\.id)), kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
+        try await e.continueAutomatic(batchID: batch.id)
         result = try await e.batch(batchID: batch.id)
         XCTAssertTrue(result.allSucceeded)
         XCTAssertTrue(result.activeTasks.allSatisfy { Set($0.artifacts.filter { $0.state == .completed }.map(\.kind)) == [.hd,.png4k] })
@@ -487,7 +489,7 @@ final class WorkflowFinalizationTests: XCTestCase {
         XCTAssertEqual(preview.task(id: front)?.pendingFinalPSD, pending)
 
         _ = try saveReviewPSD(stale.workingURL, marker: "changed after confirmation")
-        try await executor.requestExports(batchID: f.batch.id, taskIDs: [front, third], kinds: [.png4k], policy: .overwrite, layouts: [:])
+        try await executor.requestExports(batchID: f.batch.id, taskIDs: [front, third], kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
         let result = try await executor.batch(batchID: f.batch.id)
         XCTAssertNil(result.task(id: front)?.pendingFinalPSD)
         XCTAssertEqual(result.task(id: front)?.snapshot?.contentVersion, pending.contentVersion)
@@ -550,7 +552,7 @@ final class WorkflowFinalizationTests: XCTestCase {
         let version = try saveReviewPSD(frontURL, marker: "accepted")
         await photoshop.setDocuments([openDocument(backURL, 2)])
         try await executor.pollManualEdits(batchID: f.batch.id)
-        try await executor.requestExports(batchID: f.batch.id, taskIDs: [front], kinds: [.png4k], policy: .overwrite, layouts: [:])
+        try await executor.requestExports(batchID: f.batch.id, taskIDs: [front], kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
         try await executor.runPending(batchID: f.batch.id)
         let queued = try await executor.batch(batchID: f.batch.id)
         XCTAssertEqual(queued.task(id: front)?.requestedExports?[.png4k]?.snapshotVersion, version)
@@ -629,8 +631,8 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     private func readyBatchReview(count: Int = 1) async throws -> (ExecutorFixture, WorkflowExecutor, ReviewPhotoshop) {
-        let f = try ExecutorFixture(checks: false, count: count)
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(count: count)
+        var batch = f.batch
         let photoshop = ReviewPhotoshop()
         let executor = WorkflowExecutor(services: batchReviewServices(f, photoshop), coordinator: PhotoshopExecutionCoordinator())
         try await executor.register(batch: batch, manifestURL: f.manifest)
@@ -665,21 +667,6 @@ final class WorkflowFinalizationTests: XCTestCase {
         return services
     }
 
-    func testMigrationBacksUpManifestAndDoesNotApplyGeometryToEditedPSD() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        let e = WorkflowExecutor(services: finalServices(f))
-        try await e.register(batch: f.batch,manifestURL: f.manifest); try await e.runPending(batchID: f.batch.id)
-        let before = try Data(contentsOf: f.manifest)
-        try await e.migrateToFinalization(batchID: f.batch.id)
-        let result = try await e.batch(batchID: f.batch.id)
-        XCTAssertEqual(result.manualFinalization,true)
-        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.geometry].state == .waitingReview })
-        let backups = try FileManager.default.contentsOfDirectory(at: f.batch.outputDirectory,includingPropertiesForKeys: nil).filter { $0.lastPathComponent.hasPrefix("batch-before-finalization-") }
-        XCTAssertEqual(backups.count,1); XCTAssertEqual(try Data(contentsOf: XCTUnwrap(backups.first)),before)
-        try await e.runPending(batchID: f.batch.id)
-        let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
-    }
-
     func testFinalSnapshotAcceptsChangedLayerIdentitiesButRejectsForeignOwner() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("final-bridge-\(UUID())")
         try FileManager.default.createDirectory(at: root,withIntermediateDirectories: true)
@@ -703,8 +690,8 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     func testImpossibleGeometryRequiresExplicitManualAdoptionBeforeConfirmation() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         var services = finalServices(f)
         services.analyze = { roles,_ in
             var solution = ExecutorFixture.solution(roles.snapshotVersion)
@@ -718,35 +705,35 @@ final class WorkflowFinalizationTests: XCTestCase {
         XCTAssertTrue(failed.activeTasks.allSatisfy { $0[.geometry].state == .failed && $0.geometrySolution?.isApplicable == false })
         let face = try XCTUnwrap(failed.activeTasks.first), version = try XCTUnwrap(face.snapshot?.contentVersion)
         do {
-            try await executor.confirmFinalTasks(batchID: batch.id,versions: [face.id:version])
+            try await executor.confirmSavedTasks(batchID: batch.id, taskIDs: [face.id])
             XCTFail("Failed geometry accepted without manual adoption")
-        } catch WorkflowStateError.staleVersion {}
+        } catch WorkflowStateError.invalidTransition {}
         _ = try await executor.beginManualEditing(batchID: batch.id,taskID: face.id)
         try await executor.adoptCurrentPSD(batchID: batch.id,taskID: face.id)
         try await executor.endManualEditing(batchID: batch.id)
-        try await executor.confirmFinalTasks(batchID: batch.id,versions: [face.id:version])
+        try await executor.confirmSavedTasks(batchID: batch.id, taskIDs: [face.id])
 
         let result = try await executor.batch(batchID: batch.id), calls = await f.probe.values()
         XCTAssertEqual(calls.filter { $0 == "adopt-manual-geometry" }.count,1)
         XCTAssertFalse(calls.contains("apply-save"))
-        XCTAssertEqual(result.task(id: face.id)?[.geometry].confirmedVersion,version)
+        XCTAssertEqual(result.task(id: face.id)?[.geometry].confirmedVersion, try AIFileValidation.hash(face.snapshot!.workingURL.path))
         XCTAssertEqual(result.activeTasks.last?[.geometry].state,.failed)
         XCTAssertTrue(result.activeTasks.allSatisfy { $0.artifacts.isEmpty })
     }
 
     func testCombinedExportRetriesHDFailureFromVisibleExportStage() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let e = WorkflowExecutor(services: finalServices(f))
         try await e.register(batch: batch,manifestURL: f.manifest); try await e.runPending(batchID: batch.id)
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         await f.probe.fail([.hd])
-        try await e.confirm4K(batchID: batch.id,layouts: Dictionary(uniqueKeysWithValues: batch.activeTasks.map { ($0.id,$0.squareLayout) }))
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
         let failed = try await e.batch(batchID: batch.id)
         XCTAssertEqual(failed.currentStage,.png4k); XCTAssertFalse(failed.allSucceeded)
-        XCTAssertTrue(failed.activeTasks.allSatisfy { $0[.hd].state == .failed && $0[.png4k].state == .pending })
+        XCTAssertTrue(failed.activeTasks.allSatisfy { $0[.hd].state == .failed && $0[.png4k].state == .completed })
         await f.probe.fail([])
-        try await e.retry(batchID: batch.id,specimenIDs: [batch.specimens[0].id],stage: .png4k)
+        try await e.retryTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), stage: .hd)
         let retried = try await e.batch(batchID: batch.id),calls = await f.probe.values()
         XCTAssertTrue(retried.allSucceeded)
         XCTAssertEqual(calls.filter { $0 == "apply-save" }.count,2)
@@ -754,8 +741,8 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     func testSwitchingFacesRequiresSavedPreviousFaceAndDoesNotLoseManualLease() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let gate = FinalizationSaveGate()
         var services = finalServices(f); let finalize = services.finalize!
         services.finalize = { url,id in if await gate.dirty { throw WorkflowBridgeError.unsavedDocument }; return try await finalize(url,id) }
@@ -769,14 +756,15 @@ final class WorkflowFinalizationTests: XCTestCase {
         _ = try await e.beginManualEditing(batchID: batch.id,taskID: front)
         await gate.setDirty(false)
         _ = try await e.beginManualEditing(batchID: batch.id,taskID: back)
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await e.endManualEditing(batchID: batch.id)
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         let result = try await e.batch(batchID: batch.id)
-        XCTAssertTrue(result.activeTasks.allSatisfy { $0.snapshot?.finalRoles?.isValid == true })
+        XCTAssertTrue(result.activeTasks.allSatisfy { $0.acceptedFinalPSD != nil })
     }
 
     func testFinalExportRejectsChangedSourceAfterRenderBeforePublication() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let gate = FinalizationSaveGate()
         var services = finalServices(f); let extract = services.extract,render = services.render
         services.extract = { snapshot in
@@ -788,16 +776,16 @@ final class WorkflowFinalizationTests: XCTestCase {
         }
         let e = WorkflowExecutor(services: services)
         try await e.register(batch: batch,manifestURL: f.manifest); try await e.runPending(batchID: batch.id)
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
-        try await e.confirm4K(batchID: batch.id,layouts: Dictionary(uniqueKeysWithValues: batch.activeTasks.map { ($0.id,$0.squareLayout) }))
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
         let result = try await e.batch(batchID: batch.id)
         XCTAssertFalse(result.allSucceeded)
         XCTAssertTrue(result.activeTasks.flatMap(\.artifacts).allSatisfy { $0.state != .completed && !FileManager.default.fileExists(atPath: $0.url.path) })
     }
 
     func testFailedMatteCanBeOpenedForManualRepairButCannotBeConfirmed() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let id = batch.specimens[0].front.id
         var services = finalServices(f); let select = try XCTUnwrap(services.selectSubject)
         services.selectSubject = { snapshot in
@@ -815,9 +803,9 @@ final class WorkflowFinalizationTests: XCTestCase {
         XCTAssertEqual(document,snapshot.workingURL)
         try await executor.endManualEditing(batchID: batch.id)
         do {
-            try await executor.confirmFinalTasks(batchID: batch.id,versions: [id:snapshot.contentVersion])
+            try await executor.confirmSavedTasks(batchID: batch.id, taskIDs: [id])
             XCTFail("Unrepaired matte accepted as final")
-        } catch WorkflowStateError.staleVersion {}
+        } catch WorkflowStateError.invalidTransition {}
         let after = try await executor.batch(batchID: batch.id)
         XCTAssertTrue(after.isPaused)
         XCTAssertEqual(after.task(id: id)?[.matte].state,.failed)
@@ -826,51 +814,50 @@ final class WorkflowFinalizationTests: XCTestCase {
     }
 
     func testPNGFailureKeepsSuccessfulJPEGWhenRetryingCombinedExport() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let e = WorkflowExecutor(services: finalServices(f))
         try await e.register(batch: batch,manifestURL: f.manifest); try await e.runPending(batchID: batch.id)
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         await f.probe.fail([.png4k])
-        try await e.confirm4K(batchID: batch.id,layouts: Dictionary(uniqueKeysWithValues: batch.activeTasks.map { ($0.id,$0.squareLayout) }))
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), kinds: [.hd, .png4k], policy: .overwrite, layouts: [:])
         let failed = try await e.batch(batchID: batch.id)
         XCTAssertTrue(failed.activeTasks.allSatisfy { $0[.hd].state == .completed && $0[.png4k].state == .failed })
         await f.probe.fail([])
-        try await e.retry(batchID: batch.id,specimenIDs: [batch.specimens[0].id],stage: .png4k)
+        try await e.retryTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), stage: .png4k)
         let retried = try await e.batch(batchID: batch.id),calls = await f.probe.values()
         XCTAssertTrue(retried.allSucceeded); XCTAssertEqual(calls.filter { $0 == "render-hd" }.count,2)
     }
 
     @MainActor func testNewDraftUsesFixedDirectoriesAndMandatoryReview() throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
-        let batch = try draft.freeze(names: "标本",output: f.batch.outputDirectory.appendingPathComponent("batch"),checkStack: true,checkMatte: true,checkGeometry: false,check4K: false,manualFinalization: true)
-        XCTAssertEqual(batch.manualFinalization,true); XCTAssertFalse(batch.checkAfterStack); XCTAssertFalse(batch.checkAfterMatte)
-        XCTAssertEqual(batch.checkGeometry,true); XCTAssertEqual(batch.check4K,true)
+        let batch = try draft.freeze(names: "标本",output: f.batch.outputDirectory.appendingPathComponent("batch"))
+        XCTAssertEqual(batch.schemaVersion, WorkflowBatch.currentSchemaVersion)
         let store = PhotoWorkflowStore(); store.scan(f.batch.sourceDirectory)
-        XCTAssertTrue(store.canStart); XCTAssertFalse(store.needsExportDirectories)
+        XCTAssertTrue(store.canStart)
         XCTAssertEqual(store.exportDirectory(for: .png4k),batch.exportDirectory(for: .png4k))
         XCTAssertEqual(store.exportDirectory(for: .hd),batch.exportDirectory(for: .hd))
     }
 
     @MainActor func testPausedExportHasResumeEntryAndDoesNotBypassConfirmation() async throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let e = WorkflowExecutor(services: finalServices(f))
         try await e.register(batch: batch,manifestURL: f.manifest); try await e.runPending(batchID: batch.id)
-        try await e.confirmFinalPSD(batchID: batch.id,specimenIDs: [batch.specimens[0].id])
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
         await e.pause(batchID: batch.id)
         let store = PhotoWorkflowStore(); store.batch = try await e.batch(batchID: batch.id); store.stage = .png4k
         XCTAssertTrue(store.canResumeAutomatic)
         try await e.continueAutomatic(batchID: batch.id)
         let resumed = try await e.batch(batchID: batch.id)
-        XCTAssertTrue(resumed.activeTasks.allSatisfy { $0[.png4k].state == .waitingReview && $0.artifacts.isEmpty })
+        XCTAssertTrue(resumed.activeTasks.allSatisfy { $0[.png4k].state == .pending && $0.artifacts.isEmpty })
         store.batch = resumed; XCTAssertFalse(store.canResumeAutomatic)
     }
 
     func testFixedOutputDirectoryRejectsSymlinkOutsideInput() throws {
-        let f = try ExecutorFixture(checks: false); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        let f = try ExecutorFixture(); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
+        var batch = f.batch
         let external = FileManager.default.temporaryDirectory.appendingPathComponent("final-foreign-\(UUID())")
         try FileManager.default.createDirectory(at: external,withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: external) }
@@ -878,17 +865,6 @@ final class WorkflowFinalizationTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: root,withDestinationURL: external)
         XCTAssertThrowsError(try batch.validateArtifactURL(root.appendingPathComponent("sample0_D.png"),kind: .png4k))
         XCTAssertThrowsError(try batch.validateOutputURL(root.appendingPathComponent("sample0_D.png")))
-    }
-
-    func testMigrationBeforeCompletedMatteLeavesLegacyBatchUntouched() async throws {
-        let f = try ExecutorFixture(checks: true); defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        let e = WorkflowExecutor(services: finalServices(f))
-        try await e.register(batch: f.batch,manifestURL: f.manifest)
-        let before = try Data(contentsOf: f.manifest)
-        do { try await e.migrateToFinalization(batchID: f.batch.id); XCTFail("Incomplete legacy batch migrated") }
-        catch { XCTAssertTrue(error.localizedDescription.contains("AI")) }
-        let unchanged = try await e.batch(batchID: f.batch.id)
-        XCTAssertNil(unchanged.manualFinalization); XCTAssertEqual(try Data(contentsOf: f.manifest),before)
     }
 
     private func finalServices(_ f: ExecutorFixture) -> WorkflowExecutor.Services {

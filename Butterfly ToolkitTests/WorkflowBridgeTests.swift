@@ -549,7 +549,7 @@ final class WorkflowBridgeTests: XCTestCase {
         let directory = try temporaryDirectory(), log = PerformanceLog()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("batch.json"), observedURL = directory.appendingPathComponent("observed.json")
-        let original = WorkflowBatch(sourceDirectory: directory, outputDirectory: directory, specimens: [])
+        let original = WorkflowBatch(sourceDirectory: directory.resolvingSymlinksInPath(), sourceDirectoryName: directory.lastPathComponent, outputDirectory: directory, specimens: [])
         try await WorkflowBatchStore().save(original, to: url)
         let store = WorkflowBatchStore(performanceObserver: { log.append($0) })
         try await store.save(original, to: observedURL)

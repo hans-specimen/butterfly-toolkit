@@ -40,7 +40,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var ignoreRemainder = false
     var photoCount: Int { groups.reduce(0) { $0 + $1.files.count } + remainder.count }
     static func scan(directory: URL,inputMode: WorkflowInputMode = .photos) throws -> Self {
-        let files = try FileManager.default.contentsOfDirectory(at: directory,includingPropertiesForKeys: [.isRegularFileKey],options: [.skipsHiddenFiles]).filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        let files = try FileManager.default.contentsOfDirectory(at: directory.resolvingSymlinksInPath(),includingPropertiesForKeys: [.isRegularFileKey],options: [.skipsHiddenFiles]).filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         if inputMode == .psd {
             let psds = files.filter { $0.pathExtension.lowercased() == "psd" }
             let pairs = try psdGroups(files: psds)
@@ -71,7 +71,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
         return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
     }
-    func freeze(names: String,output: URL,checkStack: Bool,checkMatte: Bool,locations: WorkflowOutputLocations? = nil,checkGeometry: Bool = true,check4K: Bool = true,manualFinalization: Bool = false,matteProvider: WorkflowMatteProvider = .photoshop,geometryRequest: GeometryRequest = GeometryRequest()) throws -> WorkflowBatch {
+    func freeze(names: String,output: URL,locations: WorkflowOutputLocations? = nil,geometryRequest: GeometryRequest = GeometryRequest()) throws -> WorkflowBatch {
         let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
         guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage(inputMode == .psd ? "请补齐 D/V 配对或明确排除未配对 PSD" : "请明确排除剩余未分组照片") }
@@ -99,10 +99,20 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             }
             return WorkflowSpecimen(id: group.id,baseName: name,front: side(.front,0),back: side(.back,inputMode.filesPerSide),exclusionReason: group.excluded ? "建批次时排除" : nil)
         }
-        var batch = WorkflowBatch(sourceDirectory: directory,outputDirectory: output,outputLocations: locations,checkAfterStack: inputMode == .photos && checkStack,checkAfterMatte: checkMatte,checkGeometry: checkGeometry,check4K: check4K,specimens: specimens)
-        batch.matteProvider = matteProvider; batch.psdSubdirectory = true
-        if manualFinalization { batch.manualFinalization = true; batch.checkAfterStack = false; batch.checkAfterMatte = false; batch.checkGeometry = true; batch.check4K = true }
-        try batch.validate(); try batch.validateStart(); return batch
+        var batch = WorkflowBatch(sourceDirectory: directory.resolvingSymlinksInPath(),sourceDirectoryName: directory.lastPathComponent,outputDirectory: output,outputLocations: locations,specimens: specimens)
+        let root = batch.generatedPSDDirectory
+        // 为同名新批次冻结独立目录；断开的链接也占用名字，不能靠重试认领上一批文件。
+        func occupied(_ file: URL) -> Bool {
+            FileManager.default.fileExists(atPath: file.path) ||
+                (try? FileManager.default.destinationOfSymbolicLink(atPath: file.path)) != nil
+        }
+        batch.psdBatchSubdirectory = specimens.contains { specimen in
+            WorkflowSide.allCases.contains { side in
+                let file = root.appendingPathComponent("\(specimen.baseName)_\(side.fileSuffix).psd")
+                return occupied(file) || occupied(file.appendingPathExtension("workflow-owner.json"))
+            }
+        }
+        try batch.validate(); return batch
     }
 }
 
@@ -115,27 +125,14 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var names = ""
     @Published var hdDirectory: URL?
     @Published var png4kDirectory: URL?
-    @Published var matteProvider: WorkflowMatteProvider = .photoshop
-    var effectiveMatteProvider: WorkflowMatteProvider { batch?.effectiveMatteProvider ?? matteProvider }
     var workingPSDDirectory: URL? {
         if let task = currentTask {
             if let saved = task.snapshot { return saved.workingURL.deletingLastPathComponent() }
-            if task.sources.isPSD { return task.sources.first.url.deletingLastPathComponent() }
         }
         return batch?.generatedPSDDirectory
     }
-    @Published var checkAfterStack = UserDefaults.standard.object(forKey: "workflowCheckStack") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(checkAfterStack,forKey: "workflowCheckStack") }
-    }
-    @Published var checkAfterMatte = UserDefaults.standard.object(forKey: "workflowCheckMatte") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(checkAfterMatte,forKey: "workflowCheckMatte") }
-    }
-    @Published var checkGeometry = true
-    @Published var check4K = true
     @Published var draftGeometryRequest = GeometryRequest()
-    var needsExportDirectories: Bool { false }
-    var usesFinalization: Bool { batch?.manualFinalization == true }
-    var canStart: Bool { draft != nil && (!needsExportDirectories || (hdDirectory != nil && png4kDirectory != nil)) }
+    var canStart: Bool { draft != nil }
     @Published var batch: WorkflowBatch?
     @Published var selectedSpecimens: Set<UUID> = []
     @Published var selectedTaskIDs: Set<UUID> = []
@@ -158,8 +155,6 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     @Published var zoom = 1.0
     @Published var showSafeFrame = true
-    @Published var pickingTips = false
-    @Published var tips: [CGPoint] = []
     @Published private(set) var images: [UUID: CGImage] = [:]
     @Published private(set) var imageIdentities: [UUID: WorkflowPreviewImageIdentity] = [:]
     @Published private(set) var isDragging = false
@@ -167,14 +162,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published private(set) var detailRequested: Set<UUID> = []
     private var requestedImageIdentities: [UUID: WorkflowPreviewImageIdentity] = [:]
     @Published private(set) var solutions: [UUID: GeometrySolution] = [:]
-    @Published private(set) var requests: [UUID: GeometryRequest] = [:]
     @Published private(set) var layouts: [UUID: SquareLayout] = [:]
     @Published private(set) var gates: [UUID: WorkflowPreviewGate] = [:]
     @Published private(set) var loading: Set<UUID> = []
     @Published private(set) var previewInteractionStarted: [UUID: TimeInterval] = [:]
-    private var warmSources: Set<String> = []
     @Published var manualTaskID: UUID?
-    @Published var manualChange: WorkflowPSDChange = .maskOnly
     private var executor: WorkflowExecutor?
     @Published private(set) var isUpdatingReview = false
     @Published private(set) var manualReviewSessionID: UUID?
@@ -199,24 +191,14 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
     var currentSolution: GeometrySolution? { currentTask.flatMap { solutions[$0.id] ?? $0.geometrySolution } }
-    var currentRequest: GeometryRequest {
-        guard let task = currentTask else { return GeometryRequest() }
-        if let draft = requests[task.id] { return draft }
-        var request = task.geometryRequest
-        if let saved = task.geometrySolution,task[.geometry].state == .completed || task.geometryRevalidationRequired { request.angleStrategy = .manual(degrees: saved.angleDegrees) }
-        return request
-    }
+
     var currentLayout: SquareLayout { currentTask.flatMap { layouts[$0.id] } ?? currentTask?.squareLayout ?? .png4k }
     var currentPreviewLayout: SquareLayout {
         var value = currentLayout
         if isDragging { value.center.x += dragOffset.width; value.center.y += dragOffset.height }
         return value
     }
-    var currentPreviewSolution: GeometrySolution? {
-        guard var value = currentSolution else { return nil }
-        if isDragging { value.sourceCropRect = value.sourceCropRect.offsetBy(dx: -dragOffset.width,dy: -dragOffset.height); value.isApplicable = false }
-        return value
-    }
+    var currentPreviewSolution: GeometrySolution? { currentSolution }
     func displayImage(for task: WorkflowSideTask) -> CGImage? {
         guard let identity = desiredImageIdentity(task),imageIdentities[task.id] == identity else { return nil }
         return images[task.id]
@@ -227,13 +209,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     private func desiredImageIdentity(_ task: WorkflowSideTask) -> WorkflowPreviewImageIdentity? {
         guard let roles = task.roleImages,roles.snapshotVersion == task.snapshot?.contentVersion else { return nil }
-        if usesFinalization && stage == .png4k && !hasRequestedExportPreview(task) { return nil }
+        if stage == .png4k && !hasRequestedExportPreview(task) { return nil }
         let mode = stage == .png4k ? "抠图" : previewMode
         let url = mode == "蒙版" ? roles.maskPNG : mode == "抠图" ? roles.cutoutPNG : roles.basePNG
         return WorkflowPreviewImageIdentity(sourceVersion: roles.snapshotVersion,url: url,maximumPixelSize: detailRequested.contains(task.id) ? Int(max(roles.pixelSize.width,roles.pixelSize.height)) : 2048)
     }
     func loadCurrentDetail() {
-        guard manualTaskID == nil || usesFinalization,let task = currentTask,desiredImageIdentity(task) != nil else { return }
+        guard let task = currentTask,desiredImageIdentity(task) != nil else { return }
         retainCurrentDetailOnly()
         detailRequested.insert(task.id); requestPreview(task: task)
     }
@@ -249,29 +231,20 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func useQuickPreview() {
-        guard manualTaskID == nil || usesFinalization,let task = currentTask else { return }
+        guard let task = currentTask else { return }
         detailRequested.remove(task.id); requestPreview(task: task)
     }
-    var canConfirm: Bool {
-        guard !isDragging,!busy,manualTaskID == nil,let batch,!batch.isPaused,!selectedSpecimens.isEmpty else { return false }
-        let selected = batch.specimens.filter { selectedSpecimens.contains($0.id) && !$0.isExcluded }
-        guard selected.count == selectedSpecimens.count else { return false }
-        return selected.flatMap { [$0.front,$0.back] }.allSatisfy { task in
-            guard displayImage(for: task) != nil,task.roleImages?.snapshotVersion == task.snapshot?.contentVersion,gates[task.id]?.canConfirm == true,solutions[task.id]?.sourceVersion == task.snapshot?.contentVersion else { return false }
-            if stage == .png4k { return task[.geometry].state == .completed && (usesFinalization ? task.snapshot?.finalRoles?.isValid == true : task[.hd].state == .completed) && squareValid(task: task) }
-            return task[.geometry].state == .waitingReview || task[.geometry].state == .completed
-        }
-    }
+
     var canResumeAutomatic: Bool {
         guard batch?.isPaused == true else { return false }
         guard manualReviewSessionID == nil, !isUpdatingReview else { return false }
-        return !usesFinalization || manualTaskID == nil || batch?.activeTasks.contains { task in
+        return manualTaskID == nil || batch?.activeTasks.contains { task in
             [WorkflowStage.stack,.matte,.geometry].contains { task[$0].state == .pending }
         } == true
     }
     func displayedRecord(_ task: WorkflowSideTask) -> WorkflowStageRecord {
-        if usesFinalization && stage == .hd { return task[.geometry] }
-        if usesFinalization && stage == .png4k && task[.hd].state == .failed { return task[.hd] }
+        if stage == .hd { return task[.geometry] }
+        if stage == .png4k && task[.hd].state == .failed { return task[.hd] }
         return task[stage]
     }
     private func isReviewable(_ task: WorkflowSideTask) -> Bool {
@@ -282,7 +255,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var hasManualEditing: Bool { manualTaskID != nil || manualReviewSessionID != nil }
     var hasQueuedExports: Bool { batch?.activeTasks.contains { !($0.requestedExports ?? [:]).isEmpty } == true }
     var canFinalize: Bool {
-        guard usesFinalization, !busy, !isUpdatingReview, manualTaskID == nil,
+        guard !busy, !isUpdatingReview, manualTaskID == nil,
               currentSpecimen?.isExcluded == false, let task = currentTask, isReviewable(task) else { return false }
         if task.manualEdit?.observedDocumentID != nil { return manualObservationError != nil }
         return task[.geometry].state == .waitingReview || task.manualEdit != nil || task.manualEditError != nil
@@ -344,7 +317,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let task = currentTask else { return }
         // 选择变化由视图统一准备预览，避免阶段切换提前重复派发解码任务。
         isSelectingTaskStage = true; defer { isSelectingTaskStage = false }
-        if usesFinalization, isReviewable(task) {
+        if isReviewable(task) {
             if stage == .hd || stage == .png4k { return }
             if hasManualEditing { stage = .hd; return }
         }
@@ -422,9 +395,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let outputDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Butterfly Toolkit/PhotoWorkflow/\(UUID().uuidString)", isDirectory: true)
         let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
-        let names = names,stack = checkAfterStack,matte = checkAfterMatte,geometry = checkGeometry,fourK = check4K,provider = WorkflowMatteProvider.photoshop,request = draftGeometryRequest
+        let names = names, request = draftGeometryRequest
         launch { [self] in
-            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,checkStack: stack,checkMatte: matte,locations: locations,checkGeometry: geometry,check4K: fourK,manualFinalization: true,matteProvider: provider,geometryRequest: request) }.value
+            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,locations: locations,geometryRequest: request) }.value
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)
@@ -434,10 +407,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
+        guard kind == .hd || kind == .png4k else { return nil }
         if let batch { return batch.exportDirectory(for: kind) }
         if let selected = kind == .hd ? hdDirectory : png4kDirectory { return selected }
         guard let directory = draft?.directory else { return nil }
-        return directory.appendingPathComponent(directory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
+        return directory.resolvingSymlinksInPath().appendingPathComponent(directory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
     }
     var canChangeExportDirectory: Bool { canSwitchBatch }
     func selectExportDirectory(_ url: URL, kind: WorkflowAssetKind) {
@@ -466,7 +440,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
                 currentSpecimenID = specimen.id; face = editing.side; stage = .hd
             } else {
                 stage = value.currentStage ?? .png4k
-                if value.manualFinalization == true && stage == .geometry {
+                if stage == .geometry {
                     if currentTask?[.geometry].state == .waitingReview { stage = .hd }
                     else { nextReview() }
                 }
@@ -493,7 +467,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         exportPreviewVersions = [:]; preparingExportPreview = nil; photoshopOpenErrors = [:]
         manualObservationError = nil; selectedTaskIDs = []
         previewTasks = [:]; images = [:]; imageIdentities = [:]; requestedImageIdentities = [:]
-        gates = [:]; solutions = [:]; requests = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; warmSources = []; cancelMove()
+        gates = [:]; solutions = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; cancelMove()
         await geometry.removeAll()
     }
     private func makeExecutor(output: URL) -> WorkflowExecutor {
@@ -522,7 +496,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             if value.revision == previous.revision { return }
             batch = value
             if let currentTask, let old = previous.task(id: currentTask.id) {
-                if usesFinalization, [.stack,.matte,.geometry].contains(stage),
+                if [.stack,.matte,.geometry].contains(stage),
                    !isReviewable(old), isReviewable(currentTask) {
                     stage = .hd
                 } else if old[stage].state == .running, currentTask[stage].state != .running {
@@ -539,7 +513,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
                 guard changedVersion || task.roleImages != old.roleImages else { continue }
                 invalidatePreview(task.id)
                 if changedVersion { layouts[task.id] = nil; exportPreviewVersions[task.id] = nil }
-                if !usesFinalization || task.id == currentSpecimen?.front.id || task.id == currentSpecimen?.back.id {
+                if task.id == currentSpecimen?.front.id || task.id == currentSpecimen?.back.id {
                     requestPreview(task: task)
                 }
             }
@@ -551,97 +525,59 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     private func invalidatePreview(_ id: UUID) {
         previewTasks.removeValue(forKey: id)?.cancel()
         images[id] = nil; imageIdentities[id] = nil; requestedImageIdentities[id] = nil
-        solutions[id] = nil; requests[id] = nil; gates[id] = nil; loading.remove(id)
+        solutions[id] = nil; gates[id] = nil; loading.remove(id)
         previewInteractionStarted[id] = nil
     }
     func prepareSelected() {
-        guard manualTaskID == nil || usesFinalization,let batch else { return }
-        let ordered = batch.specimens.filter { $0.id == currentSpecimenID }
-            + (usesFinalization ? [] : batch.specimens.filter { $0.id != currentSpecimenID && selectedSpecimens.contains($0.id) })
-        var visible: [Task<Void,Never>] = []
-        for specimen in ordered {
-            for task in [specimen.front,specimen.back] {
-                guard let identity = desiredImageIdentity(task) else { continue }
-                if gates[task.id] == nil || requestedImageIdentities[task.id] != identity {
-                    requestPreview(task: task,after: specimen.id == currentSpecimenID ? [] : visible)
-                }
-                if specimen.id == currentSpecimenID,let pending = previewTasks[task.id] { visible.append(pending) }
-            }
+        guard let specimen = currentSpecimen else { return }
+        for task in [specimen.front,specimen.back] {
+            guard let identity = desiredImageIdentity(task) else { continue }
+            if gates[task.id] == nil || requestedImageIdentities[task.id] != identity { requestPreview(task: task) }
         }
     }
     func refreshVisibleImage() {
-        guard manualTaskID == nil || usesFinalization,let task = currentTask else { return }; requestPreview(task: task)
+        guard let task = currentTask else { return }; requestPreview(task: task)
     }
     // MARK: - 构图草稿与异步预览
-    func editRequest(_ edit: (inout GeometryRequest) -> Void) {
-        guard let task = currentTask,manualTaskID == nil else { return }
-        if let version = task.snapshot?.contentVersion,warmSources.contains(version),images[task.id] != nil { previewInteractionStarted[task.id] = ProcessInfo.processInfo.systemUptime }
-        var request = currentRequest; edit(&request); requests[task.id] = request
-        // 交互时立即用缓存源图更新预览，精确校验随后异步完成。
-        if var solution = solutions[task.id] {
-            if case .manual(let angle) = request.angleStrategy { solution.angleDegrees = angle }
-            let b = solution.subjectBounds,factor = 1-2*request.targetMargin
-            var width = b.width/factor,height = b.height/factor
-            let ratio: Double? = switch request.ratio { case .adaptive: nil; case .fiveByFour: 1.25; case .elevenByEightPointFive: 22.0/17; case .square: 1 }
-            if let ratio { height = max(height,width/ratio); width = height*ratio }
-            let center = request.centerOverride ?? CGPoint(x: b.midX,y: b.midY)
-            solution.sourceCropRect = CGRect(x: center.x-width/2,y: center.y-height/2,width: width,height: height); solution.isApplicable = false
-            solutions[task.id] = solution
-        }
-        requestPreview(task: task,request: request)
-    }
-    func resetSuggestion() { guard let task = currentTask else { return }; requests[task.id] = GeometryRequest(); requestPreview(task: task,request: GeometryRequest()) }
-    func pickTip(_ point: CGPoint) {
-        guard pickingTips else { return }; tips.append(point)
-        if tips.count == 2 {
-            let ordered = tips.sorted { $0.x < $1.x }; editRequest { $0.angleStrategy = .twoPoints(left: ordered[0],right: ordered[1]) }; pickingTips = false; tips = []
-        }
-    }
     func updateMove(_ delta: CGSize) {
-        guard manualTaskID == nil,!busy,(stage == .geometry && !usesFinalization) || stage == .png4k else { return }
+        guard manualTaskID == nil,!busy,stage == .png4k else { return }
         isDragging = true; dragOffset = delta
         if let id = currentTask?.id { previewInteractionStarted[id] = ProcessInfo.processInfo.systemUptime }
     }
     func cancelMove() { isDragging = false; dragOffset = .zero }
     func commitMove(_ delta: CGSize) { cancelMove(); move(delta) }
     private func move(_ delta: CGSize) {
-        if stage == .png4k { var l = currentLayout; l.center.x += delta.width; l.center.y += delta.height; editLayout(l) }
-        else if let solution = currentSolution { editRequest { $0.centerOverride = CGPoint(x: solution.sourceCropRect.midX-delta.width,y: solution.sourceCropRect.midY-delta.height) } }
+        guard stage == .png4k else { return }
+        var layout = currentLayout; layout.center.x += delta.width; layout.center.y += delta.height; editLayout(layout)
     }
     func editLayout(_ layout: SquareLayout) {
         guard let task = currentTask,manualTaskID == nil else { return }
         if images[task.id] != nil { previewInteractionStarted[task.id] = ProcessInfo.processInfo.systemUptime }
         layouts[task.id] = layout
     }
-    private func squareValid(task: WorkflowSideTask) -> Bool {
-        guard let solution = solutions[task.id],solution.subjectBounds.width > 0,solution.subjectBounds.height > 0 else { return false }
-        let l = layouts[task.id] ?? task.squareLayout,b = solution.subjectBounds,s = min(Double(l.canvasSide-2*l.safeMargin)/b.width,Double(l.canvasSide-2*l.safeMargin)/b.height)
-        return l.safeMargin >= 0 && l.safeMargin <= 512 && l.center.x-b.width*s/2 >= 0 && l.center.y-b.height*s/2 >= 0 && l.center.x+b.width*s/2 <= 4096 && l.center.y+b.height*s/2 <= 4096
-    }
-    private func requestPreview(task: WorkflowSideTask,request: GeometryRequest? = nil,after predecessors: [Task<Void,Never>] = []) {
+
+    private func requestPreview(task: WorkflowSideTask) {
         guard !isResettingPreviews, let batchID = batch?.id, let roles = task.roleImages, let identity = desiredImageIdentity(task) else { return }
         previewTasks[task.id]?.cancel()
         requestedImageIdentities[task.id] = identity
         if imageIdentities[task.id] != identity { images[task.id] = nil; imageIdentities[task.id] = nil }
         // 取消旧任务之外还更新令牌，拦截不响应取消的解码或几何服务迟到结果。
         var gate = gates[task.id] ?? WorkflowPreviewGate(); let token = gate.begin(sourceVersion: roles.snapshotVersion); gates[task.id] = gate; loading.insert(task.id)
-        let request = request ?? requests[task.id] ?? task.geometryRequest
+        let request = task.geometryRequest
         let saved = task.geometrySolution
-        let useSaved = requests[task.id] == nil && (task[.geometry].state == .completed || task.geometryRevalidationRequired || usesFinalization)
         previewTasks[task.id] = Task { [self] in
-            for predecessor in predecessors { await predecessor.value }
             do {
                 try Task.checkCancellation()
                 let image = try await previews.image(url: identity.url,version: roles.snapshotVersion,maximumPixelSize: identity.maximumPixelSize)
                 guard !Task.isCancelled, batch?.id == batchID, batch?.task(id: task.id)?.roleImages == roles,
                       gates[task.id]?.token == token else { return }
                 imageIdentities[task.id] = identity; images[task.id] = image
-                let solution = try await previews.geometry(source: roles,request: request,savedCandidate: useSaved ? saved : nil)
+                let solution = try await previews.geometry(source: roles,request: request,savedCandidate: saved)
                 guard !Task.isCancelled, batch?.id == batchID, batch?.task(id: task.id)?.roleImages == roles,
                       gates[task.id]?.token == token else { return }
                 guard solution.sourceVersion == roles.snapshotVersion else { throw WorkflowBridgeError.staleSource }
                 guard !Task.isCancelled,gates[task.id]?.accept(token: token,sourceVersion: roles.snapshotVersion,valid: solution.isApplicable) == true else { return }
-                solutions[task.id] = solution; loading.remove(task.id); warmSources.insert(roles.snapshotVersion)
+                solutions[task.id] = solution; loading.remove(task.id)
             } catch is CancellationError {} catch {
                 guard !Task.isCancelled, batch?.id == batchID, gates[task.id]?.token == token else { return }
                 loading.remove(task.id); self.error = error.localizedDescription
@@ -650,24 +586,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
     // MARK: - 检查点确认与人工编辑
     func primary() {
-        if usesFinalization {
-            if stage == .hd { confirmCurrent() }
-            else if stage == .png4k { exportImages(scope: "此图") }
-            return
-        }
-        guard let e = executor,let b = batch else { return }
-        let selected = b.specimens.filter { selectedSpecimens.contains($0.id) }.flatMap { [$0.front,$0.back] }
-        launch { [self] in
-            switch stage {
-            case .stack,.matte: try await e.continueAfterReview(batchID: b.id,stage: stage,specimenIDs: b.specimens.filter { !$0.isExcluded }.map(\.id))
-            case .geometry:
-                try await e.confirmGeometry(batchID: b.id,solutions: Dictionary(uniqueKeysWithValues: selected.compactMap { task in solutions[task.id].map { (task.id,$0) } }),exportHD: true)
-            case .png4k:
-                try await e.confirm4K(batchID: b.id,layouts: Dictionary(uniqueKeysWithValues: selected.map { ($0.id,layouts[$0.id] ?? $0.squareLayout) }))
-            case .derivatives: throw WorkflowStateError.invalidTransition
-            case .hd: try await e.retry(batchID: b.id,specimenIDs: Array(selectedSpecimens),stage: stage)
-            }
-        }
+        if stage == .hd { confirmCurrent() }
+        else if stage == .png4k { exportImages(scope: "此图") }
     }
     func retry() { guard let e = executor,let b = batch else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: Set(b.activeTasks.map(\.id)),stage: stage) } }
     func reprocessCurrent(from stage: WorkflowStage) {
@@ -683,11 +603,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     func pause() { guard let e = executor,let b = batch else { return }; notice = "正在等待当前步骤安全保存并暂停"; Task { await e.pause(batchID: b.id); await sync() } }
     func resume() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.continueAutomatic(batchID: b.id); manualTaskID = nil } }
     private func usesBatchReview(for task: WorkflowSideTask) -> Bool {
-        usesFinalization && manualTaskID != task.id && isReviewable(task)
+        manualTaskID != task.id && isReviewable(task)
     }
     var canOpenPSD: Bool {
         guard let task = currentTask, task.snapshot != nil, currentSpecimen?.isExcluded == false else { return false }
-        // 未走完自动阶段的面仍可用旧的单面修补入口。
+        // 未走完自动阶段的失败面保留单面修补入口。
         if !usesBatchReview(for: task) {
             return !isUpdatingReview && manualReviewSessionID == nil && (manualTaskID == nil || manualTaskID == task.id)
         }
@@ -715,7 +635,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         Set((batch?.activeTasks ?? []).filter { selectedTaskIDs.contains($0.id) && canOpenReviewPSD($0) }.map(\.id))
     }
     var canOpenSelectedPSDs: Bool {
-        usesFinalization && !busy && !isUpdatingReview && manualTaskID == nil && !selectedReviewTaskIDs.isEmpty
+        !busy && !isUpdatingReview && manualTaskID == nil && !selectedReviewTaskIDs.isEmpty
     }
     func openSelectedPSDs() {
         guard canOpenSelectedPSDs else { return }
@@ -811,7 +731,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         return exportPreviewVersions[task.id] == version
     }
     var canLoadCurrentExportPreview: Bool {
-        guard usesFinalization, stage == .png4k, currentSpecimen?.isExcluded == false, let task = currentTask,
+        guard stage == .png4k, currentSpecimen?.isExcluded == false, let task = currentTask,
               !hasManualEditing, !busy, !isUpdatingReview, !loading.contains(task.id),
               task[.geometry].state == .completed, let version = task.finalPSDVersion,
               task[.geometry].confirmedVersion == version else { return false }
@@ -836,13 +756,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             if stage == .png4k { requestPreview(task: prepared) }
         }
     }
-    func migrateToFinalization() {
-        guard let e = executor,let b = batch else { return }
-        launch { [self] in
-            try await e.migrateToFinalization(batchID: b.id)
-            await clearPreviewState(); await sync(); stage = .geometry
-        }
-    }
+
     func adoptCurrentPSD() {
         guard let e = executor, let b = batch, let id = manualTaskID else { return }
         launch { [self] in
@@ -852,14 +766,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func refreshSaved() {
-        guard let e = executor,let b = batch,let taskID = manualTaskID ?? (usesFinalization ? currentTask?.id : nil) else { return }
+        guard let e = executor,let b = batch,let taskID = manualTaskID ?? currentTask?.id else { return }
         images[taskID] = nil; gates[taskID] = nil; solutions[taskID] = nil
         launch { [self] in
-            if usesFinalization {
-                if manualTaskID == taskID { try await e.refreshManualPSD(batchID: b.id,taskID: taskID) }
-                else { try await e.refreshFinalPSD(batchID: b.id,taskID: taskID) }
-                await clearPreviewState(); await sync(); stage = .hd; return
-            }
-            try await e.refreshSavedPSD(batchID: b.id,taskID: taskID,change: manualChange); await sync(); if let task = batch?.task(id: taskID) { requestPreview(task: task) }; if manualChange != .maskOnly { stage = .geometry } }
+            if manualTaskID == taskID { try await e.refreshManualPSD(batchID: b.id,taskID: taskID) }
+            else { try await e.refreshFinalPSD(batchID: b.id,taskID: taskID) }
+            await clearPreviewState(); await sync(); stage = .hd
+        }
     }
 }

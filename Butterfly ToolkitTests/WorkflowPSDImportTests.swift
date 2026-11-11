@@ -17,36 +17,19 @@ import XCTest
         XCTAssertEqual(WorkflowSide.front.fileSuffix,"D")
         XCTAssertEqual(WorkflowSide.back.fileSuffix,"V")
     }
-    func testLegacyPhotoManifestKeepsItsSavedPSDPaths() throws {
-        let f = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.outputDirectory = batch.sourceDirectory.appendingPathComponent("new-batch")
-        for side in WorkflowSide.allCases {
-            var task = side == .front ? batch.specimens[0].front : batch.specimens[0].back
-            let url = batch.sourceDirectory.appendingPathComponent("sample0_\(side.legacyFileSuffix).psd")
-            task.stackAttemptURL = url; task.snapshot = ExecutorFixture.snapshot(task.id,url,"old",roles: false)
-            if side == .front { batch.specimens[0].front = task } else { batch.specimens[0].back = task }
-        }
-        let restored = try JSONDecoder().decode(WorkflowBatch.self,from: JSONEncoder().encode(batch))
-        try restored.validate()
-        for task in restored.activeTasks {
-            XCTAssertEqual(task.sources.files.count,3)
-            try restored.validateOutputURL(XCTUnwrap(task.snapshot).workingURL)
-        }
-    }
+
     func testPSDPairsAreNamedAndFrozenWithoutJPGs() throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         for name in ["SC10_蝶_V.psd","SC2_蝶_d.PSD","SC10_蝶_D.psd","SC2_蝶_v.psd","DSC001.JPG"] { _ = try write(name,in: root) }
         let draft = try WorkflowBatchDraft.scan(directory: root,inputMode: .psd)
         XCTAssertEqual(draft.groups.map(\.suggestedName),["SC2_蝶","SC10_蝶"])
         XCTAssertEqual(draft.groups[0].files.compactMap { $0?.lastPathComponent },["SC2_蝶_d.PSD","SC2_蝶_v.psd"])
-        let batch = try draft.freeze(names: "SC2_蝶\nSC10_蝶",output: root.appendingPathComponent("batch"),checkStack: true,checkMatte: true,manualFinalization: true)
-        XCTAssertFalse(batch.checkAfterStack)
-        XCTAssertTrue(batch.activeTasks.allSatisfy { $0.sources.isPSD && $0.sources.files.count == 1 && $0.stackPNG == nil })
+        let batch = try draft.freeze(names: "SC2_蝶\nSC10_蝶",output: root.appendingPathComponent("batch"))
+        XCTAssertTrue(batch.activeTasks.allSatisfy { $0.sources.isPSD && $0.sources.files.count == 1 })
         let restored = try JSONDecoder().decode(WorkflowBatch.self,from: JSONEncoder().encode(batch))
         XCTAssertEqual(restored,batch)
         try restored.validate()
-        for task in restored.activeTasks { try restored.validateOutputURL(task.sources.first.url) }
+        for task in restored.activeTasks { XCTAssertThrowsError(try restored.validateOutputURL(task.sources.first.url), "Input PSD is never an authorized output") }
         try restored.validateOutputURL(restored.generatedPSDDirectory.appendingPathComponent("SC2_蝶_D.psd"))
         XCTAssertThrowsError(try restored.validateOutputURL(root.appendingPathComponent("foreign.psd")))
     }
@@ -55,9 +38,9 @@ import XCTest
         for name in ["pair_D.psd","pair_V.psd","single_D.psd","unknown.psd"] { _ = try write(name,in: root) }
         var draft = try WorkflowBatchDraft.scan(directory: root,inputMode: .psd)
         XCTAssertEqual(Set(draft.remainder.map(\.lastPathComponent)),["single_D.psd","unknown.psd"])
-        XCTAssertThrowsError(try draft.freeze(names: "pair",output: root.appendingPathComponent("batch"),checkStack: false,checkMatte: true))
+        XCTAssertThrowsError(try draft.freeze(names: "pair",output: root.appendingPathComponent("batch")))
         draft.ignoreRemainder = true
-        _ = try draft.freeze(names: "pair",output: root.appendingPathComponent("batch"),checkStack: false,checkMatte: true)
+        _ = try draft.freeze(names: "pair",output: root.appendingPathComponent("batch"))
         // 大小写不敏感文件系统不能创建仅大小写不同的双份文件，用显式扫描列表覆盖重复项。
         let file = root.appendingPathComponent("pair_D.psd")
         XCTAssertThrowsError(try WorkflowBatchDraft.psdGroups(files: [file,file]))
@@ -66,15 +49,12 @@ import XCTest
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         for index in 1...6 { _ = try write("DSC\(index).JPG",in: root) }
         for name in ["蝶_D.psd","蝶_V.psd"] { _ = try write(name,in: root) }
-        let store = PhotoWorkflowStore(), oldStackCheck = store.checkAfterStack, oldMatteCheck = store.checkAfterMatte
-        defer { store.checkAfterStack = oldStackCheck; store.checkAfterMatte = oldMatteCheck }
+        let store = PhotoWorkflowStore()
         store.scan(root); store.names = "旧照片名"
         XCTAssertEqual(store.draft?.groups.first?.files.count,6)
         store.inputMode = .psd
         XCTAssertEqual(store.draft?.groups.first?.files.count,2)
         XCTAssertEqual(store.names,"蝶")
-        store.checkAfterStack = true; store.checkAfterMatte = false; store.checkGeometry = false; store.check4K = false
-        XCTAssertFalse(store.needsExportDirectories)
         XCTAssertTrue(store.canStart)
     }
     func testAdoptPreservesOriginalAndSnapshotAndRejectsForeignOwnerOrChangedSource() async throws {
@@ -108,9 +88,9 @@ import XCTest
         XCTAssertEqual(try AIFileValidation.hash(document.path),source.fingerprint)
     }
     func testImportedPSDCopyUsesNativeMatteAndContinuesWithoutStackingIncludingReopen() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true
+        var batch = f.batch
         for side in WorkflowSide.allCases {
             var task = side == .front ? batch.specimens[0].front : batch.specimens[0].back
             let url = batch.sourceDirectory.appendingPathComponent("manual_\(side.fileSuffix).psd")

@@ -115,6 +115,15 @@ nonisolated struct WorkflowArtifactStore: Sendable {
         return existing
     }
 
+    /// 清理前只读核对已有成品及归属，不推进待提交凭据或写历史文件。
+    func verifyPublished(artifact: WorkflowArtifact) throws {
+        Self.lock.lock(); defer { Self.lock.unlock() }
+        try validateMetadata(artifact)
+        guard let existing = try existingArtifact(at: artifact.url, receipt: readReceipt(artifact.url)),
+              sameRecipe(existing, artifact), existing.fileFingerprint == artifact.fileFingerprint,
+              artifact.state == .completed else { throw WorkflowArtifactError.ownershipConflict }
+    }
+
     // MARK: - 归属凭据与历史保留
     private func preserveCommittedRecipe(_ receipt: Receipt,matching current: WorkflowArtifact) throws {
         guard let committed = receipt.committed else { return }

@@ -62,8 +62,9 @@ Python 引擎是外部项目，通过所选目录下的 `.venv/bin/python` 与 `
 | 位置 | 含义 |
 | --- | --- |
 | 用户输入目录 | 源照片或已有 D/V 合成 PSD，输入文件只读 |
-| `~/Library/Application Support/Butterfly Toolkit/PhotoWorkflow/<UUID>/` | 第 2 版 `batch.json`、`PSD/` 下的工作 PSD 和 `.work/` 下的恢复材料 |
-| 用户选择的高清与 PNG4K 目录 | 成品、发布归属记录和历史版本 |
+| 输入目录内的 `<目录名>_psd/` | 工作 PSD；遇同名文件时使用批次专属子目录，重新处理另建子目录保留原件 |
+| `~/Library/Application Support/Butterfly Toolkit/PhotoWorkflow/<UUID>/` | 第 3 版 `batch.json` 和 `.work/` 下的快照、角色图与恢复材料；整批成功导出后自动清理 `.work`，小体积记录保留 |
+| 输入目录内的 `<目录名>_堆栈原图/`、`<目录名>_4K_PNG/`，或用户另选目录 | 成品、发布归属记录和历史版本 |
 | 所选 AI 项目的数据／输出目录 | 独立导入副本、人工答案、推理记录与工作区设置，具体由引擎和 UI 契约管理 |
 | `/tmp`、本地 `build/`、`staging/` | 本次构建、测试及临时证据；只有确认可再生成或已备份的部分才清理 |
 | `output/app-icon-liquid-glass/` | 当前图标的原始设计图与生成说明；正式各尺寸图标在 `Assets.xcassets`，重复导出包与旧方案已清理 |

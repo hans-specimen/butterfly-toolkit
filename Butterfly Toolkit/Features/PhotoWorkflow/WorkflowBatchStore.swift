@@ -11,7 +11,7 @@ actor WorkflowBatchStore {
     func load(from url: URL) throws -> WorkflowBatch {
         if let data = try? Data(contentsOf: url),
            let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let version = metadata["schemaVersion"] as? Int, version != 2 {
+           let version = metadata["schemaVersion"] as? Int, version != WorkflowBatch.currentSchemaVersion {
             throw WorkflowStateError.invalidManifest("此批次使用旧流程，请新建批次；旧文件未作修改")
         }
         if let batch = try? readValidBatch(from: url) { return try recoverInterruptedWork(batch) }
@@ -33,7 +33,9 @@ actor WorkflowBatchStore {
         // 仅用有效的旧清单更新恢复副本；当前文件损坏且没有有效备份时拒绝覆盖。
         let previous = url.appendingPathExtension("previous")
         if manager.fileExists(atPath: url.path) {
-            if let existing = try? Data(contentsOf: url), (try? decodeValid(existing)) != nil {
+            let existing = try Data(contentsOf: url)
+            try rejectOldSchema(existing)
+            if (try? decodeValid(existing)) != nil {
                 try existing.write(to: previous, options: .atomic)
             } else if (try? readValidBatch(from: previous)) == nil {
                 throw WorkflowStateError.invalidManifest("Refusing to replace a corrupt manifest without a valid recovery copy")
@@ -53,7 +55,15 @@ actor WorkflowBatchStore {
         try decodeValid(Data(contentsOf: url))
     }
 
+    private func rejectOldSchema(_ data: Data) throws {
+        if let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let version = metadata["schemaVersion"] as? Int, version != WorkflowBatch.currentSchemaVersion {
+            throw WorkflowStateError.invalidManifest("此批次使用旧流程，请新建批次；旧文件未作修改")
+        }
+    }
+
     private func decodeValid(_ data: Data) throws -> WorkflowBatch {
+        try rejectOldSchema(data)
         let batch = try JSONDecoder().decode(WorkflowBatch.self, from: data)
         try batch.validate()
         return batch

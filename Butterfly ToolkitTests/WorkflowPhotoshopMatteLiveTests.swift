@@ -33,9 +33,7 @@ import XCTest
             groups.append(WorkflowDraftGroup(files: copies))
         }
         let draft = WorkflowBatchDraft(directory: source, groups: groups, remainder: [], otherFiles: [])
-        let batch = try draft.freeze(names: selected.map(\.baseName).joined(separator: "\n"), output: workspace,
-            checkStack: false, checkMatte: false, manualFinalization: true)
-        XCTAssertEqual(batch.effectiveMatteProvider, .photoshop)
+        let batch = try draft.freeze(names: selected.map(\.baseName).joined(separator: "\n"), output: workspace)
         let bridge = PhotoshopWorkflowBridge(workspace: workspace.appendingPathComponent(".work"))
         var services = WorkflowExecutor.Services.live(bridge: bridge)
         let select = try XCTUnwrap(services.selectSubject)
@@ -52,7 +50,7 @@ import XCTest
         for task in processed.activeTasks {
             XCTAssertEqual(task[.matte].state, .completed, task[.matte].error ?? "")
             XCTAssertEqual(task[.geometry].state, .waitingReview, task[.geometry].error ?? "")
-            XCTAssertNil(task.matteArtifact); XCTAssertNil(task.stackPNG)
+            XCTAssertNotNil(task.snapshot)
             let saved = try XCTUnwrap(task.snapshot)
             XCTAssertEqual(saved.workingURL.deletingLastPathComponent(), batch.generatedPSDDirectory)
             XCTAssertTrue(task.geometrySolution?.isApplicable == true, task.geometrySolution?.reason ?? "No geometry")
@@ -106,7 +104,7 @@ import XCTest
         let editedRoles = try XCTUnwrap(edited.task(id: task.id)?.roleImages)
         XCTAssertEqual(try WorkflowRaster.read(editedRoles.cutoutPNG).pixels[offset+3], 0)
         let versions = try Dictionary(uniqueKeysWithValues: edited.activeTasks.map { ($0.id, try XCTUnwrap($0.snapshot?.contentVersion)) })
-        try await executor.confirmFinalTasks(batchID: batch.id, versions: versions)
+        try await executor.confirmSavedTasks(batchID: batch.id, taskIDs: Set(versions.keys))
         try await executor.requestExports(batchID: batch.id, taskIDs: Set(versions.keys), kinds: [.hd,.png4k], policy: .skipExisting, layouts: [:])
         try await executor.continueAutomatic(batchID: batch.id)
         let finished = try await executor.batch(batchID: batch.id)

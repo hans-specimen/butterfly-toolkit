@@ -31,9 +31,9 @@ struct PhotoWorkflowView: View {
     private let queueWidth: CGFloat = 210
     private let inspectorWidth: CGFloat = 300
     private func stageTitle(_ stage: WorkflowStage) -> String {
-        if store.usesFinalization && stage == .geometry { return "旋转矫正" }
-        if store.usesFinalization && stage == .hd { return "人工检查" }
-        if store.usesFinalization && stage == .png4k { return "导出" }
+        if stage == .geometry { return "旋转矫正" }
+        if stage == .hd { return "人工检查" }
+        if stage == .png4k { return "导出" }
         return stage == .stack && store.currentTask?.sources.isPSD == true ? "已有 PSD" : stage.title
     }
     var body: some View {
@@ -134,7 +134,7 @@ struct PhotoWorkflowView: View {
                     }
                 }.padding(10)
             }
-            Text(store.usesFinalization && store.stage == .hd ? "勾选正面或反面进行批量精修" : "选择标本查看正反面")
+            Text(store.stage == .hd ? "勾选正面或反面进行批量精修" : "选择标本查看正反面")
                 .font(.caption).foregroundStyle(.secondary).padding(18)
         }.background(panelBackground)
     }
@@ -208,7 +208,7 @@ struct PhotoWorkflowView: View {
             Divider()
             inspectorSection("批次目录",icon: "folder") {
                 directoryControl(store.inputMode == .psd ? "已合成 PSD" : "原始照片",url: store.draft?.directory,placeholder: store.inputMode == .psd ? "选择包含 D/V 配对 PSD 的文件夹" : "选择 JPG / JPEG 文件夹") { chooseFolder { store.scan($0) } }
-                Text(store.inputMode == .psd ? "原 PSD 会复制到本批工作目录，在副本中继续处理。" : "景深合成生成的 PSD 保存在本批工作目录。").font(.caption).foregroundStyle(.secondary)
+                Text(store.inputMode == .psd ? "原 PSD 会复制到输入文件夹内的“目录名_psd”子文件夹，在副本中继续处理。" : "景深合成生成的 PSD 保存在输入文件夹内的“目录名_psd”子文件夹。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             inspectorSection("名称清单",icon: "text.alignleft") {
@@ -263,7 +263,7 @@ struct PhotoWorkflowView: View {
         inspectorSection("导出位置", icon: "square.and.arrow.down") {
             exportLocation(.hd)
             exportLocation(.png4k)
-            Text(store.batch == nil || store.usesFinalization ? "默认在输入文件夹内创建输出目录，也可分别更改。" : "两个目录可分别指定，流程在 PNG4K 导出后结束。").font(.caption).foregroundStyle(.secondary)
+            Text("默认在输入文件夹内创建输出子文件夹，也可分别更改。").font(.caption).foregroundStyle(.secondary)
         }
     }
     // MARK: - 执行队列与正反面对照
@@ -294,7 +294,7 @@ struct PhotoWorkflowView: View {
                     }
                     Button("暂不处理所选标本") { store.excludeSelected() }.disabled(store.busy || store.hasManualEditing || store.isUpdatingReview || store.selectedSpecimens.isEmpty)
                 }.fixedSize()
-                if store.canResumeAutomatic { Button(store.usesFinalization ? (store.stage == .png4k || store.hasQueuedExports ? "继续导出" : "继续自动准备") : "明确继续批处理") { store.resume() }.disabled(store.busy) }
+                if store.canResumeAutomatic { Button(store.stage == .png4k || store.hasQueuedExports ? "继续导出" : "继续自动准备") { store.resume() }.disabled(store.busy) }
                 else if store.busy { Button("暂停") { store.pause() } }
                 Button("批量导出") { exportScope = "全部已确认"; store.stage = .png4k }
                 Button(primaryTitle,action: performPrimary).buttonStyle(.borderedProminent).controlSize(.large).disabled(primaryDisabled)
@@ -311,7 +311,7 @@ struct PhotoWorkflowView: View {
                 Spacer()
                 if store.runningTask != nil { Button("定位正在处理") { store.locateRunning() }.font(.caption) }
                 if let task = store.currentTask {
-                    Text(store.usesFinalization && store.stage == .hd ? store.reviewStatus(task) : store.summaryRecord(task).state.title).font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
+                    Text(store.stage == .hd ? store.reviewStatus(task) : store.summaryRecord(task).state.title).font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
                         .padding(.horizontal,10).padding(.vertical,6).background(Color.accentColor.opacity(0.12),in: Capsule())
                 }
             }
@@ -355,8 +355,8 @@ struct PhotoWorkflowView: View {
                     Spacer()
                     Button(store.currentDetailReady ? "返回快速预览" : "加载原图细节") { if store.currentDetailReady { store.useQuickPreview() } else { store.loadCurrentDetail() } }
                         .font(.caption).buttonStyle(.borderless)
-                        .disabled(store.currentTask?.roleImages == nil || (store.manualTaskID != nil && !store.usesFinalization) ||
-                            (store.usesFinalization && store.stage == .png4k && store.currentTask.map { !store.hasRequestedExportPreview($0) } == true))
+                        .disabled(store.currentTask?.roleImages == nil ||
+                            (store.stage == .png4k && store.currentTask.map { !store.hasRequestedExportPreview($0) } == true))
                 }
                 Spacer(minLength: 0)
             } else { ContentUnavailableView("请选择标本",systemImage: "photo").frame(maxHeight: .infinity) }
@@ -374,8 +374,7 @@ struct PhotoWorkflowView: View {
     @ViewBuilder private func cleanupSummary(for task: WorkflowSideTask) -> some View {
         let report = cleanupReport(for: task)
         if let solution = task.geometrySolution {
-            let applied = store.usesFinalization || task[.geometry].state == .completed
-            Text(applied || !solution.isApplicable ? WorkflowCleanupStatus.title(solution: solution,report: report,targetMargin: task.geometryRequest.targetMargin) : "裁切方案待确认")
+            Text(WorkflowCleanupStatus.title(solution: solution,report: report,targetMargin: task.geometryRequest.targetMargin))
                 .font(.caption).foregroundStyle(solution.isApplicable ? Color.secondary : Color.primary)
         }
         if let report,let snapshot = task.snapshot {
@@ -408,20 +407,20 @@ struct PhotoWorkflowView: View {
                 }.foregroundStyle(active ? Color.accentColor : Color.secondary)
             }.buttonStyle(.plain)
             Group {
-                if store.usesFinalization && store.stage == .png4k && store.displayImage(for: task) == nil {
+                if store.stage == .png4k && store.displayImage(for: task) == nil {
                     if store.preparingExportPreview == task.id || (store.hasRequestedExportPreview(task) && store.loading.contains(task.id)) {
                         ProgressView("正在准备预览").controlSize(.small)
                     } else {
                         Text(task[.geometry].state == .completed ? "尚未加载 4K 预览" : "待人工确认")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                } else if store.usesFinalization && store.stage == .hd && task.pendingFinalPSD != nil {
+                } else if store.stage == .hd && task.pendingFinalPSD != nil {
                     Text("已确认保存版本").font(.caption).foregroundStyle(.secondary)
                 } else if let roles = task.roleImages {
                     WorkflowGeometryPreview(image: store.displayImage(for: task),source: roles,
                         solution: active ? store.currentPreviewSolution : store.solutions[task.id] ?? task.geometrySolution,
                         square: store.stage == .png4k ? (active ? store.currentPreviewLayout : store.layouts[task.id] ?? task.squareLayout) : nil,
-                        zoom: store.zoom,background: store.previewBackground,showSafeFrame: store.showSafeFrame,savedCanvasOnly: store.usesFinalization,showWingTips: store.stage == .geometry,
+                        zoom: store.zoom,background: store.previewBackground,showSafeFrame: store.showSafeFrame,savedCanvasOnly: true,showWingTips: store.stage == .geometry,
                         cleanupRegions: showCleanupRegions ? cleanupRegions(for: task) : [],
                         interactionStarted: store.previewInteractionStarted[task.id],
                         onMoveChanged: { if store.stage == .png4k { store.updateMove($0) } },
@@ -430,7 +429,7 @@ struct PhotoWorkflowView: View {
                         .overlay(alignment: .topLeading) {
                             if store.loading.contains(task.id) { ProgressView().controlSize(.small).padding(10).background(.regularMaterial,in: RoundedRectangle(cornerRadius: 6)) }
                         }
-                } else { WorkflowFileThumbnail(url: task.stackPNG?.pngURL ?? task.snapshot?.snapshotURL ?? task.sources.first.url) }
+                } else { WorkflowFileThumbnail(url: task.snapshot?.workingURL ?? task.sources.first.url) }
             }.frame(maxWidth: .infinity,maxHeight: .infinity).frame(minHeight: 200)
                 .clipShape(RoundedRectangle(cornerRadius: 9))
                 .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(active ? Color.accentColor.opacity(0.65) : Color.secondary.opacity(0.2),lineWidth: active ? 2 : 1) }
@@ -447,13 +446,13 @@ struct PhotoWorkflowView: View {
                     cleanupReports[task.id] = (snapshot.contentVersion,report)
                 }
             Text("\(store.currentSpecimen?.baseName ?? "")_\(task.side.fileSuffix)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            if store.usesFinalization && store.stage == .hd {
+            if store.stage == .hd {
                 Text(store.reviewStatus(task)).font(.caption).foregroundStyle(.secondary)
                 if let message = store.photoshopOpenErrors[task.id] ?? task.manualEditError {
                     Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                 }
             }
-            if store.usesFinalization && [.hd, .png4k].contains(store.stage), let status = store.outputPreparationStatus(task) {
+            if [.hd, .png4k].contains(store.stage), let status = store.outputPreparationStatus(task) {
                 Text(status).font(.caption).foregroundStyle(task.finalPreparationError == nil ? Color.secondary : Color.red)
             }
             if let message = store.displayedRecord(task).error { Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
@@ -495,8 +494,8 @@ struct PhotoWorkflowView: View {
     }
     private func sideStatus(_ task: WorkflowSideTask) -> some View {
         VStack(alignment: .leading,spacing: 5) {
-            WorkflowFileThumbnail(url: task.roleImages?.cutoutPNG ?? task.sources.first.url).frame(height: 44).clipShape(RoundedRectangle(cornerRadius: 5))
-            let review = store.usesFinalization && [.hd,.png4k].contains(store.stage)
+            WorkflowFileThumbnail(url: task.roleImages?.cutoutPNG ?? task.snapshot?.workingURL ?? task.sources.first.url).frame(height: 44).clipShape(RoundedRectangle(cornerRadius: 5))
+            let review = [.hd,.png4k].contains(store.stage)
             let state = review ? (store.stage == .png4k ? store.outputPreparationStatus(task) ?? store.reviewStatus(task) : store.reviewStatus(task)) : store.summaryRecord(task).state.title
             let failed = store.photoshopOpenErrors[task.id] != nil || task.manualEditError != nil ||
                 (store.stage == .png4k && task.finalPreparationError != nil) || store.summaryRecord(task).state == .failed
@@ -545,19 +544,21 @@ struct PhotoWorkflowView: View {
                     Text("跳过模式保留已有文件；旧版本标为待更新。覆盖仅替换本任务成品，外来同名文件会报冲突。").font(.caption).foregroundStyle(.secondary)
                     exportLocation(.hd); exportLocation(.png4k)
                     artifactResults(kinds: [.hd,.png4k])
+                    Text("整批导出成功后自动清理中转文件。").font(.caption).foregroundStyle(.secondary)
+                    if let message = store.batch?.intermediateCleanupError {
+                        Text(message).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    }
                 }
                 Divider()
                 inspectorSection("4K 构图",icon: "crop") {
-                    if store.usesFinalization {
-                        Button("加载此图预览") { store.loadCurrentExportPreview() }.disabled(!store.canLoadCurrentExportPreview)
-                        if let message = store.currentTask?.finalPreparationError {
-                            Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                        } else if store.hasManualEditing {
-                            Text("关闭正在精修的 PSD 后可加载预览。").font(.caption).foregroundStyle(.secondary)
-                        }
-                        if let task = store.currentTask, store.displayImage(for: task) != nil { squareControls }
-                        else { Text("可直接使用默认居中布局导出。").font(.caption).foregroundStyle(.secondary) }
-                    } else { squareControls }
+                    Button("加载此图预览") { store.loadCurrentExportPreview() }.disabled(!store.canLoadCurrentExportPreview)
+                    if let message = store.currentTask?.finalPreparationError {
+                        Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    } else if store.hasManualEditing {
+                        Text("关闭正在精修的 PSD 后可加载预览。").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if let task = store.currentTask, store.displayImage(for: task) != nil { squareControls }
+                    else { Text("可直接使用默认居中布局导出。").font(.caption).foregroundStyle(.secondary) }
                 }
             case .derivatives:
                 EmptyView()
@@ -616,38 +617,31 @@ struct PhotoWorkflowView: View {
             let retryOpen = store.currentTask.flatMap { store.photoshopOpenErrors[$0.id] } != nil
             Button(retryOpen ? "重试打开此图 PSD" : store.face == .front ? "打开正面工作 PSD" : "打开反面工作 PSD") { store.openPSD() }
                 .disabled(!store.canOpenPSD)
-            if store.usesFinalization {
-                Button("打开所选 \(store.selectedReviewTaskIDs.count) 张 PSD") { store.openSelectedPSDs() }
-                    .disabled(!store.canOpenSelectedPSDs)
-                Text("可少量勾选正面或反面。在 Photoshop 保存并关闭后自动确认此图。")
-                    .font(.caption).foregroundStyle(.secondary)
-                if store.canStopTrackingCurrentPSD {
-                    Button("结束跟踪此图") { store.stopTrackingCurrentPSD() }
-                        .help("核实此图已关闭后结束跟踪")
-                }
-                if let task = store.currentTask, store.manualTaskID == task.id {
-                    if task.manualAdoptionRequired == true || task.geometryApplySourceVersion != nil {
-                        Button("采用当前姿态与裁切") { store.adoptCurrentPSD() }.disabled(store.busy)
-                    } else {
-                        Button("刷新保存结果") { store.refreshSaved() }.disabled(store.busy)
-                    }
-                    Button("结束编辑") { store.finishEditing() }.disabled(store.busy)
-                }
-                Menu("从此步骤重新处理") {
-                    Button("重新景深合成／导入") { reprocessStage = .stack }
-                    Button("重新 PS 抠图") { reprocessStage = .matte }.disabled(store.currentTask?.checkpoints?[.stack] == nil)
-                    Button("重新旋转矫正") { reprocessStage = .geometry }.disabled(store.currentTask?.checkpoints?[.matte] == nil)
-                }.disabled(store.busy || store.hasManualEditing || store.isUpdatingReview)
-                .confirmationDialog("从\(reprocessStage?.title ?? "所选步骤")重新处理？",isPresented: Binding(get: { reprocessStage != nil },set: { if !$0 { reprocessStage = nil } })) {
-                    Button("重新处理") { if let step = reprocessStage { store.reprocessCurrent(from: step) }; reprocessStage = nil }
-                    Button("取消",role: .cancel) { reprocessStage = nil }
-                } message: { Text("旧 PSD 和已导出文件会保留。后续处理与确认失效，请重新检查后再导出。") }
-            } else if store.manualTaskID != nil {
-                Text("自动队列已保留给人工编辑。请先在 PS 保存，再分类刷新。").font(.caption).foregroundStyle(.orange)
-                Picker("这次保存改变了",selection: $store.manualChange) { Text("仅蒙版").tag(WorkflowPSDChange.maskOnly); Text("角度／画布").tag(WorkflowPSDChange.geometry); Text("堆栈内容").tag(WorkflowPSDChange.stackContent) }
-                Button("刷新保存结果") { store.refreshSaved() }
-                Button("明确继续批处理") { store.resume() }
+            Button("打开所选 \(store.selectedReviewTaskIDs.count) 张 PSD") { store.openSelectedPSDs() }
+                .disabled(!store.canOpenSelectedPSDs)
+            Text("可少量勾选正面或反面。在 Photoshop 保存并关闭后自动确认此图。")
+                .font(.caption).foregroundStyle(.secondary)
+            if store.canStopTrackingCurrentPSD {
+                Button("结束跟踪此图") { store.stopTrackingCurrentPSD() }
+                    .help("核实此图已关闭后结束跟踪")
             }
+            if let task = store.currentTask, store.manualTaskID == task.id {
+                if task.manualAdoptionRequired == true || task.geometryApplySourceVersion != nil {
+                    Button("采用当前姿态与裁切") { store.adoptCurrentPSD() }.disabled(store.busy)
+                } else {
+                    Button("刷新保存结果") { store.refreshSaved() }.disabled(store.busy)
+                }
+                Button("结束编辑") { store.finishEditing() }.disabled(store.busy)
+            }
+            Menu("从此步骤重新处理") {
+                Button("重新景深合成／导入") { reprocessStage = .stack }
+                Button("重新 PS 抠图") { reprocessStage = .matte }.disabled(store.currentTask?.checkpoints?[.stack] == nil)
+                Button("重新旋转矫正") { reprocessStage = .geometry }.disabled(store.currentTask?.checkpoints?[.matte] == nil)
+            }.disabled(store.busy || store.hasManualEditing || store.isUpdatingReview)
+            .confirmationDialog("从\(reprocessStage?.title ?? "所选步骤")重新处理？",isPresented: Binding(get: { reprocessStage != nil },set: { if !$0 { reprocessStage = nil } })) {
+                Button("重新处理") { if let step = reprocessStage { store.reprocessCurrent(from: step) }; reprocessStage = nil }
+                Button("取消",role: .cancel) { reprocessStage = nil }
+            } message: { Text("旧 PSD 和已导出文件会保留。后续处理与确认失效，请重新检查后再导出。") }
         }
     }
     private func artifactResults(kinds: [WorkflowAssetKind]) -> some View {
@@ -659,50 +653,44 @@ struct PhotoWorkflowView: View {
                     if let note = store.currentTask?.exportNotes?[kind] { Text(note).font(.caption).foregroundStyle(.secondary) }
                     if let message = store.currentTask?[kind.stage].error { Text(message).font(.caption).foregroundStyle(.red) }
                     if let artifact { Text(artifact.state.title).font(.caption); Button(artifact.url.lastPathComponent) { NSWorkspace.shared.open(artifact.url) }.font(.caption).disabled(artifact.state != .completed) }
-                    else { Text(kind == .hd && store.currentTask?.exportHD == false ? "本次未选择" : "尚无有效产物").font(.caption).foregroundStyle(.secondary) }
+                    else { Text("尚无有效产物").font(.caption).foregroundStyle(.secondary) }
                 }
             }
         }
     }
     private func panelStatus(_ panel: WorkflowStage) -> String {
         guard let task = store.currentTask else { return "未开始" }
-        if panel == .hd { return store.usesFinalization ? store.reviewStatus(task) : task[.hd].state.title }
+        if panel == .hd { return store.reviewStatus(task) }
         if panel == .geometry && task[.geometry].state == .waitingReview { return "自动处理完成" }
         if panel == .png4k { return "JPEG \(task[.hd].state.title) / PNG \(task[.png4k].state.title)" }
         return task[panel].state.title
     }
     private var primaryTitle: String {
-        if store.usesFinalization && [.stack,.matte,.geometry].contains(store.stage) {
+        if [.stack,.matte,.geometry].contains(store.stage) {
             return store.currentTask?[store.stage].state == .failed ? "重试\(stageTitle(store.stage))" : "前往人工检查"
         }
-        if store.usesFinalization && store.stage == .hd {
+        if store.stage == .hd {
             return store.currentTask?.manualEdit?.observedDocumentID != nil && store.manualObservationError != nil ? "核对已保存版本" : "确认此图"
         }
-        if store.usesFinalization && store.stage == .png4k { return "导出\(exportScope)" }
-        return switch store.stage { case .stack: "确认景深合成检查"; case .matte: "确认抠图检查"; case .geometry: "确认所选标本两面构图"; case .hd: "导出堆栈原图"; case .png4k: "确认两面并导出 4K PNG"; case .derivatives: "仅重试失败资产" }
+        if store.stage == .png4k { return "导出\(exportScope)" }
+        return "继续"
     }
     private func performPrimary() {
-        if store.usesFinalization && [.stack,.matte,.geometry].contains(store.stage) {
+        if [.stack,.matte,.geometry].contains(store.stage) {
             if store.currentTask?[store.stage].state == .failed { store.retryCurrent() }
             else { store.stage = .hd }
         } else if store.stage == .png4k { store.exportImages(scope: exportScope) }
         else { store.primary() }
     }
-    // 检查点条件由存储层汇总；界面仅据此禁用按钮，避免未验证预览进入确认。
+    // 确认绑定保存版本，导出仍要求有效确认；预览加载不阻塞人工确认。
     private var primaryDisabled: Bool {
-        if store.usesFinalization && [.stack,.matte,.geometry].contains(store.stage) {
+        if [.stack,.matte,.geometry].contains(store.stage) {
             if store.currentTask?[store.stage].state == .failed { return store.hasManualEditing || store.isUpdatingReview }
             return ![WorkflowStatus.waitingReview,.completed].contains(store.currentTask?[.geometry].state ?? .pending)
         }
-        if store.usesFinalization && store.stage == .hd { return !store.canFinalize }
-        if store.usesFinalization && store.stage == .png4k { return store.isUpdatingReview || store.exportTaskIDs(scope: exportScope).isEmpty || (!store.exportHDSelected && !store.exportPNGSelected) }
-        if store.usesFinalization { return true }
-        if store.busy || store.manualTaskID != nil || store.batch?.isPaused == true { return true }
-        if store.stage == .hd && store.exportDirectory(for: .hd) == nil { return true }
-        if store.stage == .png4k && store.exportDirectory(for: .png4k) == nil { return true }
-        if store.stage == .geometry || store.stage == .png4k { return !store.canConfirm }
-        if store.stage == .stack || store.stage == .matte { return store.batch?.activeTasks.allSatisfy { $0[store.stage].state == .waitingReview } != true }
-        return store.selectedSpecimens.isEmpty
+        if store.stage == .hd { return !store.canFinalize }
+        if store.stage == .png4k { return store.isUpdatingReview || store.exportTaskIDs(scope: exportScope).isEmpty || (!store.exportHDSelected && !store.exportPNGSelected) }
+        return true
     }
     private func assetTitle(_ kind: WorkflowAssetKind) -> String {
         switch kind { case .hd: "高清堆栈 JPG"; case .png4k: "4096 透明 PNG"; case .xianyu: "闲鱼 2000 · 浅灰 RGB 238 · 水印"; case .white1k: "1K 白底 · 1000 · 留白 10 px"; case .footage: "PNG 素材 · 原尺寸紧裁" }

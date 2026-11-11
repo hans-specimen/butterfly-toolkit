@@ -4,11 +4,11 @@ import XCTest
 @MainActor
 final class WorkflowOutputTests: XCTestCase {
     func testDraftFreezesCropChoicesForEveryFaceAndAutomaticProcessingReadsThem() async throws {
-        let f = try ExecutorFixture(checks: false,count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
         let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
         let request = GeometryRequest(ratio: .fiveByFour,targetMargin: 0.16)
-        let batch = try draft.freeze(names: "first\nsecond",output: f.batch.sourceDirectory.appendingPathComponent("output"),checkStack: false,checkMatte: false,manualFinalization: true,geometryRequest: request)
+        let batch = try draft.freeze(names: "first\nsecond",output: f.batch.sourceDirectory.appendingPathComponent("output"),geometryRequest: request)
         XCTAssertEqual(batch.activeTasks.count,4)
         for task in batch.activeTasks {
             XCTAssertEqual(task.geometryRequest.ratio,.fiveByFour)
@@ -32,10 +32,10 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testDraftCropDefaultsKeepExistingCallersCompatible() throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }
         let draft = try WorkflowBatchDraft.scan(directory: f.batch.sourceDirectory)
-        let batch = try draft.freeze(names: "sample",output: f.batch.sourceDirectory.appendingPathComponent("output"),checkStack: true,checkMatte: true)
+        let batch = try draft.freeze(names: "sample",output: f.batch.sourceDirectory.appendingPathComponent("output"))
         for task in batch.activeTasks {
             XCTAssertEqual(task.geometryRequest.ratio,.adaptive)
             XCTAssertEqual(task.geometryRequest.targetMargin,0.1)
@@ -109,7 +109,7 @@ final class WorkflowOutputTests: XCTestCase {
     }
 
     func testPSDIsCreatedBesideInputPhotos() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch
         batch.outputDirectory = batch.sourceDirectory.appendingPathComponent("internal-records")
@@ -119,20 +119,21 @@ final class WorkflowOutputTests: XCTestCase {
         try await e.runPending(batchID: batch.id)
         let b = try await e.batch(batchID: batch.id)
         for task in b.activeTasks {
-            XCTAssertEqual(task.snapshot?.workingURL.deletingLastPathComponent().path, b.sourceDirectory.path)
+            XCTAssertEqual(task.snapshot?.workingURL.deletingLastPathComponent().path, b.generatedPSDDirectory.path)
         }
     }
 
     func testWorkflowEndsAt4KWithoutRenderingDerivatives() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = WorkflowExecutor(services: f.services)
         try await e.register(batch: f.batch, manifestURL: f.manifest)
         try await e.runPending(batchID: f.batch.id)
         var b = try await e.batch(batchID: f.batch.id)
-        try await e.confirmGeometry(batchID: b.id, solutions: Dictionary(uniqueKeysWithValues: b.activeTasks.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
+        try await e.confirmSavedTasks(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)))
+        try await e.requestExports(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)), kinds: [.hd], policy: .overwrite, layouts: [:])
         b = try await e.batch(batchID: b.id)
-        try await e.confirm4K(batchID: b.id, layouts: Dictionary(uniqueKeysWithValues: b.activeTasks.map { ($0.id, $0.squareLayout) }))
+        try await e.requestExports(batchID: b.id, taskIDs: Set(b.activeTasks.map(\.id)), kinds: [.png4k], policy: .overwrite, layouts: [:])
         b = try await e.batch(batchID: b.id)
         XCTAssertTrue(b.allSucceeded)
         XCTAssertNil(b.currentStage)
@@ -141,79 +142,20 @@ final class WorkflowOutputTests: XCTestCase {
         XCTAssertFalse(calls.contains("render-xianyu"))
         XCTAssertFalse(calls.contains("render-footage"))
     }
-    func testNoCheckpointsRunsThroughBothExports() async throws {
-        let f = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch
-        batch.checkGeometry = false; batch.check4K = false
-        batch.outputLocations = WorkflowOutputLocations(hd: batch.sourceDirectory.appendingPathComponent("hd-export"), png4k: batch.sourceDirectory.appendingPathComponent("4k-export"))
-        let e = WorkflowExecutor(services: f.services)
-        try await e.register(batch: batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: batch.id)
-        let result = try await e.batch(batchID: batch.id)
-        XCTAssertTrue(result.allSucceeded)
-        for task in result.activeTasks {
-            XCTAssertEqual(task.artifacts.count, 2)
-            for artifact in task.artifacts {
-                XCTAssertEqual(artifact.url.deletingLastPathComponent().path, batch.exportDirectory(for: artifact.kind)?.path)
-                XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.url.path))
-            }
-        }
-    }
-
-    func testMissingDirectoriesMayBeChosenAtExportSteps() async throws {
-        let f = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.outputLocations = WorkflowOutputLocations()
-        XCTAssertNoThrow(try batch.validateStart())
-        let e = WorkflowExecutor(services: f.services)
-        try await e.register(batch: batch, manifestURL: f.manifest)
-        try await e.runPending(batchID: batch.id)
-        var result = try await e.batch(batchID: batch.id)
-        try await e.confirmGeometry(batchID: batch.id, solutions: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
-        result = try await e.batch(batchID: batch.id)
-        XCTAssertEqual(result.currentStage, .hd)
-        XCTAssertTrue(result.activeTasks.allSatisfy { $0[.hd].state == .pending })
-        let hd = batch.sourceDirectory.appendingPathComponent("selected-hd")
-        try await e.setExportDirectory(batchID: batch.id, kind: .hd, directory: hd)
-        try await e.runPending(batchID: batch.id)
-        result = try await e.batch(batchID: batch.id)
-        XCTAssertEqual(result.currentStage, .png4k)
-        do {
-            try await e.confirm4K(batchID: batch.id, layouts: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id, $0.squareLayout) }))
-            XCTFail("Missing 4K directory accepted")
-        } catch {}
-        try await e.setExportDirectory(batchID: batch.id, kind: .png4k, directory: batch.sourceDirectory.appendingPathComponent("selected-4k"))
-        try await e.confirm4K(batchID: batch.id, layouts: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id, $0.squareLayout) }))
-        result = try await e.batch(batchID: batch.id)
-        XCTAssertTrue(result.allSucceeded)
-    }
-
-    func testDisablingAllCheckpointsRequiresBothDirectoriesAtStart() throws {
-        let f = try ExecutorFixture(checks: false)
-        defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.checkGeometry = false; batch.check4K = false
-        batch.outputLocations = WorkflowOutputLocations()
-        XCTAssertThrowsError(try batch.validateStart())
-        batch.outputLocations?.hd = batch.sourceDirectory
-        XCTAssertThrowsError(try batch.validateStart())
-        batch.outputLocations?.png4k = batch.sourceDirectory
-        XCTAssertNoThrow(try batch.validateStart())
-        batch.outputLocations = WorkflowOutputLocations(); batch.checkAfterMatte = true
-        XCTAssertNoThrow(try batch.validateStart())
-    }
 
     func testChangingCompleted4KDirectoryAllowsImmediateConfirmation() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.checkGeometry = false; batch.check4K = false
+        var batch = f.batch
         let e = WorkflowExecutor(services: f.services)
         try await e.register(batch: batch, manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)))
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(batch.activeTasks.map(\.id)), kinds: [.png4k], policy: .overwrite, layouts: [:])
         let before = try await e.batch(batchID: batch.id)
         let folder = batch.sourceDirectory.appendingPathComponent("changed-4k")
         try await e.setExportDirectory(batchID: batch.id, kind: .png4k, directory: folder)
-        try await e.confirm4K(batchID: batch.id, layouts: Dictionary(uniqueKeysWithValues: before.activeTasks.map { ($0.id, $0.squareLayout) }))
+        try await e.requestExports(batchID: batch.id, taskIDs: Set(before.activeTasks.map(\.id)), kinds: [.png4k], policy: .overwrite, layouts: [:])
         let after = try await e.batch(batchID: batch.id)
         XCTAssertTrue(after.allSucceeded)
         for task in after.activeTasks {
@@ -226,7 +168,7 @@ final class WorkflowOutputTests: XCTestCase {
 
 
     func testChosenOutputDirectoryRejectsNestedSymlinkEscape() throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let root = f.batch.outputDirectory
         let export = root.appendingPathComponent("export"), outside = root.appendingPathComponent("outside")
@@ -236,47 +178,6 @@ final class WorkflowOutputTests: XCTestCase {
         var batch = f.batch; batch.outputLocations = WorkflowOutputLocations(hd: export, png4k: export)
         XCTAssertNoThrow(try batch.validateArtifactURL(export.appendingPathComponent("test.png"), kind: .png4k))
         XCTAssertThrowsError(try batch.validateArtifactURL(export.appendingPathComponent("escape/test.png"), kind: .png4k))
-    }
-
-    func testAllFourCheckpointSwitchCombinationsRespectReviewChoices() async throws {
-        for stackCheck in [false,true] { for matteCheck in [false,true] {
-        for geometryCheck in [false, true] {
-            for fourKCheck in [false, true] {
-                let f = try ExecutorFixture(checks: stackCheck,count: 2,checkMatte: matteCheck)
-                defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-                var batch = f.batch; batch.checkGeometry = geometryCheck; batch.check4K = fourKCheck
-                let e = WorkflowExecutor(services: f.services)
-                try await e.register(batch: batch, manifestURL: f.manifest)
-                try await e.runPending(batchID: batch.id)
-                var result = try await e.batch(batchID: batch.id)
-                if stackCheck {
-                    XCTAssertEqual(result.currentStage,.stack)
-                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("select-subject"))
-                    try await e.continueAfterReview(batchID: batch.id,stage: .stack,specimenIDs: batch.specimens.map(\.id))
-                    result = try await e.batch(batchID: batch.id)
-                }
-                if matteCheck {
-                    XCTAssertEqual(result.currentStage,.matte)
-                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("analyze"))
-                    try await e.continueAfterReview(batchID: batch.id,stage: .matte,specimenIDs: batch.specimens.map(\.id))
-                    result = try await e.batch(batchID: batch.id)
-                }
-                if geometryCheck {
-                    XCTAssertEqual(result.currentStage, .geometry)
-                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("apply-save"))
-                    try await e.confirmGeometry(batchID: batch.id, solutions: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id, $0.geometrySolution!) }), exportHD: true)
-                    result = try await e.batch(batchID: batch.id)
-                }
-                if fourKCheck {
-                    XCTAssertEqual(result.currentStage, .png4k)
-                    let calls = await f.probe.values(); XCTAssertFalse(calls.contains("render-png4k"))
-                    try await e.confirm4K(batchID: batch.id, layouts: Dictionary(uniqueKeysWithValues: result.activeTasks.map { ($0.id, $0.squareLayout) }))
-                    result = try await e.batch(batchID: batch.id)
-                }
-                XCTAssertTrue(result.allSucceeded)
-            }
-        }
-        } }
     }
 
 }

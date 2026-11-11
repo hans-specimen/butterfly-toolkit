@@ -5,10 +5,9 @@ import XCTest
 @MainActor
 final class WorkflowPerImageTests: XCTestCase {
     func testEachFaceFinishesAutomaticStepsBeforeNextFaceStarts() async throws {
-        let f = try ExecutorFixture(checks: false, count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch
-        batch.manualFinalization = true; batch.matteProvider = .photoshop
         var services = f.services
         services.selectSubject = { snapshot in
             await f.probe.record("select-subject")
@@ -27,10 +26,9 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testFailedFaceDoesNotBlockOtherFaces() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch
-        batch.manualFinalization = true; batch.matteProvider = .photoshop
         let failedID = batch.specimens[0].front.id
         var services = f.services
         services.selectSubject = { snapshot in
@@ -48,9 +46,9 @@ final class WorkflowPerImageTests: XCTestCase {
         XCTAssertEqual(result.specimens[0].back[.geometry].state, .waitingReview)
     }
     func testPauseFinishesCurrentSavedStepWithoutStartingNextStep() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
-        var batch = f.batch; batch.manualFinalization = true; batch.matteProvider = .photoshop
+        var batch = f.batch
         let entered = expectation(description: "stack started"), gate = PerImagePauseGate(entered)
         var services = f.services; let original = services.stack
         services.stack = { job,id in await gate.hold(); return try await original(job,id) }
@@ -69,10 +67,9 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testSingleFaceConfirmationAndPNGExportDoNotRequireOtherFaceOrJPEG() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var batch = f.batch
-        batch.manualFinalization = true; batch.matteProvider = .photoshop
         var services = f.services
         services.selectSubject = { snapshot in
             let saved = ExecutorFixture.snapshot(snapshot.taskID, snapshot.workingURL, "matte", roles: true)
@@ -91,7 +88,7 @@ final class WorkflowPerImageTests: XCTestCase {
         try await e.register(batch: batch, manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
         let id = batch.specimens[0].front.id
-        try await e.confirmFinalTasks(batchID: batch.id, versions: [id: "geometry"])
+        try await e.confirmSavedTasks(batchID: batch.id, taskIDs: [id])
         var result = try await e.batch(batchID: batch.id)
         XCTAssertEqual(result.specimens[0].front[.geometry].state, .completed)
         XCTAssertEqual(result.specimens[0].back[.geometry].state, .waitingReview)
@@ -118,7 +115,7 @@ final class WorkflowPerImageTests: XCTestCase {
         return services
     }
     private func registered(_ f: ExecutorFixture,services: WorkflowExecutor.Services? = nil) async throws -> WorkflowExecutor {
-        var batch = f.batch; batch.manualFinalization = true; batch.matteProvider = .photoshop
+        var batch = f.batch
         let e = WorkflowExecutor(services: services ?? nativeServices(f),coordinator: PhotoshopExecutionCoordinator())
         try await e.register(batch: batch,manifestURL: f.manifest)
         try await e.runPending(batchID: batch.id)
@@ -126,10 +123,10 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testSkipCurrentOverwriteAndSkipOutdatedAreDistinct() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = try await registered(f), id = f.batch.specimens[0].front.id
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"geometry"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.png4k],policy: .skipExisting,layouts: [:])
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.png4k],policy: .skipExisting,layouts: [:])
         var result = try await e.batch(batchID: f.batch.id)
@@ -147,10 +144,10 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testPartialExportFailureRetriesOnlyFailedType() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = try await registered(f), id = f.batch.specimens[0].front.id
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"geometry"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         await f.probe.fail([.png4k])
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.hd,.png4k],policy: .skipExisting,layouts: [:])
         var result = try await e.batch(batchID: f.batch.id)
@@ -166,7 +163,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testInterruptedWriteRequiresExplicitManualAdoptionAndNeverAutoResumes() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var services = nativeServices(f)
         services.apply = { _,_ in throw WorkflowBridgeError.interruptedWrite("injected") }
@@ -185,7 +182,7 @@ final class WorkflowPerImageTests: XCTestCase {
         XCTAssertEqual(result.task(id: id)?.manualAdoptionRequired,false)
         XCTAssertNil(result.task(id: id)?.geometryApplySourceVersion)
         XCTAssertEqual(result.task(id: id)?[.geometry].state,.waitingReview)
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"matte"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         result = try await e.batch(batchID: f.batch.id)
         XCTAssertTrue(result.isPaused)
         XCTAssertEqual(result.task(id: id)?[.geometry].state,.completed)
@@ -193,7 +190,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testOldManifestIsRejectedWithoutChangingFilesOrUsingPrevious() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var old = f.batch; old.schemaVersion = 1
         let bytes = try JSONEncoder().encode(old)
@@ -205,7 +202,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testEarlyManualViewCanEndWithoutSkippingFailedMatte() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var services = nativeServices(f)
         services.selectSubject = { _ in throw WorkflowBridgeError.invalidImage("no subject") }
@@ -216,11 +213,11 @@ final class WorkflowPerImageTests: XCTestCase {
         XCTAssertTrue(result.isPaused)
         XCTAssertEqual(result.task(id: id)?[.matte].state,.failed)
         XCTAssertEqual(result.task(id: id)?[.geometry].state,.pending)
-        do { try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"stack"]); XCTFail() } catch {}
+        do { try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id]); XCTFail() } catch {}
     }
 
     func testCannotExcludeManuallyOwnedSpecimen() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = try await registered(f), id = f.batch.specimens[0].front.id
         _ = try await e.beginManualEditing(batchID: f.batch.id,taskID: id)
@@ -235,16 +232,15 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testHDExportBecomesOutdatedEvenWhenOnlyMaskVersionChanges() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = try await registered(f), id = f.batch.specimens[0].front.id
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"geometry"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.hd],policy: .skipExisting,layouts: [:])
         let original = try await e.batch(batchID: f.batch.id).task(id: id)!.snapshot!
         var edited = original; edited.contentVersion = "mask-edited"
         try JSONEncoder().encode(edited).write(to: edited.workingURL)
-        try await e.refreshFinalPSD(batchID: f.batch.id,taskID: id)
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"mask-edited"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.hd],policy: .skipExisting,layouts: [:])
         let result = try await e.batch(batchID: f.batch.id)
         XCTAssertEqual(result.task(id: id)?.exportNotes?[.hd],"待更新，已跳过")
@@ -252,7 +248,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testReprocessingGeometryUsesMatteCheckpointAndPreservesPreviousPSD() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var services = nativeServices(f)
         services.restoreCheckpoint = { snapshot,destination in
@@ -277,10 +273,10 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testExportPauseStopsRefillingQueueAfterAlreadyStartedFiles() async throws {
-        let f = try ExecutorFixture(checks: false,count: 2)
+        let f = try ExecutorFixture(count: 2)
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let e = try await registered(f), ids = Set(f.batch.activeTasks.map(\.id))
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: Dictionary(uniqueKeysWithValues: ids.map { ($0,"geometry") }))
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: ids)
         await f.probe.block()
         let request = Task { try await e.requestExports(batchID: f.batch.id,taskIDs: ids,kinds: [.hd],policy: .skipExisting,layouts: [:]) }
         for _ in 0..<300 {
@@ -298,7 +294,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testManualMaskRefreshUpdatesTheGeometryRestartCheckpoint() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var services = nativeServices(f)
         services.selectSubject = { _ in throw WorkflowBridgeError.invalidImage("no subject") }
@@ -315,7 +311,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testExportUsesReextractedRolesAndRejectsCacheReplacementDuringRender() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let paths = PerImageRolePath(f.batch.outputDirectory.appendingPathComponent("old.png"))
         var services = nativeServices(f)
@@ -329,7 +325,7 @@ final class WorkflowPerImageTests: XCTestCase {
             await paths.replaceAfterRender()
         }
         let e = try await registered(f,services: services), id = f.batch.specimens[0].front.id
-        try await e.confirmFinalTasks(batchID: f.batch.id,versions: [id:"geometry"])
+        try await e.confirmSavedTasks(batchID: f.batch.id, taskIDs: [id])
         await paths.set(f.batch.outputDirectory.appendingPathComponent("fresh.png"))
         try await e.requestExports(batchID: f.batch.id,taskIDs: [id],kinds: [.png4k],policy: .skipExisting,layouts: [:])
         let first = try await e.batch(batchID: f.batch.id).task(id: id)!.artifacts.first!
@@ -343,7 +339,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testManualOpenCannotRaceWithCheckpointReplacement() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         let entered = expectation(description: "restoring checkpoint"), gate = PerImagePauseGate(entered)
         var services = nativeServices(f)
@@ -366,7 +362,7 @@ final class WorkflowPerImageTests: XCTestCase {
     }
 
     func testUnavailablePhotoshopPausesQueueBeforeOtherImages() async throws {
-        let f = try ExecutorFixture(checks: false)
+        let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.outputDirectory) }
         var services = nativeServices(f)
         services.stack = { _,_ in throw FocusStackError.photoshopNotFound }
