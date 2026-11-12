@@ -9,6 +9,7 @@ import SwiftUI
 enum ToolPage: String, CaseIterable, Identifiable {
 
     case photoWorkflow = "照片工作流"
+    case identificationCards = "图鉴卡片"
     case aiCutout = "AI 抠图"
     case aiSamples = "训练素材"
     case aiTraining = "模型训练"
@@ -33,6 +34,7 @@ enum ToolPage: String, CaseIterable, Identifiable {
         switch self {
 
         case .photoWorkflow: return "camera.macro"
+        case .identificationCards: return "rectangle.on.rectangle"
         case .aiCutout: return "viewfinder"
         case .aiSamples: return "photo.stack"
         case .aiTraining: return "brain"
@@ -76,6 +78,7 @@ struct ContentView: View {
     // 状态由主窗口持有，避免切换到其他工具时重新创建工作区。
     @StateObject private var aiStore = AIWorkspaceStore()
     @StateObject private var workflowStore = PhotoWorkflowStore()
+    @StateObject private var cardsStore = IdentificationCardsStore()
 
     // MARK: - 侧边栏与详情页路由
 
@@ -86,6 +89,7 @@ struct ContentView: View {
             List(selection: $selectedPage) {
                 Section("标本照片") {
                     Label(ToolPage.photoWorkflow.rawValue, systemImage: ToolPage.photoWorkflow.icon).tag(ToolPage.photoWorkflow)
+                    Label(ToolPage.identificationCards.rawValue, systemImage: ToolPage.identificationCards.icon).tag(ToolPage.identificationCards)
                 }
                 Section("AI 工作区") {
                     ForEach([ToolPage.aiCutout, .aiSamples, .aiTraining, .aiModels]) { page in
@@ -110,6 +114,9 @@ struct ContentView: View {
 
             case .photoWorkflow:
                 PhotoWorkflowView(store: workflowStore)
+
+            case .identificationCards:
+                IdentificationCardsView(store: cardsStore)
 
             case .aiCutout, .aiSamples, .aiTraining, .aiModels:
                 AIWorkspaceView(store: aiStore, page: selectedPage ?? .aiCutout) { selectedPage = $0 }

@@ -54,6 +54,10 @@ python3 scripts/version.py check
 
 ## 按需真实环境测试
 
+图鉴卡片的解析、批量采集信息填入及工作目录验证纳入常规测试。
+
+`IdentificationCardBatchLiveTests.testSelectedBatchAndInterface` 使用 `TEST_RUNNER_CARD_LIVE_TEMPLATE` 和 `TEST_RUNNER_CARD_LIVE_INPUT` 指定明确授权的模板与十组 D/V PNG，使用素材副本验证快速导出及工作 PSD 清理。可额外指定 `TEST_RUNNER_CARD_LIVE_COLLECTION` 验证采集表格按序填入及 Photoshop 文字读回。`testInterfaceSnapshotsWhenRequested` 使用 `TEST_RUNNER_CARD_UI_SESSION` 对已有隔离会话重拍界面。
+
 Xcode 运行测试时用 `TEST_RUNNER_` 前缀传递变量，并用 `-only-testing` 限定测试类。下表列的是测试内部读取的变量名，缩写的 `BATCH/EVIDENCE` 表示两个完整变量名。素材与路径约束以各测试方法为准。
 
 | 测试入口 | 变量与范围 |
