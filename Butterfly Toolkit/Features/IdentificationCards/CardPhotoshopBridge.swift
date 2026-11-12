@@ -1,6 +1,7 @@
 // 图鉴 Photoshop 桥接：所有操作经过共享协调器，快速导出完成后才交付预览文件。
 import Foundation
 import ImageIO
+import CryptoKit
 
 nonisolated struct CardRenderRequest: Sendable {
     var working: URL
@@ -18,6 +19,8 @@ nonisolated struct CardRenderResult: Sendable {
     var width: Int
     var height: Int
     var collision: Bool
+    var workHash: String
+    var previewHash: String
 }
 nonisolated protocol CardPhotoshopServing: Sendable {
     func render(_ request: CardRenderRequest, owner: UUID) async throws -> CardRenderResult
@@ -46,9 +49,9 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
         return result
     }
     func close(_ url: URL, owner: UUID,expectedHash:String?) async throws {
-        _ = try await coordinator.run(owner:owner) {
+        try await coordinator.run(owner:owner) {
             if let expectedHash,try AIFileValidation.hash(url.path) != expectedHash { throw CardError.message("PSD 在导出后又有修改，已保留新的人工版本") }
-            return try await self.invoke(["operation":"close", "working":url.resolvingSymlinksInPath().path])
+            try await self.closeWorking(url)
         }
     }
     // MARK: - 真实模板与渲染
@@ -63,12 +66,25 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
         var collision: Bool = false
         var frontSize: [Double] = []
         var backSize: [Double] = []
+        var documentID: Int?
+        var nativePath: String?
+        var owned: Bool?
     }
     private func invoke(_ payload: [String:Any]) async throws -> Metadata {
         let data = try JSONSerialization.data(withJSONObject:payload,options:[.sortedKeys])
         let script = CardPhotoshopScript.source + "\ncardRun(" + String(decoding:data,as:UTF8.self) + ");"
         let output = try await PhotoshopWorkflowBridge.execute(script)
-        return try JSONDecoder().decode(Metadata.self,from:Data(output.utf8))
+        do { return try JSONDecoder().decode(Metadata.self,from:Data(output.utf8)) }
+        catch {
+            let operation = payload["operation"] as? String ?? "预览"
+            throw CardError.message("Photoshop 未返回有效的图鉴结果（\(operation)）。\(error.localizedDescription)")
+        }
+    }
+    private func closeWorking(_ url: URL, documentID: Int? = nil, nativePath: String? = nil) async throws {
+        var payload: [String:Any] = ["operation":"close", "working":url.resolvingSymlinksInPath().path]
+        if let documentID { payload["documentID"] = documentID }
+        if let nativePath { payload["nativePath"] = nativePath }
+        _ = try await invoke(payload)
     }
     private func renderUnlocked(_ original: CardRenderRequest, inspectOnly: Bool) async throws -> CardRenderResult {
         var request=original
@@ -90,10 +106,33 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
             guard !inspectOnly, request.roles == nil else { throw CardError.message("工作 PSD 已丢失，不能丢弃人工状态后自动重建") }
             try fm.copyItem(at:request.template,to:request.working)
         }
+        let opened = try await invoke(["operation":"acquire", "working":request.working.resolvingSymlinksInPath().path])
+        guard let documentID = opened.documentID, let nativePath = opened.nativePath, let owned = opened.owned else {
+            throw CardError.message("无法确认 Photoshop 工作 PSD 的归属")
+        }
+        let result: CardRenderResult
+        do {
+            result = try await renderOpened(request, inspectOnly:inspectOnly, documentID:documentID, nativePath:nativePath)
+        } catch {
+            // 只关闭本次打开且仍为已保存状态的同一个文档。失败时保留脏文档。
+            if owned { try? await closeWorking(request.working, documentID:documentID, nativePath:nativePath) }
+            throw error
+        }
+        if owned { try await closeWorking(request.working, documentID:documentID, nativePath:nativePath) }
+        return result
+    }
+
+    private func renderOpened(_ request: CardRenderRequest, inspectOnly: Bool, documentID: Int, nativePath: String) async throws -> CardRenderResult {
+        let fm = FileManager.default
+        let folder = request.working.deletingLastPathComponent()
+        let checkpointURL = folder.appendingPathComponent("prepared.json")
+        let working = request.working.resolvingSymlinksInPath().path
         let stage = folder.appendingPathComponent("render-\(UUID())")
         try fm.createDirectory(at:stage,withIntermediateDirectories:true)
         // 独立副本可直接关闭；不会打开或关闭用户正在查看的原 PNG。
-        var payload: [String:Any] = ["working":request.working.resolvingSymlinksInPath().path, "operation":inspectOnly ? "inspect" : "prepare"]
+        let document: [String:Any] = ["working":working, "documentID":documentID, "nativePath":nativePath]
+        var payload = document
+        payload["operation"] = inspectOnly ? "inspect" : "prepare"
         if let roles = request.roles { payload["roles"] = roles }
         if !inspectOnly {
             payload["fields"] = ["chineseName":request.fields.chineseName,"latinName":request.fields.latinName,"sex":request.fields.sex.rawValue,"collectionText":request.fields.collectionText]
@@ -113,12 +152,19 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
         if request.layout && !inspectOnly {
             guard metadata.frontSize.count == 2, metadata.backSize.count == 2 else { throw CardError.message("无法读取蝴蝶可见轮廓") }
             let frames = CardLayout.frames(front:CGSize(width:metadata.frontSize[0],height:metadata.frontSize[1]),back:CGSize(width:metadata.backSize[0],height:metadata.backSize[1]))
-            payload = ["working":request.working.resolvingSymlinksInPath().path,"operation":"layout","roles":metadata.roles,"frames":frames.map { [$0.minX,$0.minY,$0.width,$0.height] }]
+            payload = document
+            payload["operation"] = "layout"
+            payload["roles"] = metadata.roles
+            payload["frames"] = frames.map { [$0.minX,$0.minY,$0.width,$0.height] }
             metadata = try await invoke(payload)
             try checkpoint(metadata,pending:false)
         }
         let before = try AIFileValidation.hash(request.working.path)
-        _ = try await invoke(["working":request.working.resolvingSymlinksInPath().path,"operation":"export","roles":metadata.roles,"destination":stage.resolvingSymlinksInPath().path])
+        payload = document
+        payload["operation"] = "export"
+        payload["roles"] = metadata.roles
+        payload["destination"] = stage.resolvingSymlinksInPath().path
+        _ = try await invoke(payload)
         let candidate = stage.appendingPathComponent(request.working.deletingPathExtension().lastPathComponent + ".png")
         var ready = false
         var lastSize: Int64 = -1
@@ -131,14 +177,19 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
             try await Task.sleep(for:.milliseconds(250))
         }
         guard ready else { throw CardError.message("Photoshop 快速导出未完成，请检查 Photoshop 后重试；临时 PSD 已保留") }
-        _ = try await invoke(["working":request.working.resolvingSymlinksInPath().path,"operation":"check"])
+        payload = document
+        payload["operation"] = "check"
+        _ = try await invoke(payload)
         guard try AIFileValidation.hash(request.working.path) == before else { throw CardError.message("导出期间工作文档发生变化，请刷新后重试") }
         let preview = folder.appendingPathComponent("preview.png")
-        try Data(contentsOf:candidate).write(to:preview,options:.atomic)
+        let png = try Data(contentsOf:candidate)
+        let previewHash = SHA256.hash(data: png).map { String(format:"%02x", $0) }.joined()
+        try png.write(to:preview,options:.atomic)
         try fm.removeItem(at:stage)
         var fields = request.fields
         fields.chineseName = metadata.chineseName; fields.latinName = metadata.latinName
         fields.sex = metadata.sex; fields.collectionText = metadata.collectionText
-        return CardRenderResult(roles:metadata.roles,fields:fields,preview:preview,width:metadata.width,height:metadata.height,collision:metadata.collision)
+        return CardRenderResult(roles:metadata.roles,fields:fields,preview:preview,width:metadata.width,height:metadata.height,
+                                collision:metadata.collision,workHash:before,previewHash:previewHash)
     }
 }

@@ -69,4 +69,22 @@ final class IdentificationCardParsingTests: XCTestCase {
         XCTAssertEqual(try CardCollectionInfo.parse(tabular[0].source), tabular[0].info)
         XCTAssertThrowsError(try CardCollectionInfo.parseBatch("Cameroon\tEbogo\t2026.2\n缺少列"))
     }
+
+    func testLeadingWingspanFollowsDateAndLegacyRowsRemainReadable() throws {
+        let rows = try CardCollectionInfo.parseBatch("""
+        | 74 | DR Congo | Biakato, Mambasa, Ituri | 2004.12.15 |
+        | -- | -------- | --------------------- | ---------- |
+        | | Cameroon | Ebogo, Centre Reg. | 2026.2 |
+        | 81 mm | Cameroon | Ebogo, Centre Reg. | 2026.2 |
+        """)
+        XCTAssertEqual(rows.map(\.info.formatted), [
+            "Biakato, Mambasa, Ituri, DR Congo, 2004.12.15, 74 mm",
+            "Ebogo, Centre Reg., Cameroon, 2026.2",
+            "Ebogo, Centre Reg., Cameroon, 2026.2, 81 mm"
+        ])
+        let legacy = try JSONDecoder().decode(CardCollectionInfo.self, from: Data(
+            #"{"country":"Ghana","locality":"Ashanti","altitude":"1000m","date":"2025.4","warnings":[]}"#.utf8))
+        XCTAssertNil(legacy.wingspan)
+        XCTAssertEqual(legacy.formatted, "Ashanti, Ghana, 1000m, 2025.4")
+    }
 }

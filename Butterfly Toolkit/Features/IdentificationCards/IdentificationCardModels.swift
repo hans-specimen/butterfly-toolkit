@@ -35,6 +35,7 @@ nonisolated struct CardRecord: Codable, Identifiable, Sendable {
     var fields: CardFields
     var revision = 0
     var renderedRevision: Int?
+    var previewHash: String?
     var roles: [String: Int]?
     var sources: [String: String] = [:]
     var workHash: String?

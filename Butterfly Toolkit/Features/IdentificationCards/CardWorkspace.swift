@@ -66,7 +66,7 @@ nonisolated struct CardWorkspace: Sendable {
         }
     }
     // MARK: - 发布与清理
-    func publish(_ candidate: URL, to target: URL, expected: CardTargetStamp) throws {
+    func publish(_ candidate: URL, to target: URL, expected: CardTargetStamp, previewHash: String? = nil) throws {
         guard try CardTargetStamp.read(target) == expected else { throw CardError.message("同名文件在确认后发生变化，请重新确认覆盖") }
         guard let source = CGImageSourceCreateWithURL(candidate as CFURL,nil), CGImageSourceGetStatus(source) == .statusComplete,
               let image = CGImageSourceCreateImageAtIndex(source,0,nil), image.width == 4000, image.height == 2250 else { throw CardError.message("导出 PNG 不完整或尺寸错误，原成品保持不变") }
@@ -75,6 +75,9 @@ nonisolated struct CardWorkspace: Sendable {
         let temporary = target.deletingLastPathComponent().appendingPathComponent(".card-\(UUID()).png")
         try fm.copyItem(at:candidate,to:temporary)
         defer { try? fm.removeItem(at:temporary) }
+        if let previewHash, try AIFileValidation.hash(temporary.path) != previewHash {
+            throw CardError.message("预览文件已变化，请重新生成预览。")
+        }
         var coordinationError: NSError?, operationError: Error?
         NSFileCoordinator().coordinate(writingItemAt:target,options:.forReplacing,error:&coordinationError) { coordinated in
             do {

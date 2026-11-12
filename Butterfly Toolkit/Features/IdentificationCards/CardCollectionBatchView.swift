@@ -15,7 +15,7 @@ struct CardCollectionBatchView: View {
 
         VStack(alignment: .leading, spacing: 14) {
             Text("批量填写采集信息").font(.title2.bold())
-            Text("粘贴 Markdown 或制表符表格，每行对应左侧列表的一只标本。没有信息时，用各列都留空的表格行占位。")
+            Text("每行对应左侧的一只标本。可粘贴「翅展（mm）、国家、采集点、日期」或原有采集表格。没有信息时保留空单元格。")
                 .foregroundStyle(.secondary)
             TextEditor(text: $source)
                 .font(.body)

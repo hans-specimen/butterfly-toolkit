@@ -9,12 +9,22 @@ function cardRun(q) {
  function sid(s){return stringIDToTypeID(s);}
  function enc(o){if(o===null)return 'null';if(typeof o=='string')return '"'+o.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\r/g,'\\r').replace(/\n/g,'\\n').replace(/\t/g,'\\t')+'"';if(typeof o!='object')return String(o);var a=[],k;if(o instanceof Array){for(k=0;k<o.length;k++)a.push(enc(o[k]));return '['+a.join(',')+']';}for(k in o)if(o.hasOwnProperty(k))a.push(enc(k)+':'+enc(o[k]));return '{'+a.join(',')+'}';}
  function empty(){return {roles:{},chineseName:'',latinName:'',collectionText:'',sex:'unknown',width:0,height:0,collision:false,frontSize:[],backSize:[]};}
- var doc=null, path=new File(q.working).fsName;
+ var doc=null, path=q.nativePath || new File(q.working).fsName;
+ function samePath(a,b){return a==b||a.replace(/^\/private\/(var|tmp)\//,'/$1/')==b.replace(/^\/private\/(var|tmp)\//,'/$1/');}
  function bounds(l){var b=l.boundsNoEffects||l.bounds;return [b[0].as('px'),b[1].as('px'),b[2].as('px'),b[3].as('px')];}
  function byID(p,id){for(var i=0;i<p.layers.length;i++){var l=p.layers[i];if(l.id==id)return l;if(l.typename=='LayerSet'){var found=byID(l,id);if(found)return found;}}return null;}
  function byName(p,name){for(var i=0;i<p.layers.length;i++){var l=p.layers[i];if(l.name==name)return l;if(l.typename=='LayerSet'){var found=byName(l,name);if(found)return found;}}return null;}
  try {
-  for(var i=0;i<app.documents.length;i++){try{if(app.documents[i].fullName.fsName==path)doc=app.documents[i];}catch(e){}}
+  for(var i=0;i<app.documents.length;i++){try{if(samePath(app.documents[i].fullName.fsName,path))doc=app.documents[i];}catch(e){}}
+  if(q.operation=='acquire'){
+   var state=empty();state.owned=!doc;
+   if(!doc)doc=app.open(new File(path));
+   state.documentID=doc.id;state.nativePath=doc.fullName.fsName;return enc(state);
+  }
+  if(q.documentID!=null&&(!doc||doc.id!=q.documentID)){
+   if(q.operation=='close')return enc(empty());
+   throw Error('工作 PSD 已关闭或被重新打开，请重新生成预览');
+  }
   if(q.operation=='close'){if(doc){if(!doc.saved)throw Error('工作 PSD 尚未保存，请先在 Photoshop 保存');doc.close(SaveOptions.DONOTSAVECHANGES);}return enc(empty());}
   if(!doc)doc=app.open(new File(path));
   app.activeDocument=doc;
@@ -48,8 +58,40 @@ function cardRun(q) {
    var d=new ActionDescriptor(),r=new ActionReference();r.putEnumerated(sid('layer'),sid('ordinal'),sid('targetEnum'));d.putReference(sid('null'),r);d.putString(sid('fileType'),'png');d.putInteger(sid('quality'),32);d.putInteger(sid('metadata'),metadata);d.putBoolean(sid('sRGB'),srgb);d.putBoolean(sid('openWindow'),false);d.putBoolean(sid('promptForSaveLocation'),false);d.putString(sid('destFolder'),q.destination);executeAction(sid('exportDocumentAsFileTypePressed'),d,DialogModes.NO);return enc(empty());
   }
   if(q.operation=='prepare'){
-   function setText(layer,value){layer.allLocked=false;layer.textItem.contents=value||' ';layer.visible=!!value;if(value){var b=bounds(layer);layer.translate(2000-(b[0]+b[2])/2,0);}}
-   setText(latin,q.fields.latinName);setText(chinese,q.fields.chineseName);setText(collection,q.fields.collectionText);
+   function applyNameTypography(layer,value){
+    var regular=app.fonts.getByName('PingFangSC-Regular'), italic=app.fonts.getByName('TimesNewRomanPS-ItalicMT');
+    doc.activeLayer=layer;
+    var key=sid('textKey'), ref=new ActionReference();
+    ref.putProperty(sid('property'),key);ref.putIdentifier(sid('layer'),layer.id);
+    var textDescriptor=executeActionGet(ref).getObjectValue(key), styleKey=sid('textStyleRange');
+    var existing=textDescriptor.getList(styleKey), base=existing.getObjectValue(0).getObjectValue(sid('textStyle'));
+    var last=existing.getObjectValue(existing.count-1).getInteger(sid('to'));
+    var end=Math.max(value.length,Math.min(value.length+1,last)), ranges=new ActionList();
+    function addRange(from,to,font){
+     if(from>=to)return;
+     var style=new ActionDescriptor();style.fromStream(base.toStream());
+     style.putString(sid('fontPostScriptName'),font.postScriptName);
+     style.putString(sid('fontName'),font.family);style.putString(sid('fontStyleName'),font.style);
+     style.putUnitDouble(sid('size'),charIDToTypeID('#Pnt'),16);
+     if(style.hasKey(sid('impliedFontSize')))style.erase(sid('impliedFontSize'));
+     style.putBoolean(sid('syntheticItalic'),false);style.putBoolean(sid('syntheticBold'),false);
+     var range=new ActionDescriptor();range.putInteger(sid('from'),from);range.putInteger(sid('to'),to==value.length?end:to);
+     range.putObject(sid('textStyle'),sid('textStyle'),style);ranges.putObject(styleKey,range);
+    }
+    // Photoshop 的区间按 UTF-16 字符索引计数，标点和词间空格跟随英文片段。
+    var latinWords=/[A-Za-z\u00c0-\u024f\u1e00-\u1eff][A-Za-z0-9\u00c0-\u024f\u0300-\u036f\u1e00-\u1eff .’'\-]*/g, word, cursor=0;
+    while((word=latinWords.exec(value))!=null){
+     addRange(cursor,word.index,regular);addRange(word.index,latinWords.lastIndex,italic);cursor=latinWords.lastIndex;
+    }
+    addRange(cursor,value.length,regular);
+    textDescriptor.putList(styleKey,ranges);
+    var target=new ActionReference(), change=new ActionDescriptor();
+    target.putEnumerated(sid('textLayer'),sid('ordinal'),sid('targetEnum'));
+    change.putReference(sid('null'),target);change.putObject(sid('to'),sid('textLayer'),textDescriptor);
+    executeAction(sid('set'),change,DialogModes.NO);
+   }
+   function setText(layer,value,styled){layer.allLocked=false;layer.textItem.contents=value||' ';layer.visible=!!value;if(value){if(styled)applyNameTypography(layer,value);var b=bounds(layer);layer.translate(2000-(b[0]+b[2])/2,0);}}
+   setText(latin,q.fields.latinName);setText(chinese,q.fields.chineseName,true);setText(collection,q.fields.collectionText);
    female.visible=q.fields.sex=='female';male.visible=q.fields.sex=='male';
   }
   shape.visible=false;bg.visible=true;text.visible=true;butterfly.visible=true;front.visible=true;back.visible=true;

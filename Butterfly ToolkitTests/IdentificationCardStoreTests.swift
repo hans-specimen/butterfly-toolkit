@@ -61,7 +61,7 @@ final class IdentificationCardStoreTests: XCTestCase {
         record.revision=1;record.renderedRevision=1
         XCTAssertFalse(record.isExported)
     }
-    @MainActor func testImportPreviewsAndManualExternalChangeCanBeResumed() async throws {
+    @MainActor func testImportAndSelectionWaitForExplicitPreview() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
         let front=root.appendingPathComponent("SC1_蝶_Test_D.png"), back=root.appendingPathComponent("SC1_蝶_Test_V.png")
@@ -72,14 +72,57 @@ final class IdentificationCardStoreTests: XCTestCase {
         let bridge=CardTestBridge(), workspace=CardWorkspace(root:root.appendingPathComponent("work"),template:front)
         let store=IdentificationCardsStore(workspace:workspace,bridge:bridge)
         store.importFiles([front,back]); try await settle(store)
-        XCTAssertNotNil(store.current?.renderedRevision,"导入后应自动生成首张预览")
-        if store.current?.renderedRevision == nil { store.refresh(); try await settle(store) }
+        XCTAssertNil(store.current?.renderedRevision)
         let id=try XCTUnwrap(store.current?.id)
+        store.select(id)
+        store.edit { $0.chineseName = "手动填写" }
+        try await settle(store)
+        let before = await bridge.renderCount
+        XCTAssertEqual(before, 0)
+        store.refresh(all:true)
+        try await settle(store)
+        XCTAssertEqual(store.current?.renderedRevision, store.current?.revision)
+        XCTAssertEqual(store.current?.fields.chineseName, "手动填写")
         try Data("external edit".utf8).write(to:workspace.working(id))
         store.openPhotoshop(); try await settle(store)
         XCTAssertEqual(store.manualID,id,"外部保存后应允许进入人工模式读回，不能陷入无法刷新的死路")
         if store.manualID != nil { store.finishManual(); try await settle(store) }
         XCTAssertNil(store.manualID)
+    }
+
+    @MainActor func testExportPublishesCurrentPreviewWithoutPhotoshopAndSkipsEditedCard() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let workspace = CardWorkspace(root: root.appendingPathComponent("work"), template: root.appendingPathComponent("template.psd"))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("template".utf8).write(to: workspace.template)
+        let files = try ["SC1_甲_Test one", "SC2_乙_Test two"].flatMap { name in
+            try ["D", "V"].map { side in
+                let url = root.appendingPathComponent(name + "_" + side + ".png")
+                try Data("source".utf8).write(to: url)
+                return url
+            }
+        }
+        let records = CardInputParser.group(files).map { CardRecord(input: $0) }
+        let output = root.appendingPathComponent("output")
+        try workspace.save(CardSession(records: records, outputDirectory: output))
+        let bridge = CardTestBridge()
+        let store = IdentificationCardsStore(workspace: workspace, bridge: bridge)
+        store.refresh(all:true)
+        try await settle(store)
+        let first = try XCTUnwrap(store.session.records.first)
+        let cached = try Data(contentsOf: workspace.preview(first.id))
+        store.select(records[1].id)
+        store.edit { $0.collectionText = "新的采集信息" }
+        store.export(all:true)
+        try await settle(store)
+        XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent(first.outputName)), cached)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.appendingPathComponent(records[1].outputName).path))
+        let renders = await bridge.renderCount
+        let closes = await bridge.closeCount
+        XCTAssertEqual(renders, 2)
+        XCTAssertEqual(closes, 0)
+        XCTAssertTrue(store.session.records[0].isExported)
+        XCTAssertFalse(store.session.records[1].isExported)
     }
     @MainActor private func settle(_ store:IdentificationCardsStore) async throws {
         for _ in 0..<200 { if !store.busy { return }; try await Task.sleep(for:.milliseconds(20)) }
@@ -121,12 +164,23 @@ final class IdentificationCardStoreTests: XCTestCase {
 }
 
 private actor CardTestBridge: CardPhotoshopServing {
+    private(set) var renderCount = 0
+    private(set) var closeCount = 0
     func render(_ request:CardRenderRequest,owner:UUID) async throws -> CardRenderResult {
+        renderCount += 1
         try FileManager.default.createDirectory(at:request.working.deletingLastPathComponent(),withIntermediateDirectories:true)
         try Data("working".utf8).write(to:request.working)
-        return CardRenderResult(roles:["front":1],fields:request.fields,preview:request.working.deletingLastPathComponent().appendingPathComponent("preview.png"),width:4000,height:2250,collision:false)
+        let preview = request.working.deletingLastPathComponent().appendingPathComponent("preview.png")
+        let context = try XCTUnwrap(CGContext(data:nil,width:4000,height:2250,bitsPerComponent:8,bytesPerRow:0,
+                                              space:CGColorSpaceCreateDeviceRGB(),bitmapInfo:CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(CGColor(gray:0.5,alpha:1))
+        context.fill(CGRect(x:0,y:0,width:4000,height:2250))
+        let image = try XCTUnwrap(context.makeImage())
+        try XCTUnwrap(NSBitmapImageRep(cgImage:image).representation(using:.png,properties:[:])).write(to:preview)
+        return CardRenderResult(roles:["front":1],fields:request.fields,preview:preview,width:4000,height:2250,collision:false,
+                                workHash:try AIFileValidation.hash(request.working.path),previewHash:try AIFileValidation.hash(preview.path))
     }
     func beginManual(_ url:URL,owner:UUID) async throws {}
     func finishManual(_ request:CardRenderRequest,owner:UUID) async throws -> CardRenderResult { try await render(request,owner:owner) }
-    func close(_ url:URL,owner:UUID,expectedHash:String?) async throws {}
+    func close(_ url:URL,owner:UUID,expectedHash:String?) async throws { closeCount += 1 }
 }

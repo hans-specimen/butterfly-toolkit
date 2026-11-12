@@ -21,6 +21,7 @@ struct CardOverwriteRequest: Identifiable {
     let workspace: CardWorkspace
     private let bridge: any CardPhotoshopServing
     private var exportQueue: [UUID] = []
+    private var skippedExports = 0
     private var recoveryFailed = false
     var current: CardRecord? { session.records.first { $0.id == selectedID } }
     var locked: Bool { busy || manualID != nil || overwrite != nil || recoveryFailed }
@@ -44,14 +45,11 @@ struct CardOverwriteRequest: Identifiable {
             }
             if self.selectedID == nil { self.selectedID = self.session.records.first?.id }
             try self.persist(); self.loadImage()
-        } completion: {
-            if self.current?.input.issue == nil { self.refresh() }
         }
     }
     func select(_ id: UUID) {
         guard !locked else { return }
         selectedID = id; loadImage()
-        if let card = current, card.input.issue == nil, card.renderedRevision != card.revision { refresh() }
     }
     func edit(_ update: (inout CardFields)->Void) {
         guard !locked, let index = index(selectedID) else { return }
@@ -105,8 +103,41 @@ struct CardOverwriteRequest: Identifiable {
         }
     }
     // MARK: - 预览与人工编辑
-    func refresh(layout: Bool = false) {
-        guard !locked, let id = selectedID else { return }
+    func hasCurrentPreview(_ card: CardRecord) -> Bool {
+        card.renderedRevision == card.revision && card.previewHash != nil
+            && FileManager.default.fileExists(atPath: workspace.preview(card.id).path)
+    }
+
+    func canExport(_ card: CardRecord) -> Bool {
+        card.input.issue == nil && !card.collision && hasCurrentPreview(card)
+    }
+
+    func refresh(layout: Bool = false, all: Bool = false) {
+        guard !locked else { return }
+        if all {
+            let pending = session.records.filter { $0.input.issue == nil && !hasCurrentPreview($0) }
+            guard !pending.isEmpty else { return }
+            run("正在生成图鉴预览…") {
+                var failures: [String] = []
+                for (offset, card) in pending.enumerated() {
+                    self.activity = "正在预览 \(offset + 1)/\(pending.count) · \(card.input.id)"
+                    do {
+                        try await self.render(card.id)
+                    } catch {
+                        let reason = error.localizedDescription
+                        if let i = self.index(card.id) { self.session.records[i].issue = reason }
+                        failures.append("\(card.input.id) \(reason)")
+                    }
+                    if self.selectedID == card.id { self.loadImage() }
+                }
+                if !failures.isEmpty {
+                    try self.persist()
+                    self.error = "\(failures.count) 张卡片预览失败。\n" + failures.joined(separator: "\n")
+                }
+            }
+            return
+        }
+        guard let id = selectedID else { return }
         run("正在生成 Photoshop 预览…") { try await self.render(id,forceLayout:layout); self.loadImage() }
     }
     func openPhotoshop() {
@@ -166,18 +197,34 @@ struct CardOverwriteRequest: Identifiable {
     }
     private func accept(_ result: CardRenderResult,id:UUID,revision:Int) throws {
         guard let i = index(id), session.records[i].revision == revision else { throw CardError.message("卡片已更新，旧预览未采用") }
-        session.records[i].roles = result.roles; session.records[i].fields = result.fields
-        session.records[i].renderedRevision = revision; session.records[i].collision = result.collision
-        session.records[i].layoutPending = false
-        session.records[i].workHash = try AIFileValidation.hash(workspace.working(id).path)
-        session.records[i].issue = result.collision ? "图片与文字过近或超出画布，请在 Photoshop 调整" : nil
-        try persist()
+        guard result.preview.standardizedFileURL == workspace.preview(id).standardizedFileURL else {
+            throw CardError.message("预览文件归属不符")
+        }
+        guard try AIFileValidation.hash(result.preview.path) == result.previewHash,
+              try AIFileValidation.hash(workspace.working(id).path) == result.workHash else {
+            throw CardError.message("预览或工作 PSD 已变化，请重新预览。")
+        }
+        var updated = session
+        updated.records[i].roles = result.roles
+        updated.records[i].fields = result.fields
+        updated.records[i].renderedRevision = revision
+        updated.records[i].previewHash = result.previewHash
+        updated.records[i].collision = result.collision
+        updated.records[i].layoutPending = false
+        updated.records[i].workHash = result.workHash
+        updated.records[i].issue = result.collision ? "图片与文字过近或超出画布，请在 Photoshop 调整" : nil
+        try workspace.save(updated)
+        session = updated
     }
     // MARK: - 导出队列和逐项覆盖确认
     func export(all: Bool) {
         guard !locked else { return }
-        exportQueue = all ? session.records.filter { $0.input.issue == nil }.map(\.id) : [selectedID].compactMap { $0 }
-        let names = session.records.filter { exportQueue.contains($0.id) }.map { $0.outputName.lowercased() }
+        let candidates = all ? session.records : [current].compactMap { $0 }
+        let ready = candidates.filter { canExport($0) }
+        guard !ready.isEmpty else { error = "请先为要导出的卡片生成有效预览。"; return }
+        skippedExports = candidates.count - ready.count
+        exportQueue = ready.map(\.id)
+        let names = ready.map { $0.outputName.lowercased() }
         guard Set(names).count == names.count else { exportQueue = []; error = "批次内有相同输出文件名，请先修改名称"; return }
         exportNext()
     }
@@ -187,7 +234,10 @@ struct CardOverwriteRequest: Identifiable {
         else { exportNext() }
     }
     private func exportNext() {
-        guard !exportQueue.isEmpty else { return }
+        guard !exportQueue.isEmpty else {
+            if skippedExports > 0 { error = "已跳过 \(skippedExports) 张没有有效预览的卡片。"; skippedExports = 0 }
+            return
+        }
         let id = exportQueue.removeFirst()
         guard let card = session.records.first(where:{ $0.id == id }) else { exportNext(); return }
         let destination = session.outputDirectory.appendingPathComponent(card.outputName)
@@ -199,19 +249,37 @@ struct CardOverwriteRequest: Identifiable {
     }
     private func exportOne(_ id:UUID,to destination:URL,stamp:CardTargetStamp) {
         run("正在导出图鉴 PNG…") {
-            try await self.render(id)
-            guard let i = self.index(id), !self.session.records[i].collision else { throw CardError.message("图片与文字重合或超出画布，未导出") }
+            guard let i = self.index(id) else { return }
             let record = self.session.records[i]
-            try self.workspace.verify(record.sources)
-            guard record.renderedRevision == record.revision, try AIFileValidation.hash(self.workspace.working(id).path) == record.workHash else { throw CardError.message("预览已过期，请重新刷新") }
-            try self.workspace.publish(self.workspace.preview(id),to:destination,expected:stamp)
+            guard self.canExport(record), let previewHash = record.previewHash,
+                  let front = record.input.front, let back = record.input.back else {
+                throw CardError.message("预览已过期，请重新生成预览。")
+            }
+            let workspace = self.workspace
+            try await Task.detached {
+                guard Set(record.sources.keys) == Set([front.path, back.path, workspace.template.path]) else {
+                    throw CardError.message("缺少预览来源校验，请重新生成预览。")
+                }
+                try workspace.verify(record.sources)
+                let working = workspace.working(id)
+                if record.workHash != nil || FileManager.default.fileExists(atPath: working.path) {
+                    guard try AIFileValidation.hash(working.path) == record.workHash else {
+                        throw CardError.message("工作 PSD 已变化，请采用人工调整或重新生成预览。")
+                    }
+                }
+                try workspace.publish(workspace.preview(id),to:destination,expected:stamp,previewHash:previewHash)
+            }.value
             self.session.records[i].exportedURL = destination
             self.session.records[i].exportedRevision = record.revision
             try self.persist()
-            try await self.bridge.close(self.workspace.working(id),owner:id,expectedHash:record.workHash)
-            try self.workspace.cleanCompleted(id,expectedHash:record.workHash)
-            self.session.records[i].roles = nil; self.session.records[i].workHash = nil
-            try self.persist(); self.loadImage()
+            // Photoshop 运行时，用户可能从外部重新打开工作 PSD，无法只凭磁盘哈希确认可清理。
+            if let hash = record.workHash,
+               NSRunningApplication.runningApplications(withBundleIdentifier: "com.adobe.Photoshop").allSatisfy(\.isTerminated) {
+                try workspace.cleanCompleted(id,expectedHash:hash)
+                self.session.records[i].roles = nil
+                self.session.records[i].workHash = nil
+                try self.persist()
+            }
         } completion: { self.exportNext() }
     }
     // MARK: - 生命周期

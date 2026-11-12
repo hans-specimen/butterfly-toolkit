@@ -44,6 +44,8 @@ final class IdentificationCardBatchLiveTests: XCTestCase {
             XCTAssertFalse(result.collision,group.id)
             XCTAssertEqual(result.fields.collectionText, card.fields.collectionText, group.id)
             card.roles=result.roles;card.renderedRevision=card.revision
+            card.previewHash = result.previewHash
+            card.sources = try workspace.fingerprints([request.front, request.back, request.template])
             let hash=try AIFileValidation.hash(workspace.working(card.id).path)
             let destination=output.appendingPathComponent(card.outputName)
             try workspace.publish(result.preview,to:destination,expected:CardTargetStamp.read(destination))

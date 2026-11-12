@@ -65,8 +65,12 @@ struct IdentificationCardsView: View {
             Button("添加 PNG 或文件夹…",systemImage:"plus") { chooseInputs() }.disabled(store.locked)
             Button("批量填写采集信息…") { showCollectionBatch = true }
                 .disabled(store.locked || store.session.records.isEmpty)
-            Button("导出可用卡片") { store.export(all:true) }
-                .disabled(store.locked || !store.session.records.contains { $0.input.issue == nil })
+            Button("预览全部") { store.refresh(all:true) }
+                .help("依次生成缺少预览或已过期的卡片")
+                .disabled(store.locked || !store.session.records.contains { $0.input.issue == nil && !store.hasCurrentPreview($0) })
+            Button("导出全部") { store.export(all:true) }
+                .help("导出所有已有有效预览的卡片")
+                .disabled(store.locked || !store.session.records.contains { store.canExport($0) })
         }.padding(.horizontal,24).padding(.vertical,18)
     }
     private var queue: some View {
@@ -97,7 +101,7 @@ struct IdentificationCardsView: View {
     private func status(_ card:CardRecord) -> String {
         if let issue = card.input.issue ?? card.issue { return issue }
         if card.isExported { return "已导出" }
-        return card.renderedRevision == card.revision ? "待导出" : "待生成预览"
+        return store.hasCurrentPreview(card) ? "待导出" : "待生成预览"
     }
     // MARK: - 预览与人工调整
     private var preview: some View {
@@ -106,12 +110,12 @@ struct IdentificationCardsView: View {
             if let image = store.selectedImage {
                 Image(nsImage:image).resizable().scaledToFit().padding(.horizontal,20)
                     .accessibilityLabel("当前图鉴卡片的 Photoshop 合成预览")
-                if let current = store.current,current.renderedRevision != current.revision {
-                    Label("信息已修改，请刷新预览",systemImage:"arrow.clockwise").font(.callout).foregroundStyle(.secondary)
+                if let current = store.current, !store.hasCurrentPreview(current) {
+                    Label("请重新生成预览后导出",systemImage:"arrow.clockwise").font(.callout).foregroundStyle(.secondary)
                 }
             } else {
                 Image(systemName:"photo.on.rectangle").font(.system(size:38,weight:.light)).foregroundStyle(.secondary)
-                Text(store.current?.input.issue ?? "选择卡片后生成真实模板预览")
+                Text(store.current?.input.issue ?? "填写卡片信息后，点击「预览当前」或「预览全部」")
                     .multilineTextAlignment(.center).foregroundStyle(.secondary).padding(.horizontal,20)
             }
             Spacer(minLength:8)
@@ -124,7 +128,7 @@ struct IdentificationCardsView: View {
                 }.padding(.bottom,20)
             } else {
                 HStack {
-                    Button("刷新预览",systemImage:"arrow.clockwise") {
+                    Button("预览当前",systemImage:"eye") {
                         if let c=store.current,c.exportedURL != nil,c.roles == nil { confirmRegenerate=true } else { store.refresh() }
                     }
                     Button("在 Photoshop 中调整",systemImage:"arrow.up.forward.app") { store.openPhotoshop() }
@@ -166,7 +170,13 @@ struct IdentificationCardsView: View {
                 labeled("海拔（米）") { TextField("1000m",text:collectionField(\.altitude)) }
                 labeled("日期") { TextField("2026.4",text:collectionField(\.date)) }
             }
-            Button("按上述四项更新文字") { store.composeCollection() }
+            labeled("翅展（mm）") {
+                TextField("74", text: Binding(
+                    get: { store.current?.fields.collection.wingspan ?? "" },
+                    set: { value in store.edit { $0.collection.wingspan = value.isEmpty ? nil : value } }
+                ))
+            }
+            Button("更新采集文字") { store.composeCollection() }
             labeled("最终采集文字") {
                 TextField("留空则不显示",text:field(\.collectionText),axis:.vertical).lineLimit(2...5)
             }
@@ -213,7 +223,7 @@ struct IdentificationCardsView: View {
             Spacer(minLength:8)
             Button("导出当前 PNG") { store.export(all:false) }
                 .buttonStyle(.borderedProminent)
-                .disabled(store.locked || store.current == nil || store.current?.input.issue != nil)
+                .disabled(store.locked || !(store.current.map { store.canExport($0) } ?? false))
         }.padding(.horizontal,24).padding(.vertical,14)
     }
     private func chooseInputs() {
