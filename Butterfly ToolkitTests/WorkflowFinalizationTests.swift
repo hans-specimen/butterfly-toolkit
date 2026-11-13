@@ -196,8 +196,7 @@ final class WorkflowFinalizationTests: XCTestCase {
         }, isApplicationActive: { true })
         store.openBatch(f.manifest)
         try await waitForStore { !store.busy && store.currentTask?.id == front }
-        XCTAssertTrue(store.selectedReviewTaskIDs.isEmpty)
-        store.selectedTaskIDs = [front, back]
+        XCTAssertEqual(store.selectedReviewTaskIDs, [front, back])
         store.openSelectedPSDs()
         try await waitForStore { !store.isUpdatingReview && store.trackedReviewCount == 2 }
         XCTAssertNotNil(store.photoshopOpenErrors[back])

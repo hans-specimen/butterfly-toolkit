@@ -78,24 +78,13 @@ struct CardOverwriteRequest: Identifiable {
         }
     }
     func select(_ id: UUID, modifiers: NSEvent.ModifierFlags = []) {
-        guard !locked, let target = index(id) else { return }
-        let extending = modifiers.contains(.command)
-        if modifiers.contains(.shift), let anchor = index(selectedID) {
-            let range = session.records[min(anchor, target)...max(anchor, target)].map(\.id)
-            let startingIDs = extending ? selectedIDs : Array(selectedIDs.prefix(1))
-            let existing = Set(startingIDs)
-            setSelection(startingIDs + range.filter { !existing.contains($0) })
-        } else if extending {
-            setSelection(selectedIDs.contains(id) ? selectedIDs.filter { $0 != id } : selectedIDs + [id])
-        } else {
-            setSelection([id])
-        }
+        guard !locked else { return }
+        setSelection(OrderedListSelection.clicked(id, modifiers: modifiers, selected: selectedIDs, visible: session.records.map(\.id)))
     }
 
     func selectAll() {
         guard !locked else { return }
-        let existing = Set(selectedIDs)
-        setSelection(selectedIDs + session.records.map(\.id).filter { !existing.contains($0) })
+        setSelection(OrderedListSelection.appending(session.records.map(\.id), to: selectedIDs))
     }
 
     private func setSelection(_ ids: [UUID]) {

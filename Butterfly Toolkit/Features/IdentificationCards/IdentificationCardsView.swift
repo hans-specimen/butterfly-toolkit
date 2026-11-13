@@ -117,46 +117,43 @@ struct IdentificationCardsView: View {
             }.padding(12)
             Divider()
             ScrollView {
-                LazyVStack(spacing:2) {
-                    ForEach(store.session.records) { card in
-                        let isSelected = selectedIDs.contains(card.id)
-                        let isCurrent = card.id == store.selectedID
-                        Button {
-                            store.select(card.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
-                            queueFocused = true
-                        } label: {
-                            VStack(alignment:.leading,spacing:7) {
-                                HStack(spacing:6) {
-                                    WorkflowFileThumbnail(url:card.input.front).frame(width:70,height:48)
-                                    WorkflowFileThumbnail(url:card.input.back).frame(width:70,height:48)
-                                }.accessibilityLabel("正面与反面素材")
-                                Text(card.title).font(.body.weight(.medium)).lineLimit(2)
-                                if let number = card.input.specimenNumber {
-                                    Text(number).font(.caption).foregroundStyle(.secondary)
-                                } else if card.title != card.fields.latinName && !card.fields.latinName.isEmpty {
-                                    Text(card.fields.latinName).font(.caption).foregroundStyle(.secondary)
+                SpecimenSelectionRows(items: store.session.records, selectedIDs: selectedIDs, currentID: store.selectedID) { _, card, isSelected, isCurrent in
+                    Button {
+                        store.select(card.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
+                        queueFocused = true
+                    } label: {
+                        VStack(alignment:.leading,spacing:7) {
+                            HStack(spacing:6) {
+                                WorkflowFileThumbnail(url:card.input.front).frame(width:70,height:48)
+                                WorkflowFileThumbnail(url:card.input.back).frame(width:70,height:48)
+                            }.accessibilityLabel("正面与反面素材")
+                            Text(card.title).font(.body.weight(.medium)).lineLimit(2)
+                            if let number = card.input.specimenNumber {
+                                Text(number).font(.caption).foregroundStyle(.secondary)
+                            } else if card.title != card.fields.latinName && !card.fields.latinName.isEmpty {
+                                Text(card.fields.latinName).font(.caption).foregroundStyle(.secondary)
+                            }
+                            if let missing = card.missingNames { Text(missing).font(.caption).foregroundStyle(.orange) }
+                            cardStatus(card)
+                        }.frame(maxWidth:.infinity,alignment:.leading).padding(12)
+                            .overlay(alignment: .topTrailing) {
+                                if isSelected {
+                                    Image(systemName: isCurrent ? "checkmark.circle.fill" : "checkmark.circle")
+                                        .font(.caption).foregroundStyle(Color.accentColor)
+                                        .padding(8).accessibilityHidden(true).allowsHitTesting(false)
                                 }
-                                if let missing = card.missingNames { Text(missing).font(.caption).foregroundStyle(.orange) }
-                                Text(status(card)).font(.caption).foregroundStyle(card.input.issue != nil || card.issue != nil ? .orange : .secondary).lineLimit(3)
-                            }.frame(maxWidth:.infinity,alignment:.leading).padding(12)
-                                .background(isSelected ? Color.accentColor.opacity(isCurrent ? 0.23 : 0.13) : .clear)
-                                .overlay(alignment: .topTrailing) {
-                                    if isSelected {
-                                        Image(systemName: isCurrent ? "checkmark.circle.fill" : "checkmark.circle")
-                                            .font(.caption).foregroundStyle(Color.accentColor)
-                                            .padding(8).accessibilityHidden(true).allowsHitTesting(false)
-                                    }
-                                }
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityAddTraits(isSelected ? .isSelected : [])
-                        .accessibilityHint(isCurrent ? "当前显示预览和标本信息" : "")
-                        .disabled(store.locked)
+                            }
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                    .accessibilityHint(isCurrent ? "当前显示预览和标本信息" : "")
+                    .disabled(store.locked)
                 }
             }
+            .clipped()
             .focusable()
+            .focusEffectDisabled()
             .focused($queueFocused)
             .onKeyPress("a", phases: .down) { press in
                 let modifiers = press.modifiers.intersection([.command, .shift, .option, .control])
@@ -166,10 +163,17 @@ struct IdentificationCardsView: View {
             }
         }
     }
-    private func status(_ card:CardRecord) -> String {
-        if let issue = card.input.issue ?? card.issue { return issue }
-        if card.isExported { return "已导出" }
-        return store.hasCurrentPreview(card) ? "待导出" : "待生成预览"
+    @ViewBuilder private func cardStatus(_ card: CardRecord) -> some View {
+        if let issue = card.input.issue ?? card.issue {
+            SpecimenStatusBadge(title: "需检查", tone: .amber)
+            Text(issue).font(.caption).foregroundStyle(.secondary).lineLimit(3).help(issue)
+        } else if card.isExported {
+            SpecimenStatusBadge(title: "已导出", tone: .green)
+        } else if store.hasCurrentPreview(card) {
+            SpecimenStatusBadge(title: "待导出", tone: .blue)
+        } else {
+            SpecimenStatusBadge(title: "待生成预览", tone: .neutral)
+        }
     }
     // MARK: - 预览与人工调整
     private var preview: some View {

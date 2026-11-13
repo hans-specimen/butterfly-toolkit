@@ -1,5 +1,6 @@
 // 构建照片工作流的批次准备、标本队列、正反面预览和参数检查界面，将操作交给状态存储执行。
 
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import ImageIO
@@ -19,7 +20,8 @@ extension WorkflowStatus {
 // MARK: - 工作流页面
 struct PhotoWorkflowView: View {
     @ObservedObject var store: PhotoWorkflowStore
-    @State private var selectedDraftID: UUID?
+    @FocusState private var draftQueueFocused: Bool
+    @FocusState private var queueFocused: Bool
     @State private var singleFace = false
     @State private var exportScope = "此图"
     @State private var reprocessStage: WorkflowStage?
@@ -68,7 +70,10 @@ struct PhotoWorkflowView: View {
         .background(panelBackground)
         .frame(minWidth: 980,minHeight: 640)
         .onChange(of: store.currentSpecimenID) { store.cancelMove(); store.prepareSelected() }
-        .onChange(of: store.selectedSpecimens) { store.prepareSelected() }
+        .onChange(of: store.selectedTaskIDs) {
+            if exportScope == "此图", store.selectedSpecimens.count > 1 { exportScope = "所选" }
+        }
+        .onChange(of: store.batch?.id) { exportScope = "此图" }
         .onChange(of: store.face) { store.cancelMove(); store.refreshVisibleImage() }
         .task(id: store.manualReviewSessionID) {
             if let session = store.manualReviewSessionID { await store.observeManualEdits(sessionID: session) }
@@ -93,6 +98,12 @@ struct PhotoWorkflowView: View {
                 Text(store.draft.map { "\($0.groups.filter { !$0.excluded }.count) 只待处理 · \($0.inputMode == .psd ? "正反面各一份 PSD" : "正反面各三张")" } ?? "选择输入文件夹，开始建立收藏批次")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
+                if store.draftSelectedIDs.count > 1 {
+                    Menu("所选标本") {
+                        Button("排除所选") { store.setDraftExclusion(true, for: Set(store.draftSelectedIDs)) }
+                        Button("恢复所选") { store.setDraftExclusion(false, for: Set(store.draftSelectedIDs)) }
+                    }.fixedSize()
+                }
                 Button(store.busy ? "正在准备批次…" : (store.inputMode == .psd ? "从 PS 抠图开始" : "开始处理")) { store.start() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(store.busy || !store.canStart)
@@ -100,8 +111,8 @@ struct PhotoWorkflowView: View {
         }
     }
     private var selectedDraftIndex: Int? {
-        guard let groups = store.draft?.groups,!groups.isEmpty else { return nil }
-        return groups.firstIndex { $0.id == selectedDraftID } ?? 0
+        guard let id = store.draftSelectedIDs.first else { return nil }
+        return store.draft?.groups.firstIndex { $0.id == id }
     }
     private func draftName(_ index: Int) -> String {
         let names = ToolkitTextInput.lines(store.names)
@@ -109,32 +120,36 @@ struct PhotoWorkflowView: View {
         return String(format: "标本 %02d",index+1)
     }
     private var draftQueue: some View {
-        VStack(alignment: .leading,spacing: 0) {
-            HStack { Text("待处理蝴蝶").font(.headline); Spacer(); Text("\(store.draft?.groups.count ?? 0)").foregroundStyle(.secondary) }.padding(18)
+        let selected = Set(store.draftSelectedIDs)
+        let total = store.draft?.groups.count ?? 0
+        return VStack(alignment: .leading,spacing: 0) {
+            queueHeader("待处理蝴蝶", selected: selected.count, total: total,
+                        allSelected: selected.count == total) { store.selectAllDraftSpecimens() }
             Divider()
             ScrollView {
-                LazyVStack(spacing: 8) {
-                    if let draft = store.draft {
-                        ForEach(Array(draft.groups.enumerated()),id: \.element.id) { index,group in
-                            Button { selectedDraftID = group.id } label: {
-                                HStack(spacing: 10) {
-                                    WorkflowFileThumbnail(url: group.files.first ?? nil)
-                                        .frame(width: 46,height: 46).clipShape(RoundedRectangle(cornerRadius: 6))
-                                    VStack(alignment: .leading,spacing: 5) {
-                                        Text(draftName(index)).font(.body.weight(.medium)).lineLimit(1)
-                                        Text(group.excluded ? "已排除" : "等待处理").font(.caption).foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 0)
-                                }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
-                                    .background(selectedDraftIndex == index ? Color.accentColor.opacity(0.16) : .clear,in: RoundedRectangle(cornerRadius: 9))
-                                    .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(selectedDraftIndex == index ? Color.accentColor.opacity(0.35) : .clear) }
-                                    .opacity(group.excluded ? 0.5 : 1)
-                            }.buttonStyle(.plain)
-                        }
-                    }
-                }.padding(10)
+                SpecimenSelectionRows(items: store.draft?.groups ?? [], selectedIDs: selected, currentID: store.draftSelectedIDs.first) { index, group, isSelected, _ in
+                    Button {
+                        store.selectDraftSpecimen(group.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
+                        draftQueueFocused = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            WorkflowFileThumbnail(url: group.files.first ?? nil)
+                                .frame(width: 46,height: 46).clipShape(RoundedRectangle(cornerRadius: 6))
+                            VStack(alignment: .leading,spacing: 5) {
+                                Text(draftName(index)).font(.body.weight(.medium)).lineLimit(1)
+                                SpecimenStatusBadge(title: group.excluded ? "已排除" : "等待处理", tone: .neutral)
+                            }
+                            Spacer(minLength: 0)
+                        }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
+                            .contentShape(Rectangle())
+                            .opacity(group.excluded ? 0.5 : 1)
+                    }.buttonStyle(.plain).accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
             }
-            Text(store.stage == .hd ? "勾选正面或反面进行批量精修" : "选择标本查看正反面")
+            .clipped()
+            .focusable().focusEffectDisabled().focused($draftQueueFocused)
+            .onKeyPress("a", phases: .down) { selectAllShortcut($0, enabled: total > 0 && !store.busy, action: store.selectAllDraftSpecimens) }
+            Text("选择标本查看正反面")
                 .font(.caption).foregroundStyle(.secondary).padding(18)
         }.background(panelBackground)
     }
@@ -177,6 +192,9 @@ struct PhotoWorkflowView: View {
                         Spacer()
                         Toggle("排除整组",isOn: Binding(get: { store.draft?.groups[index].excluded ?? false },set: { store.draft?.groups[index].excluded = $0 })).toggleStyle(.checkbox)
                     }
+                } else if store.draft?.groups.isEmpty == false {
+                    Text("请选择标本").font(.title3.weight(.semibold))
+                        .frame(maxWidth: .infinity, minHeight: 320)
                 } else {
                     VStack(spacing: 16) {
                         Image(systemName: "photo.on.rectangle.angled").font(.system(size: 42,weight: .light)).foregroundStyle(.tertiary)
@@ -300,7 +318,10 @@ struct PhotoWorkflowView: View {
                 }.fixedSize()
                 if store.canResumeAutomatic { Button(store.stage == .png4k || store.hasQueuedExports ? "继续导出" : "继续自动准备") { store.resume() }.disabled(store.busy) }
                 else if store.busy { Button("暂停") { store.pause() } }
-                Button("批量导出") { exportScope = "全部已确认"; store.stage = .png4k }
+                Button("批量导出") {
+                    exportScope = store.hasExplicitQueueSelection ? "所选" : "全部已确认"
+                    store.stage = .png4k
+                }
                 Button(primaryTitle,action: performPrimary).buttonStyle(.borderedProminent).controlSize(.large).disabled(primaryDisabled)
             }.padding(.horizontal,24).padding(.vertical,14)
         }
@@ -463,49 +484,103 @@ struct PhotoWorkflowView: View {
         }.frame(maxWidth: .infinity)
     }
     private var queue: some View {
-        VStack(alignment: .leading,spacing: 0) {
-            HStack { Text("本批标本").font(.headline); Spacer(); Text("\(store.batch?.specimens.count ?? 0)").foregroundStyle(.secondary) }.padding(18)
+        let specimens = store.filteredSpecimens
+        let canSelect = specimens.contains { !$0.isExcluded }
+        return VStack(alignment: .leading,spacing: 0) {
+            queueHeader("本批标本", selected: store.selectedSpecimens.count, total: store.batch?.specimens.count ?? 0,
+                        allSelected: !canSelect || store.allVisibleSpecimensSelected) { store.selectAllVisibleSpecimens() }
             Picker("筛选",selection: $store.queueFilter) { ForEach(["全部","失败","待检查","已确认","待导出"],id: \.self) { Text($0) } }.padding(.horizontal,12)
             Divider()
             ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(store.filteredSpecimens) { specimen in
-                        VStack(alignment: .leading,spacing: 9) {
-                            HStack(spacing: 7) {
-                                Toggle("选择 \(specimen.baseName)",isOn: Binding(get: { store.selectedSpecimens.contains(specimen.id) },set: { if $0 { store.selectedSpecimens.insert(specimen.id); store.selectedTaskIDs.formUnion([specimen.front.id,specimen.back.id]) } else { store.selectedSpecimens.remove(specimen.id); store.selectedTaskIDs.subtract([specimen.front.id,specimen.back.id]) } }))
-                                    .labelsHidden().toggleStyle(.checkbox).disabled(specimen.isExcluded)
-                                Button { store.currentSpecimenID = specimen.id } label: {
-                                    Text(specimen.baseName).font(.body.weight(.medium)).lineLimit(1).frame(maxWidth: .infinity,alignment: .leading)
-                                }.buttonStyle(.plain)
+                SpecimenSelectionRows(items: specimens, selectedIDs: store.selectedSpecimens, currentID: store.currentSpecimenID) { _, specimen, isSelected, _ in
+                    VStack(alignment: .leading,spacing: 9) {
+                        HStack(spacing: 7) {
+                            Toggle("选择 \(specimen.baseName)", isOn: Binding(
+                                get: { isSelected },
+                                set: { store.setSpecimenSelected(specimen.id, selected: $0); queueFocused = true }
+                            )).labelsHidden().toggleStyle(.checkbox).disabled(specimen.isExcluded)
+                            Button {
+                                store.selectSpecimen(specimen.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
+                                queueFocused = true
+                            } label: {
+                                Text(specimen.baseName).font(.body.weight(.medium)).lineLimit(1)
+                                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                            }.buttonStyle(.plain).accessibilityAddTraits(isSelected ? .isSelected : [])
+                        }
+                        HStack(spacing: 9) {
+                            ForEach([specimen.front,specimen.back]) { task in
+                                VStack(alignment: .leading,spacing: 5) {
+                                    Toggle(task.side == .front ? "正面" : "反面", isOn: Binding(
+                                        get: { store.selectedTaskIDs.contains(task.id) },
+                                        set: { store.setFaceSelected(task.id, selected: $0); queueFocused = true }
+                                    )).font(.caption).toggleStyle(.checkbox).disabled(specimen.isExcluded)
+                                    Button {
+                                        let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+                                        store.selectSpecimen(specimen.id, modifiers: modifiers)
+                                        if modifiers.intersection([.command, .shift]).isEmpty { store.face = task.side }
+                                        queueFocused = true
+                                    } label: { sideStatus(task) }.buttonStyle(.plain)
+                                }.frame(maxWidth: .infinity)
                             }
-                            HStack(spacing: 9) {
-                                ForEach([specimen.front,specimen.back]) { task in
-                                    VStack(alignment: .leading,spacing: 5) {
-                                        Toggle(task.side == .front ? "正面" : "反面",isOn: Binding(get: { store.selectedTaskIDs.contains(task.id) },set: { if $0 { store.selectedTaskIDs.insert(task.id) } else { store.selectedTaskIDs.remove(task.id) } })).font(.caption).toggleStyle(.checkbox).disabled(specimen.isExcluded)
-                                        Button { store.currentSpecimenID = specimen.id; store.face = task.side } label: { sideStatus(task) }.buttonStyle(.plain)
-                                    }.frame(maxWidth: .infinity)
-                                }
-                            }
-                            if let reason = specimen.exclusionReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-                        }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
-                            .background(store.currentSpecimenID == specimen.id ? Color.accentColor.opacity(0.16) : .clear,in: RoundedRectangle(cornerRadius: 9))
-                            .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(store.currentSpecimenID == specimen.id ? Color.accentColor.opacity(0.35) : .clear) }
-                    }
-                }.padding(10)
+                        }
+                        if let reason = specimen.exclusionReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
+                    }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
+                }
             }
-            Text("选择标本查看正反面").font(.caption).foregroundStyle(.secondary).padding(18)
+            .clipped()
+            .focusable().focusEffectDisabled().focused($queueFocused)
+            .onKeyPress("a", phases: .down) { selectAllShortcut($0, enabled: canSelect, action: store.selectAllVisibleSpecimens) }
+            Text("可单独勾选正面或反面").font(.caption).foregroundStyle(.secondary).padding(18)
         }.background(panelBackground)
     }
+
+    private func queueHeader(_ title: String, selected: Int, total: Int, allSelected: Bool, selectAll: @escaping () -> Void) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text("已选 \(selected)/\(total)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+            Spacer()
+            Button("全选", action: selectAll).controlSize(.small).disabled(allSelected)
+                .help("全选当前列表中的标本。列表内也可按 ⌘A。")
+        }.padding(12)
+    }
+
+    private func selectAllShortcut(_ press: KeyPress, enabled: Bool, action: () -> Void) -> KeyPress.Result {
+        guard enabled, press.modifiers.intersection([.command, .shift, .option, .control]) == .command else { return .ignored }
+        action()
+        return .handled
+    }
+
     private func sideStatus(_ task: WorkflowSideTask) -> some View {
         VStack(alignment: .leading,spacing: 5) {
             WorkflowFileThumbnail(url: task.roleImages?.cutoutPNG ?? task.snapshot?.workingURL ?? task.sources.first.url).frame(height: 44).clipShape(RoundedRectangle(cornerRadius: 5))
-            let review = [.hd,.png4k].contains(store.stage)
-            let state = review ? (store.stage == .png4k ? store.outputPreparationStatus(task) ?? store.reviewStatus(task) : store.reviewStatus(task)) : store.summaryRecord(task).state.title
-            let failed = store.photoshopOpenErrors[task.id] != nil || task.manualEditError != nil ||
-                (store.stage == .png4k && task.finalPreparationError != nil) || store.summaryRecord(task).state == .failed
-            Text("\(task.side.fileSuffix) · \(state)").font(.system(size: 10)).foregroundStyle(failed ? .red : .secondary).lineLimit(1)
+            let status = queueSideStatus(task)
+            SpecimenStatusBadge(title: status.title, tone: status.tone)
+                .accessibilityLabel("\(task.side.fileSuffix) · \(status.title)")
+                .help(status.title)
         }.frame(maxWidth: .infinity)
     }
+
+    private func queueSideStatus(_ task: WorkflowSideTask) -> (title: String, tone: SpecimenStatusBadge.Tone) {
+        let record = store.summaryRecord(task)
+        if record.state == .excluded { return ("已排除", .neutral) }
+        if store.photoshopOpenErrors[task.id] != nil { return ("打开失败", .red) }
+        if task.manualEditError != nil { return ("确认失败", .red) }
+        if task.finalPreparationError != nil { return ("输出校验失败", .red) }
+        if record.state == .failed { return ("失败", .red) }
+        if record.state == .running { return ("处理中", .blue) }
+        if let edit = task.manualEdit { return (edit.observedDocumentID == nil ? "等待打开" : "精修中", .purple) }
+        if task.artifacts.contains(where: {
+            ($0.kind == .hd || $0.kind == .png4k) && $0.state == .completed &&
+                task[$0.kind.stage].state == .completed && task[$0.kind.stage].outputVersion == $0.fileFingerprint
+        }) { return ("已导出", .green) }
+        if task.pendingFinalPSD != nil { return ("待准备输出", .blue) }
+        if task[.geometry].state == .completed { return ("已确认", .purple) }
+        if task[.geometry].state == .waitingReview { return ("待检查", .amber) }
+        return (record.state.title, .neutral)
+    }
+
     // MARK: - 阶段参数与人工编辑
     private var parameters: some View {
         VStack(alignment: .leading,spacing: 24) {

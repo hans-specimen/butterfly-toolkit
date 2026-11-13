@@ -138,6 +138,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
 // MARK: - 界面状态与当前预览
 @MainActor final class PhotoWorkflowStore: ObservableObject {
     @Published var draft: WorkflowBatchDraft?
+    @Published private(set) var draftSelectedIDs: [UUID] = []
     @Published var inputMode: WorkflowInputMode = .photos {
         didSet { if inputMode != oldValue,let directory = draft?.directory { scan(directory) } }
     }
@@ -154,6 +155,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var canStart: Bool { draft != nil }
     @Published var batch: WorkflowBatch?
     @Published var selectedSpecimens: Set<UUID> = []
+    private var specimenSelectionOrder: [UUID] = []
+    private(set) var hasExplicitQueueSelection = false
     @Published var selectedTaskIDs: Set<UUID> = []
     @Published var currentSpecimenID: UUID? { didSet { if currentSpecimenID != oldValue { retainCurrentDetailOnly(); selectCurrentTaskStage() } } }
     @Published var face: WorkflowSide = .front { didSet { if face != oldValue { retainCurrentDetailOnly(); selectCurrentTaskStage() } } }
@@ -335,6 +338,112 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             }
         }
     }
+    // MARK: - 标本与单面选择
+
+    func selectDraftSpecimen(_ id: UUID, modifiers: NSEvent.ModifierFlags = []) {
+        let ids = draft?.groups.map(\.id) ?? []
+        draftSelectedIDs = OrderedListSelection.clicked(id, modifiers: modifiers, selected: draftSelectedIDs, visible: ids)
+    }
+
+    func selectAllDraftSpecimens() {
+        draftSelectedIDs = OrderedListSelection.appending(draft?.groups.map(\.id) ?? [], to: draftSelectedIDs)
+    }
+
+    func setDraftExclusion(_ excluded: Bool, for ids: Set<UUID>) {
+        guard !busy, var draft else { return }
+        for index in draft.groups.indices where ids.contains(draft.groups[index].id) {
+            draft.groups[index].excluded = excluded
+        }
+        self.draft = draft
+    }
+
+    private var selectableSpecimens: [WorkflowSpecimen] { filteredSpecimens.filter { !$0.isExcluded } }
+
+    var allVisibleSpecimensSelected: Bool {
+        let visible = selectableSpecimens
+        return !visible.isEmpty && Set(visible.map(\.id)) == selectedSpecimens &&
+            Set(visible.flatMap { [$0.front.id, $0.back.id] }) == selectedTaskIDs
+    }
+
+    func selectSpecimen(_ id: UUID, modifiers: NSEvent.ModifierFlags = []) {
+        guard let specimen = filteredSpecimens.first(where: { $0.id == id }) else { return }
+        if specimen.isExcluded {
+            if modifiers.intersection([.command, .shift]).isEmpty { currentSpecimenID = id }
+            return
+        }
+        hasExplicitQueueSelection = true
+        let old = orderedSpecimenSelection
+        // 跳到下一张或定位运行项后，连续选择仍从当前查看的已选标本起算。
+        let anchored = currentSpecimenID.map { current in
+            old.contains(current) ? [current] + old.filter { $0 != current } : old
+        } ?? old
+        let next = OrderedListSelection.clicked(id, modifiers: modifiers, selected: anchored, visible: selectableSpecimens.map(\.id))
+        let extendsSelection = !modifiers.intersection([.command, .shift]).isEmpty
+        applySpecimenSelection(next, preservingFaceChoices: extendsSelection)
+        currentSpecimenID = next.first
+    }
+
+    func selectAllVisibleSpecimens() {
+        let visible = selectableSpecimens.map(\.id)
+        guard !visible.isEmpty else { return }
+        hasExplicitQueueSelection = true
+        let allowed = Set(visible)
+        let selected = orderedSpecimenSelection.filter { allowed.contains($0) }
+        let next = OrderedListSelection.appending(visible, to: selected)
+        applySpecimenSelection(next, preservingFaceChoices: false)
+        if let currentSpecimenID, allowed.contains(currentSpecimenID) { return }
+        currentSpecimenID = next.first
+    }
+
+    func setSpecimenSelected(_ id: UUID, selected: Bool) {
+        guard let specimen = batch?.specimens.first(where: { $0.id == id }), !specimen.isExcluded else { return }
+        hasExplicitQueueSelection = true
+        let old = orderedSpecimenSelection
+        let next = selected ? OrderedListSelection.appending([id], to: old) : old.filter { $0 != id }
+        applySpecimenSelection(next, preservingFaceChoices: true)
+        if currentSpecimenID == nil || !selected && currentSpecimenID == id {
+            currentSpecimenID = next.first
+        }
+    }
+
+    func setFaceSelected(_ id: UUID, selected: Bool) {
+        guard batch?.activeTasks.contains(where: { $0.id == id }) == true else { return }
+        hasExplicitQueueSelection = true
+        if selected { selectedTaskIDs.insert(id) } else { selectedTaskIDs.remove(id) }
+    }
+
+    private var orderedSpecimenSelection: [UUID] {
+        let active = (batch?.specimens ?? []).filter { !$0.isExcluded && selectedSpecimens.contains($0.id) }.map(\.id)
+        let available = Set(active)
+        return OrderedListSelection.appending(active, to: specimenSelectionOrder.filter { available.contains($0) })
+    }
+
+    private func applySpecimenSelection(_ ids: [UUID], preservingFaceChoices: Bool) {
+        let previous = selectedSpecimens
+        let selected = Set(ids)
+        let specimens = batch?.specimens ?? []
+        if preservingFaceChoices {
+            var selectedFaces = selectedTaskIDs
+            for specimen in specimens where previous.contains(specimen.id) != selected.contains(specimen.id) {
+                let faces = [specimen.front.id, specimen.back.id]
+                if selected.contains(specimen.id) { selectedFaces.formUnion(faces) }
+                else { selectedFaces.subtract(faces) }
+            }
+            selectedTaskIDs = selectedFaces
+        } else {
+            selectedTaskIDs = Set(specimens.filter { selected.contains($0.id) }.flatMap { [$0.front.id, $0.back.id] })
+        }
+        specimenSelectionOrder = ids
+        selectedSpecimens = selected
+    }
+
+    private func resetSpecimenSelection(current id: UUID? = nil) {
+        hasExplicitQueueSelection = false
+        let first = id ?? batch?.specimens.first { !$0.isExcluded }?.id
+        applySpecimenSelection(first.map { [$0] } ?? [], preservingFaceChoices: false)
+        currentSpecimenID = first
+    }
+
     func selectCurrentTaskStage() {
         guard let task = currentTask else { return }
         // 选择变化由视图统一准备预览，避免阶段切换提前重复派发解码任务。
@@ -409,8 +518,10 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     func scan(_ directory: URL) {
         do {
             let scanned = try WorkflowBatchDraft.scan(directory: directory,inputMode: inputMode)
-            draft = scanned; names = inputMode == .psd ? scanned.groups.compactMap(\.suggestedName).joined(separator: "\n") : ""; error = nil
-        } catch { draft = nil; names = ""; self.error = error.localizedDescription }
+            draft = scanned
+            draftSelectedIDs = scanned.groups.first.map { [$0.id] } ?? []
+            names = inputMode == .psd ? scanned.groups.compactMap(\.suggestedName).joined(separator: "\n") : ""; error = nil
+        } catch { draft = nil; draftSelectedIDs = []; names = ""; self.error = error.localizedDescription }
     }
     func start() {
         guard let draft else { error = "请选择输入文件夹"; return }
@@ -424,7 +535,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             let manifest = outputDirectory.appendingPathComponent("batch.json")
             try await e.register(batch: frozen,manifestURL: manifest)
             await clearPreviewState(); executor = e
-            batch = try await e.batch(batchID: frozen.id); currentSpecimenID = frozen.specimens.first { !$0.isExcluded }?.id; selectedSpecimens = Set(frozen.specimens.filter { !$0.isExcluded }.map(\.id))
+            batch = try await e.batch(batchID: frozen.id)
+            resetSpecimenSelection()
             try await e.runPending(batchID: frozen.id)
         }
     }
@@ -455,16 +567,16 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             let value = try await e.batch(batchID: id)
             let session = await e.manualReviewLeaseID(batchID: id)
             await clearPreviewState(); executor = e; batch = value; manualReviewSessionID = session
-            currentSpecimenID = value.specimens.first { !$0.isExcluded }?.id
-            selectedSpecimens = Set(value.specimens.filter { !$0.isExcluded }.map(\.id))
             if let editing = value.activeTasks.first(where: { $0.manualEdit != nil }),
                let specimen = value.specimens.first(where: { $0.front.id == editing.id || $0.back.id == editing.id }) {
-                currentSpecimenID = specimen.id; face = editing.side; stage = .hd
+                resetSpecimenSelection(current: specimen.id)
+                face = editing.side; stage = .hd
             } else {
+                resetSpecimenSelection()
                 stage = value.currentStage ?? .png4k
                 if stage == .geometry {
                     if currentTask?[.geometry].state == .waitingReview { stage = .hd }
-                    else { nextReview() }
+                    else { nextReview(); resetSpecimenSelection(current: currentSpecimenID) }
                 }
             }
         }
@@ -474,7 +586,8 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         launch { [self] in
             try await persistBeforeSwitch()
             await clearPreviewState(); executor = nil; batch = nil; manualReviewSessionID = nil
-            currentSpecimenID = nil; selectedSpecimens = []; draft = nil; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
+            resetSpecimenSelection()
+            draft = nil; draftSelectedIDs = []; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
         }
     }
     private func persistBeforeSwitch() async throws {
@@ -621,7 +734,21 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func retryCurrent() { guard let e = executor,let b = batch,let task = currentTask else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: [task.id],stage: stage) } }
-    func excludeSelected() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.update(batchID: b.id,event: .excludeSpecimens(ids: selectedSpecimens,reason: "用户暂不处理",expectedRevision: b.revision)); try await e.runPending(batchID: b.id) } }
+    func excludeSelected() {
+        guard let e = executor, let b = batch else { return }
+        let ids = Set(orderedSpecimenSelection)
+        guard !ids.isEmpty else { return }
+        launch { [self] in
+            try await e.update(batchID: b.id, event: .excludeSpecimens(ids: ids, reason: "用户暂不处理", expectedRevision: b.revision))
+            await sync()
+            applySpecimenSelection(orderedSpecimenSelection, preservingFaceChoices: true)
+            if let currentSpecimenID, ids.contains(currentSpecimenID) {
+                if let next = specimenSelectionOrder.first { self.currentSpecimenID = next }
+                else { resetSpecimenSelection(current: selectableSpecimens.first?.id) }
+            }
+            try await e.runPending(batchID: b.id)
+        }
+    }
     func pause() { guard let e = executor,let b = batch else { return }; notice = "正在等待当前步骤安全保存并暂停"; Task { await e.pause(batchID: b.id); await sync() } }
     func resume() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.continueAutomatic(batchID: b.id); manualTaskID = nil } }
     private func usesBatchReview(for task: WorkflowSideTask) -> Bool {
