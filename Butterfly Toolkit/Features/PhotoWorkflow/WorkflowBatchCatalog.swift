@@ -78,7 +78,7 @@ actor WorkflowBatchCatalog {
         return batch
     }
 
-    private static func progress(_ batch: WorkflowBatch) -> (label: String, pending: Bool) {
+    nonisolated static func progress(_ batch: WorkflowBatch) -> (label: String, pending: Bool) {
         let tasks = batch.activeTasks.filter { $0[.geometry].state != .excluded }
         guard !tasks.isEmpty else { return ("已全部排除", false) }
         let exportStages: [WorkflowStage] = [.hd, .png4k]

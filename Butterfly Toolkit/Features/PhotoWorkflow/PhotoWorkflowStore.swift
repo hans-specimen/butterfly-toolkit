@@ -191,6 +191,23 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published var manualTaskID: UUID?
     private var executor: WorkflowExecutor?
     let batchCatalog: WorkflowBatchCatalog
+    private let batchQueueRoot: URL
+    private let queueManifest: URL
+    @Published private var queueState = WorkflowBatchQueue()
+    @Published private(set) var isBatchQueueRunning = false
+    @Published private(set) var isPausingBatchQueue = false
+    private var isLoadingQueueBatch = false
+    @Published private(set) var runningBatch: WorkflowQueuedBatch?
+    @Published private(set) var batchQueueStatuses: [UUID: String] = [:]
+    private var runningExecutor: WorkflowExecutor?
+    private var queuePauseTask: Task<Void, Never>?
+    private var currentManifest: URL?
+    private var batchQueueLoadError: String?
+
+    var batchQueue: [WorkflowQueuedBatch] { queueState.entries }
+    var canContinueBatchQueue: Bool { queueState.interrupted && !batchQueue.isEmpty }
+    var hasPendingBatchPreparation: Bool { batch.map(Self.needsBatchPreparation) == true }
+    var canRunBatchQueue: Bool { canSwitchBatch && canOpenBatchFiles && !isBatchQueueRunning && !batchQueue.isEmpty }
     // WindowGroup 可同时持有多个工作流，删除时要保护其他窗口的执行器。
     private static let openStores = NSHashTable<PhotoWorkflowStore>.weakObjects()
     private var openingBatch = false
@@ -214,10 +231,18 @@ nonisolated struct WorkflowBatchDraft: Sendable {
          makeExecutor: ((URL) -> WorkflowExecutor)? = nil,
          openPhotoshopDocument: @escaping (URL) async throws -> Void = PhotoWorkflowStore.openInPhotoshop,
          isApplicationActive: @escaping @MainActor @Sendable () -> Bool = { NSApplication.shared.isActive },
-         batchCatalog: WorkflowBatchCatalog = WorkflowBatchCatalog()) {
+         batchCatalog: WorkflowBatchCatalog = WorkflowBatchCatalog(),
+         batchQueueRoot: URL = WorkflowIntermediateCleanup.storageRoot) {
         self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
         self.makeReviewExecutor = makeExecutor; self.openPhotoshopDocument = openPhotoshopDocument
         self.isApplicationActive = isApplicationActive; self.batchCatalog = batchCatalog
+        self.batchQueueRoot = batchQueueRoot
+        queueManifest = batchQueueRoot.appendingPathComponent("queue.json")
+        do { queueState = try WorkflowBatchQueue.load(from: queueManifest) }
+        catch {
+            batchQueueLoadError = "无法读取已保存的批次队列：\(error.localizedDescription)"
+            self.error = batchQueueLoadError
+        }
         Self.openStores.add(self)
     }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
@@ -268,7 +293,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
 
     var canResumeAutomatic: Bool {
-        guard batch?.isPaused == true else { return false }
+        guard !isBatchQueueRunning, batch?.isPaused == true || hasQueuedExports else { return false }
         guard manualReviewSessionID == nil, !isUpdatingReview else { return false }
         return manualTaskID == nil || batch?.activeTasks.contains { task in
             [WorkflowStage.stack,.matte,.geometry].contains { task[$0].state == .pending }
@@ -287,7 +312,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var hasManualEditing: Bool { manualTaskID != nil || manualReviewSessionID != nil }
     var hasQueuedExports: Bool { batch?.activeTasks.contains { !($0.requestedExports ?? [:]).isEmpty } == true }
     var canFinalize: Bool {
-        guard !busy, !isUpdatingReview, manualTaskID == nil,
+        guard !isBatchQueueRunning, !busy, !isUpdatingReview, manualTaskID == nil,
               currentSpecimen?.isExcluded == false, let task = currentTask, isReviewable(task) else { return false }
         if task.manualEdit?.observedDocumentID != nil { return manualObservationError != nil }
         return task[.geometry].state == .waitingReview || task.manualEdit != nil || task.manualEditError != nil
@@ -498,7 +523,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }.map(\.id))
     }
     func exportImages(scope: String) {
-        guard !isUpdatingReview, let e = executor, let b = batch else { return }
+        guard !isBatchQueueRunning, !isUpdatingReview, let e = executor, let b = batch else { return }
         let ids = exportTaskIDs(scope: scope), kinds = Set(([exportHDSelected ? WorkflowAssetKind.hd : nil, exportPNGSelected ? .png4k : nil]).compactMap { $0 })
         guard !ids.isEmpty,!kinds.isEmpty else { error = "请选择已确认图片及至少一种输出"; return }
         let policy = exportPolicy, layouts = layouts.filter { ids.contains($0.key) }
@@ -531,25 +556,36 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         } catch { draft = nil; draftSelectedIDs = []; names = ""; self.error = error.localizedDescription }
     }
     func start() {
-        guard canOpenBatchFiles else { error = "请等待其他窗口完成批次删除"; return }
+        guard canSwitchBatch, canOpenBatchFiles, batch == nil else { return }
         guard let draft else { error = "请选择输入文件夹"; return }
-        let outputDirectory = WorkflowIntermediateCleanup.storageRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        if let batchQueueLoadError { error = batchQueueLoadError; return }
+        let output = batchQueueRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
         let names = names, request = draftGeometryRequest
-        guard !busy else { return }
         openingBatch = true
         launch { [self] in
             defer { openingBatch = false }
-            let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,locations: locations,geometryRequest: request) }.value
-            let e = makeExecutor(output: outputDirectory)
-            let manifest = outputDirectory.appendingPathComponent("batch.json")
-            try await e.register(batch: frozen,manifestURL: manifest)
-            await clearPreviewState(); executor = e
-            batch = try await e.batch(batchID: frozen.id)
-            resetSpecimenSelection()
-            try await e.runPending(batchID: frozen.id)
+            var frozen = try await Task.detached {
+                try draft.freeze(names: names, output: output, locations: locations, geometryRequest: request)
+            }.value
+            // 同一来源的多个未运行批次也必须有各自的工作 PSD 路径。
+            frozen.psdBatchSubdirectory = true
+            let manifest = output.appendingPathComponent("batch.json")
+            let newExecutor = makeExecutor(output: output)
+            try await newExecutor.register(batch: frozen, manifestURL: manifest)
+            await displayBatch(frozen, executor: newExecutor, manifest: manifest)
+            self.draft = nil; draftSelectedIDs = []; self.names = ""
+            hdDirectory = nil; png4kDirectory = nil
+            do { try addBatchToQueue(frozen, manifest: manifest) }
+            catch { throw WorkflowStateError.invalidManifest("批次已保存。请点「加入队列」重试：\(error.localizedDescription)") }
         }
     }
+
+    func beginNewBatch() {
+        guard canSwitchBatch else { return }
+        if batch != nil { closeBatch() }
+    }
+
     func exportDirectory(for kind: WorkflowAssetKind) -> URL? {
         guard kind == .hd || kind == .png4k else { return nil }
         if let batch { return batch.exportDirectory(for: kind) }
@@ -557,7 +593,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let directory = draft?.directory else { return nil }
         return directory.resolvingSymlinksInPath().appendingPathComponent(directory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
     }
-    var canChangeExportDirectory: Bool { canSwitchBatch && canOpenBatchFiles }
+    var canChangeExportDirectory: Bool { canSwitchBatch && canOpenBatchFiles && (!isBatchQueueRunning || batch == nil) }
     func selectExportDirectory(_ url: URL, kind: WorkflowAssetKind) {
         guard canChangeExportDirectory else { return }
         guard let executor, let batch else {
@@ -573,38 +609,67 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     func openBatch(_ url: URL) {
         guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
         guard canOpenBatchFiles else { error = "请等待其他窗口完成批次删除"; return }
+        let url = url.resolvingSymlinksInPath().standardizedFileURL
+        if currentManifest == url { return }
         openingBatch = true
         launch { [self] in
             defer { openingBatch = false }
             try await persistBeforeSwitch()
-            let e = makeExecutor(output: url.deletingLastPathComponent())
-            let id = try await e.register(manifestURL: url)
-            let value = try await e.batch(batchID: id)
-            let session = await e.manualReviewLeaseID(batchID: id)
-            await clearPreviewState(); executor = e; batch = value; manualReviewSessionID = session
-            if let editing = value.activeTasks.first(where: { $0.manualEdit != nil }),
-               let specimen = value.specimens.first(where: { $0.front.id == editing.id || $0.back.id == editing.id }) {
-                resetSpecimenSelection(current: specimen.id)
-                face = editing.side; stage = .hd
-            } else {
-                resetSpecimenSelection()
-                stage = value.currentStage ?? .png4k
-                if stage == .geometry {
-                    if currentTask?[.geometry].state == .waitingReview { stage = .hd }
-                    else { nextReview(); resetSpecimenSelection(current: currentSpecimenID) }
+            if runningBatch?.manifest == url {
+                while isLoadingQueueBatch && runningBatch?.manifest == url {
+                    try await Task.sleep(for: .milliseconds(20))
                 }
+                if let processing = runningBatch, processing.manifest == url, let runningExecutor {
+                    let value = try await runningExecutor.batch(batchID: processing.id)
+                    await displayBatch(value, executor: runningExecutor, manifest: url)
+                    return
+                }
+            }
+            let value = try await WorkflowBatchStore().load(from: url)
+            if isBatchQueueRunning && value.manualReviewSessionID != nil {
+                throw WorkflowStateError.invalidManifest("请先暂停批次队列，再打开含有精修记录的批次")
+            }
+            if let runningBatch, runningBatch.id == value.id ||
+                runningBatch.manifest.deletingLastPathComponent().path == value.outputDirectory.resolvingSymlinksInPath().path {
+                throw WorkflowStateError.invalidManifest("请从队列打开正在处理的批次")
+            }
+            let newExecutor = makeExecutor(output: url.deletingLastPathComponent())
+            let id = try await newExecutor.register(manifestURL: url, loadedBatch: value)
+            let registered = try await newExecutor.batch(batchID: id)
+            await displayBatch(registered, executor: newExecutor, manifest: url)
+        }
+    }
+
+    private func displayBatch(_ value: WorkflowBatch, executor: WorkflowExecutor, manifest: URL) async {
+        let session = await executor.manualReviewLeaseID(batchID: value.id)
+        await clearPreviewState()
+        self.executor = executor; batch = value; currentManifest = manifest; manualReviewSessionID = session
+        queueFilter = "全部"
+        if let editing = value.activeTasks.first(where: { $0.manualEdit != nil }),
+           let specimen = value.specimens.first(where: { $0.front.id == editing.id || $0.back.id == editing.id }) {
+            resetSpecimenSelection(current: specimen.id)
+            face = editing.side; stage = .hd
+        } else {
+            resetSpecimenSelection()
+            stage = value.currentStage ?? .png4k
+            if stage == .geometry {
+                if currentTask?[.geometry].state == .waitingReview { stage = .hd }
+                else { nextReview(); resetSpecimenSelection(current: currentSpecimenID) }
             }
         }
     }
+
     func closeBatch() {
         guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
+        openingBatch = true
         launch { [self] in
+            defer { openingBatch = false }
             try await persistBeforeSwitch()
             await resetClosedBatch()
         }
     }
     func deleteBatch(_ record: WorkflowBatchCatalog.Record) async throws {
-        guard canSwitchBatch else { throw WorkflowBridgeError.manualReviewActive }
+        guard canSwitchBatch, !isBatchQueueRunning else { throw WorkflowBridgeError.manualReviewActive }
         let otherStores = Self.openStores.allObjects.filter { $0 !== self }
         guard !otherStores.contains(where: { $0.openingBatch || $0.deletingBatch }) else {
             throw WorkflowStateError.invalidManifest("请等待其他窗口完成批次打开或删除")
@@ -628,14 +693,16 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         let protected = otherBatches + (deletingCurrent ? [] : [batch].compactMap { $0 })
         try await batchCatalog.delete(record, protecting: protected)
         if deletingCurrent { await resetClosedBatch() }
+        if let id = record.batchID { removeQueuedBatch(id) }
     }
     private func resetClosedBatch() async {
-        await clearPreviewState(); executor = nil; batch = nil; manualReviewSessionID = nil
+        await clearPreviewState(); executor = nil; batch = nil; currentManifest = nil; manualReviewSessionID = nil
         resetSpecimenSelection()
         draft = nil; draftSelectedIDs = []; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
     }
     private func persistBeforeSwitch() async throws {
         guard let executor, let batch else { return }
+        if let runningBatch, currentManifest == runningBatch.manifest { return }
         try await executor.prepareToCloseBatch(batchID: batch.id)
         await sync()
     }
@@ -649,11 +716,194 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         gates = [:]; solutions = [:]; layouts = [:]; loading = []; detailRequested = []; previewInteractionStarted = [:]; cancelMove()
         await geometry.removeAll()
     }
-    private func makeExecutor(output: URL) -> WorkflowExecutor {
+    private func makeExecutor(output: URL, geometry: WorkflowGeometryCache? = nil) -> WorkflowExecutor {
         if let makeReviewExecutor { return makeReviewExecutor(output) }
         let workspace = output.appendingPathComponent(".work")
-        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace),geometry: geometry))
+        return WorkflowExecutor(services: .live(bridge: PhotoshopWorkflowBridge(workspace: workspace), geometry: geometry ?? self.geometry))
     }
+    // MARK: - 批次队列
+    func addBatchToQueue(_ manifest: URL) async throws {
+        let manifest = manifest.resolvingSymlinksInPath().standardizedFileURL
+        let value = try await WorkflowBatchStore().load(from: manifest)
+        try value.validateOutputURL(manifest)
+        guard !deletingBatch, FileManager.default.fileExists(atPath: manifest.path) ||
+              FileManager.default.fileExists(atPath: manifest.appendingPathExtension("previous").path) else {
+            throw WorkflowStateError.invalidManifest("这份批次清单已移除")
+        }
+        try addBatchToQueue(value, manifest: manifest)
+    }
+
+    func addViewedBatchToQueue() {
+        guard let batch, let currentManifest, canSwitchBatch else { return }
+        do { try addBatchToQueue(batch, manifest: currentManifest) }
+        catch { self.error = error.localizedDescription }
+    }
+
+    private func addBatchToQueue(_ value: WorkflowBatch, manifest: URL) throws {
+        if let existing = batchQueue.first(where: { $0.id == value.id }) {
+            guard existing.manifest == manifest else {
+                throw WorkflowStateError.invalidManifest("此批次已有清单在队列中")
+            }
+            return
+        }
+        guard !batchQueue.contains(where: {
+            $0.manifest.deletingLastPathComponent().path == manifest.deletingLastPathComponent().path
+        }) else { throw WorkflowStateError.invalidManifest("同一个批次目录只能加入一份清单") }
+        var updated = queueState
+        updated.entries.append(WorkflowQueuedBatch(batch: value, manifest: manifest))
+        try saveBatchQueue(updated)
+        batchQueueStatuses[value.id] = WorkflowBatchCatalog.progress(value).label
+    }
+
+    func moveQueuedBatch(_ id: UUID, by offset: Int) {
+        guard runningBatch?.id != id,
+              let from = batchQueue.firstIndex(where: { $0.id == id }),
+              batchQueue.indices.contains(from + offset),
+              batchQueue[from + offset].id != runningBatch?.id else { return }
+        var updated = queueState
+        updated.entries.swapAt(from, from + offset)
+        do { try saveBatchQueue(updated) }
+        catch { self.error = error.localizedDescription }
+    }
+
+    func removeQueuedBatch(_ id: UUID) {
+        guard runningBatch?.id != id, batchQueue.contains(where: { $0.id == id }) else { return }
+        var updated = queueState
+        updated.entries.removeAll { $0.id == id }
+        if updated.entries.isEmpty { updated.interrupted = false }
+        do { try saveBatchQueue(updated); batchQueueStatuses[id] = nil }
+        catch { self.error = error.localizedDescription }
+    }
+
+    private func saveBatchQueue(_ value: WorkflowBatchQueue) throws {
+        if let batchQueueLoadError { throw WorkflowStateError.invalidManifest(batchQueueLoadError) }
+        try value.save(to: queueManifest)
+        queueState = value
+    }
+
+    func refreshBatchQueueStatuses() async {
+        for entry in batchQueue where runningBatch?.id != entry.id {
+            let value = try? await WorkflowBatchStore().load(from: entry.manifest)
+            guard runningBatch?.id != entry.id, batchQueue.contains(entry) else { continue }
+            batchQueueStatuses[entry.id] = value.map { WorkflowBatchCatalog.progress($0).label } ?? "清单不可用"
+        }
+    }
+
+    func runQueuedBatch(_ id: UUID) { runBatchQueue(only: id) }
+
+    func runBatchQueue() { runBatchQueue(only: nil) }
+
+    private func runBatchQueue(only id: UUID?) {
+        guard canRunBatchQueue, id == nil || batchQueue.contains(where: { $0.id == id }) else { return }
+        var saved = queueState
+        saved.interrupted = id == nil || saved.interrupted
+        do { try saveBatchQueue(saved) }
+        catch { self.error = error.localizedDescription; return }
+
+        isBatchQueueRunning = true
+        isPausingBatchQueue = false
+        error = nil
+        Task { [self] in
+            var visited = Set<UUID>(), failures = [String]()
+            defer {
+                runningBatch = nil; runningExecutor = nil; isLoadingQueueBatch = false
+                isBatchQueueRunning = false; isPausingBatchQueue = false
+            }
+            while !isPausingBatchQueue {
+                // 界面切换完成后才取下一项，使等待期间的顺序调整立即生效。
+                if openingBatch {
+                    try? await Task.sleep(for: .milliseconds(20))
+                    continue
+                }
+                guard let entry = batchQueue.first(where: { !visited.contains($0.id) && (id == nil || $0.id == id) }) else { break }
+                visited.insert(entry.id)
+                do { try await prepareQueuedBatch(entry) }
+                catch {
+                    batchQueueStatuses[entry.id] = "无法处理"
+                    failures.append("\(entry.title) · \(error.localizedDescription)")
+                }
+                await queuePauseTask?.value
+                queuePauseTask = nil
+                runningBatch = nil; runningExecutor = nil; isLoadingQueueBatch = false
+            }
+            if !isPausingBatchQueue, id == nil {
+                var finished = queueState; finished.interrupted = false
+                do { try saveBatchQueue(finished) }
+                catch { failures.append(error.localizedDescription) }
+            }
+            if !failures.isEmpty { error = failures.joined(separator: "\n") }
+            notice = isPausingBatchQueue ? "批次队列已暂停" : id == nil ? "队列自动准备结束" : "此批次自动准备结束"
+        }
+    }
+
+    private func prepareQueuedBatch(_ entry: WorkflowQueuedBatch) async throws {
+        isLoadingQueueBatch = true
+        runningBatch = entry
+        let currentWorker = currentManifest == entry.manifest ? executor : nil
+        let saved: WorkflowBatch
+        if let currentWorker { saved = try await currentWorker.batch(batchID: entry.id) }
+        else { saved = try await WorkflowBatchStore().load(from: entry.manifest) }
+        guard saved.id == entry.id else { throw WorkflowStateError.invalidManifest("这份清单已换成其他批次") }
+        guard saved.manualReviewSessionID == nil else {
+            throw WorkflowStateError.invalidManifest("请先打开此批次并结束 PSD 精修")
+        }
+        if currentWorker == nil, let viewed = batch, viewed.id == saved.id ||
+            viewed.outputDirectory.resolvingSymlinksInPath().path == saved.outputDirectory.resolvingSymlinksInPath().path {
+            throw WorkflowStateError.invalidManifest("请从队列打开此批次，或先关闭当前查看的恢复清单")
+        }
+        guard Self.needsBatchPreparation(saved) else {
+            batchQueueStatuses[entry.id] = WorkflowBatchCatalog.progress(saved).label
+            return
+        }
+        guard !isPausingBatchQueue else { return }
+        let worker: WorkflowExecutor
+        if let currentWorker { worker = currentWorker }
+        else {
+            worker = makeExecutor(output: entry.manifest.deletingLastPathComponent(), geometry: WorkflowGeometryCache())
+            try await worker.register(batch: saved, manifestURL: entry.manifest)
+        }
+        runningExecutor = worker
+        isLoadingQueueBatch = false
+        guard !isPausingBatchQueue else { return }
+
+        let poll = Task { [self] in
+            while !Task.isCancelled {
+                await sync()
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+        }
+        defer { poll.cancel() }
+        do {
+            try await worker.runPreparation(batchID: entry.id) { await MainActor.run { self.isPausingBatchQueue } }
+        } catch {
+            await sync()
+            throw error
+        }
+        let result = try await worker.batch(batchID: entry.id)
+        batchQueueStatuses[entry.id] = WorkflowBatchCatalog.progress(result).label
+        await sync()
+    }
+
+    private static func needsBatchPreparation(_ value: WorkflowBatch) -> Bool {
+        let stages: [WorkflowStage] = [.stack, .matte, .geometry]
+        return value.activeTasks.contains { task in
+            guard let next = stages.first(where: { task[$0].state != .completed }) else { return false }
+            return task[next].state == .pending
+        }
+    }
+
+    func pauseBatchQueue() {
+        guard isBatchQueueRunning, !isPausingBatchQueue else { return }
+        isPausingBatchQueue = true
+        notice = "正在等待当前步骤安全保存"
+        if let runningExecutor, let runningBatch {
+            queuePauseTask = Task {
+                await runningExecutor.pause(batchID: runningBatch.id)
+                await self.sync()
+            }
+        }
+    }
+
     // MARK: - 命令执行与状态同步
     private func launch(_ action: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }; busy = true; error = nil
@@ -674,6 +924,9 @@ nonisolated struct WorkflowBatchDraft: Sendable {
                   let previous = batch,previous.id == id,value.revision >= previous.revision else { return }
             if value.revision == previous.revision { return }
             batch = value
+            if batchQueue.contains(where: { $0.id == id }) {
+                batchQueueStatuses[id] = WorkflowBatchCatalog.progress(value).label
+            }
             if let currentTask, let old = previous.task(id: currentTask.id) {
                 if [.stack,.matte,.geometry].contains(stage),
                    !isReviewable(old), isReviewable(currentTask) {
@@ -768,18 +1021,18 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         if stage == .hd { confirmCurrent() }
         else if stage == .png4k { exportImages(scope: "此图") }
     }
-    func retry() { guard let e = executor,let b = batch else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: Set(b.activeTasks.map(\.id)),stage: stage) } }
+    func retry() { guard !isBatchQueueRunning, let e = executor,let b = batch else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: Set(b.activeTasks.map(\.id)),stage: stage) } }
     func reprocessCurrent(from stage: WorkflowStage) {
-        guard !hasManualEditing, !isUpdatingReview, let e = executor, let b = batch, let task = currentTask else { return }
+        guard !isBatchQueueRunning, !hasManualEditing, !isUpdatingReview, let e = executor, let b = batch, let task = currentTask else { return }
         launch { [self] in
             try await e.reprocessTask(batchID: b.id,taskID: task.id,from: stage,expectedVersion: task.finalPSDVersion)
             invalidatePreview(task.id); layouts[task.id] = nil; exportPreviewVersions[task.id] = nil
             await sync(); selectCurrentTaskStage()
         }
     }
-    func retryCurrent() { guard let e = executor,let b = batch,let task = currentTask else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: [task.id],stage: stage) } }
+    func retryCurrent() { guard !isBatchQueueRunning, let e = executor,let b = batch,let task = currentTask else { return }; let stage = stage; enqueue { try await e.retryTasks(batchID: b.id,taskIDs: [task.id],stage: stage) } }
     func excludeSelected() {
-        guard let e = executor, let b = batch else { return }
+        guard !isBatchQueueRunning, let e = executor, let b = batch else { return }
         let ids = Set(orderedSpecimenSelection)
         guard !ids.isEmpty else { return }
         launch { [self] in
@@ -794,12 +1047,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     func pause() { guard let e = executor,let b = batch else { return }; notice = "正在等待当前步骤安全保存并暂停"; Task { await e.pause(batchID: b.id); await sync() } }
-    func resume() { guard let e = executor,let b = batch else { return }; launch { [self] in try await e.continueAutomatic(batchID: b.id); manualTaskID = nil } }
+    func resume() { guard !isBatchQueueRunning, let e = executor,let b = batch else { return }; launch { [self] in try await e.continueAutomatic(batchID: b.id); manualTaskID = nil } }
     private func usesBatchReview(for task: WorkflowSideTask) -> Bool {
         manualTaskID != task.id && isReviewable(task)
     }
     var canOpenPSD: Bool {
-        guard let task = currentTask, task.snapshot != nil, currentSpecimen?.isExcluded == false else { return false }
+        guard !isBatchQueueRunning, let task = currentTask, task.snapshot != nil, currentSpecimen?.isExcluded == false else { return false }
         // 未走完自动阶段的失败面保留单面修补入口。
         if !usesBatchReview(for: task) {
             return !isUpdatingReview && manualReviewSessionID == nil && (manualTaskID == nil || manualTaskID == task.id)
@@ -828,7 +1081,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         Set((batch?.activeTasks ?? []).filter { selectedTaskIDs.contains($0.id) && canOpenReviewPSD($0) }.map(\.id))
     }
     var canOpenSelectedPSDs: Bool {
-        !busy && !isUpdatingReview && manualTaskID == nil && !selectedReviewTaskIDs.isEmpty
+        !isBatchQueueRunning && !busy && !isUpdatingReview && manualTaskID == nil && !selectedReviewTaskIDs.isEmpty
     }
     func openSelectedPSDs() {
         guard canOpenSelectedPSDs else { return }
@@ -866,7 +1119,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
 
     /// 和轮询串行进入执行器，选择图片和切换面板在等待期间仍然可用。
     private func updateReview(_ action: @escaping (WorkflowExecutor, UUID) async throws -> Void) {
-        guard !isUpdatingReview, let executor, let id = batch?.id else { return }
+        guard !isBatchQueueRunning, !isUpdatingReview, let executor, let id = batch?.id else { return }
         isUpdatingReview = true; error = nil
         Task { [self] in
             await reviewObservation?.value
@@ -911,7 +1164,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
     }
     private func continueQueuedExports() {
-        guard !hasManualEditing, !isUpdatingReview, hasQueuedExports, let executor, let batch, !batch.isPaused else { return }
+        guard !isBatchQueueRunning, !hasManualEditing, !isUpdatingReview, hasQueuedExports, let executor, let batch, !batch.isPaused else { return }
         launch { [self] in
             try await executor.runPending(batchID: batch.id)
             await sync()
@@ -924,7 +1177,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         return exportPreviewVersions[task.id] == version
     }
     var canLoadCurrentExportPreview: Bool {
-        guard stage == .png4k, currentSpecimen?.isExcluded == false, let task = currentTask,
+        guard !isBatchQueueRunning, stage == .png4k, currentSpecimen?.isExcluded == false, let task = currentTask,
               !hasManualEditing, !busy, !isUpdatingReview, !loading.contains(task.id),
               task[.geometry].state == .completed, let version = task.finalPSDVersion,
               task[.geometry].confirmedVersion == version else { return false }

@@ -128,8 +128,10 @@ actor WorkflowExecutor {
             throw error
         }
     }
-    func register(manifestURL: URL) async throws -> UUID {
-        let value = try await store.load(from: manifestURL)
+    func register(manifestURL: URL, loadedBatch: WorkflowBatch? = nil) async throws -> UUID {
+        let value: WorkflowBatch
+        if let loadedBatch { value = loadedBatch }
+        else { value = try await store.load(from: manifestURL) }
         guard batches[value.id] == nil else { return value.id }
         try await register(batch: value,manifestURL: manifestURL)
         return value.id
@@ -421,12 +423,28 @@ actor WorkflowExecutor {
         guard !confirming.contains(batchID) else { return }
         try await runStages(batchID: batchID)
     }
-    private func runStages(batchID: UUID) async throws {
+    func runPreparation(batchID: UUID, shouldPause: @escaping @Sendable () async -> Bool) async throws {
+        guard !confirming.contains(batchID), !reprocessing.contains(batchID), !cleaningIntermediates.contains(batchID),
+              !running.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
+              !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else {
+            throw WorkflowStateError.invalidTransition
+        }
+        try await runStages(batchID: batchID, preparationPause: shouldPause)
+    }
+    private func runStages(batchID: UUID, preparationPause: (@Sendable () async -> Bool)? = nil) async throws {
         guard !running.contains(batchID), manual[batchID] == nil, batchReviewLeases[batchID] == nil,
               !acquiringManual.contains(batchID), !preparingFinal.contains(batchID) else { return }
         _ = try batch(batchID: batchID); running.insert(batchID); defer { running.remove(batchID); pauseRequests.remove(batchID) }
         var dispatchedExport = false
         do {
+            if let preparationPause {
+                if await preparationPause() { pauseRequests.insert(batchID) }
+                let value = try batch(batchID: batchID)
+                if value.isPaused {
+                    try reduce(batchID,.resume(expectedRevision: value.revision)); try await persist(batchID)
+                }
+                try await finishRequestedPause(batchID)
+            }
             while !(try batch(batchID: batchID)).isPaused {
                 try Task.checkCancellation()
                 var advanced = false
@@ -445,8 +463,7 @@ actor WorkflowExecutor {
                         if try batch(batchID: batchID).isPaused { break }
                     }
                 }
-                for stage in WorkflowStage.processingStages {
-                    if [WorkflowStage.stack, .matte, .geometry].contains(stage) { continue }
+                for stage in preparationPause == nil ? [WorkflowStage.hd, .png4k] : [] {
                     let value = try batch(batchID: batchID)
                     let ids = value.activeTasks.filter { $0[stage].state == .pending && eligible($0,stage: stage,batch: value) }.map(\.id)
                     if !ids.isEmpty {

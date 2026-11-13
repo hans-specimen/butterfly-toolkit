@@ -7,9 +7,11 @@ import SwiftUI
 
 @main
 struct Butterfly_ToolkitApp: App {
+    @StateObject private var workflowStore = PhotoWorkflowStore()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(workflowStore: workflowStore)
         }
         .defaultSize(width: 1440, height: 920)
     }

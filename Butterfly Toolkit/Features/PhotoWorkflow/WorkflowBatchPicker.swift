@@ -35,7 +35,7 @@ struct WorkflowBatchPicker: View {
             }
             actions
         }
-        .frame(width: 640)
+        .frame(width: 740)
         .interactiveDismissDisabled(store.busy)
         .task { await reload() }
         .fileImporter(isPresented: $importingFile, allowedContentTypes: [.json]) { result in
@@ -129,7 +129,15 @@ struct WorkflowBatchPicker: View {
         HStack(spacing: 10) {
             Button("从文件打开…") { importingFile = true }.disabled(!store.canSwitchBatch)
             Button("删除批次…", role: .destructive) { confirmingDeletion = true }
-                .disabled(!canAct || selected?.batchID == nil)
+                .disabled(!canAct || store.isBatchQueueRunning || selected?.batchID == nil)
+            Button("加入队列") {
+                guard let selected else { return }
+                Task {
+                    do { try await store.addBatchToQueue(selected.id) }
+                    catch { actionError = error.localizedDescription }
+                }
+            }
+            .disabled(!canAct || selected?.canOpen != true || store.batchQueue.contains { $0.id == selected?.batchID })
             Spacer()
             Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(store.busy)
             Button("打开所选批次") { if let selected { open(selected.id) } }

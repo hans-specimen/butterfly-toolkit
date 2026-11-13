@@ -24,6 +24,7 @@ struct PhotoWorkflowView: View {
     @FocusState private var queueFocused: Bool
     @State private var singleFace = false
     @State private var showingBatchPicker = false
+    @State private var showingBatchQueue = false
     @State private var exportScope = "此图"
     @State private var reprocessStage: WorkflowStage?
     @State private var cleanupReports: [UUID: (version: String,report: MaskCleanupReport?)] = [:]
@@ -47,9 +48,16 @@ struct PhotoWorkflowView: View {
                     Text("收藏标本 · 正面 D / 反面 V").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                batchQueueButton
+                Button("新建批次") { store.beginNewBatch() }.disabled(!store.canSwitchBatch)
                 Button("打开批次…") { showingBatchPicker = true }.disabled(!store.canSwitchBatch)
-                if store.batch != nil {
-                    Button("关闭批次／新建") { store.closeBatch() }.disabled(!store.canSwitchBatch)
+                if let batch = store.batch {
+                    if store.batchQueue.contains(where: { $0.id == batch.id }) {
+                        Button("运行此批次") { store.runQueuedBatch(batch.id) }
+                            .disabled(!store.canRunBatchQueue || !store.hasPendingBatchPreparation)
+                    } else {
+                        Button("加入队列") { store.addViewedBatchToQueue() }.disabled(!store.canSwitchBatch)
+                    }
                     Menu("查看文件") {
                         if let url = store.workingPSDDirectory { Button("工作 PSD") { NSWorkspace.shared.open(url) } }
                         if let url = store.exportDirectory(for: .hd) { Button("堆栈原图") { NSWorkspace.shared.open(url) } }
@@ -82,6 +90,25 @@ struct PhotoWorkflowView: View {
         .sheet(isPresented: $showingBatchPicker) { WorkflowBatchPicker(store: store) }
         .onDisappear { store.cancelMove() }
     }
+
+    private var batchQueueButton: some View {
+        Button("批次队列", systemImage: store.isBatchQueueRunning ? "clock" : "list.bullet.rectangle") {
+            showingBatchQueue.toggle()
+        }
+        .help(store.runningBatch.map { "正在处理：\($0.title)" } ?? "查看批次队列")
+        .popover(isPresented: $showingBatchQueue, arrowEdge: .bottom) {
+            WorkflowBatchQueuePanel(store: store, addSavedBatch: {
+                showingBatchQueue = false
+                showingBatchPicker = true
+            }, openBatch: { manifest in
+                showingBatchQueue = false
+                store.openBatch(manifest)
+            })
+            .frame(width: 340)
+            .task { await store.refreshBatchQueueStatuses() }
+        }
+    }
+
     // MARK: - 批次准备与固定槽位核对
     private var setup: some View {
         VStack(spacing: 0) {
@@ -106,7 +133,7 @@ struct PhotoWorkflowView: View {
                         Button("恢复所选") { store.setDraftExclusion(false, for: Set(store.draftSelectedIDs)) }
                     }.fixedSize()
                 }
-                Button(store.busy ? "正在准备批次…" : (store.inputMode == .psd ? "从 PS 抠图开始" : "开始处理")) { store.start() }
+                Button(store.busy ? "正在保存批次…" : "保存并加入队列") { store.start() }
                     .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(store.busy || !store.canStart)
             }.padding(.horizontal,24).padding(.vertical,14)
@@ -303,7 +330,10 @@ struct PhotoWorkflowView: View {
             }
             Divider()
             HStack(spacing: 12) {
-                if store.busy { ProgressView().controlSize(.small); Text(store.runningDescription ?? "正在安全处理，请勿在 PS 中同时编辑").font(.caption) }
+                if store.busy || store.runningBatch?.id == store.batch?.id {
+                    ProgressView().controlSize(.small)
+                    Text(store.runningDescription ?? "正在安全处理").font(.caption)
+                }
                 else if store.manualReviewSessionID != nil {
                     let count = store.trackedReviewCount
                     Text(store.hasQueuedExports ? "导出已排队，等待 PSD 精修结束" : count == 0 ? "正在保存精修记录" : "\(count) 张 PSD 正在跟踪")
@@ -314,12 +344,12 @@ struct PhotoWorkflowView: View {
                 Spacer()
                 Menu("更多操作") {
                     if [.stack,.matte,.geometry].contains(store.stage) {
-                        Button("重试本阶段失败项") { store.retry() }.disabled(store.hasManualEditing || store.isUpdatingReview)
+                        Button("重试本阶段失败项") { store.retry() }.disabled(store.isBatchQueueRunning || store.hasManualEditing || store.isUpdatingReview)
                     }
-                    Button("暂不处理所选标本") { store.excludeSelected() }.disabled(store.busy || store.hasManualEditing || store.isUpdatingReview || store.selectedSpecimens.isEmpty)
+                    Button("暂不处理所选标本") { store.excludeSelected() }.disabled(store.isBatchQueueRunning || store.busy || store.hasManualEditing || store.isUpdatingReview || store.selectedSpecimens.isEmpty)
                 }.fixedSize()
                 if store.canResumeAutomatic { Button(store.stage == .png4k || store.hasQueuedExports ? "继续导出" : "继续自动准备") { store.resume() }.disabled(store.busy) }
-                else if store.busy { Button("暂停") { store.pause() } }
+                else if store.busy && !store.isBatchQueueRunning { Button("暂停") { store.pause() } }
                 Button("批量导出") {
                     exportScope = store.hasExplicitQueueSelection ? "所选" : "全部已确认"
                     store.stage = .png4k
@@ -682,7 +712,7 @@ struct PhotoWorkflowView: View {
     }
     @ViewBuilder private var retryStageButton: some View {
         if store.currentTask?[store.stage].state == .failed {
-            Button("重试\(stageTitle(store.stage))") { store.retryCurrent() }.disabled(store.hasManualEditing || store.isUpdatingReview)
+            Button("重试\(stageTitle(store.stage))") { store.retryCurrent() }.disabled(store.isBatchQueueRunning || store.hasManualEditing || store.isUpdatingReview)
         }
     }
     private var imageControls: some View {
@@ -735,7 +765,7 @@ struct PhotoWorkflowView: View {
                 Button("重新景深合成／导入") { reprocessStage = .stack }
                 Button("重新 PS 抠图") { reprocessStage = .matte }.disabled(store.currentTask?.checkpoints?[.stack] == nil)
                 Button("重新旋转矫正") { reprocessStage = .geometry }.disabled(store.currentTask?.checkpoints?[.matte] == nil)
-            }.disabled(store.busy || store.hasManualEditing || store.isUpdatingReview)
+            }.disabled(store.isBatchQueueRunning || store.busy || store.hasManualEditing || store.isUpdatingReview)
             .confirmationDialog("从\(reprocessStage?.title ?? "所选步骤")重新处理？",isPresented: Binding(get: { reprocessStage != nil },set: { if !$0 { reprocessStage = nil } })) {
                 Button("重新处理") { if let step = reprocessStage { store.reprocessCurrent(from: step) }; reprocessStage = nil }
                 Button("取消",role: .cancel) { reprocessStage = nil }
@@ -783,11 +813,11 @@ struct PhotoWorkflowView: View {
     // 确认绑定保存版本，导出仍要求有效确认；预览加载不阻塞人工确认。
     private var primaryDisabled: Bool {
         if [.stack,.matte,.geometry].contains(store.stage) {
-            if store.currentTask?[store.stage].state == .failed { return store.hasManualEditing || store.isUpdatingReview }
+            if store.currentTask?[store.stage].state == .failed { return store.isBatchQueueRunning || store.hasManualEditing || store.isUpdatingReview }
             return ![WorkflowStatus.waitingReview,.completed].contains(store.currentTask?[.geometry].state ?? .pending)
         }
         if store.stage == .hd { return !store.canFinalize }
-        if store.stage == .png4k { return store.isUpdatingReview || store.exportTaskIDs(scope: exportScope).isEmpty || (!store.exportHDSelected && !store.exportPNGSelected) }
+        if store.stage == .png4k { return store.isBatchQueueRunning || store.isUpdatingReview || store.exportTaskIDs(scope: exportScope).isEmpty || (!store.exportHDSelected && !store.exportPNGSelected) }
         return true
     }
     private func assetTitle(_ kind: WorkflowAssetKind) -> String {
