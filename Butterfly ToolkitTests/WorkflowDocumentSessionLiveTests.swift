@@ -12,9 +12,27 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
         func record(_ script: String) { if script.contains("var px=") { geometry += 1 } }
         func count() -> Int { geometry }
     }
+    private struct LayerGeometry: Decodable {
+        let id: Int
+        let name: String
+        let visible: Bool
+        let hasMask: Bool
+        let left: Double
+        let top: Double
+        let right: Double
+        let bottom: Double
+        var center: CGPoint { CGPoint(x: (left + right) / 2, y: (top + bottom) / 2) }
+    }
+
     func testSyntheticStackSubjectGeometryKeepsOneDocumentAndRecoversReceipt() async throws {
         guard ProcessInfo.processInfo.environment["WORKFLOW_SESSION_SYNTHETIC"] == "1" else {
             throw XCTSkip("Requires explicit synthetic Photoshop validation")
+        }
+        let openCount = try await PhotoshopExecutionCoordinator.shared.run(owner: UUID()) {
+            try await PhotoshopWorkflowBridge.execute("String(app.documents.length)")
+        }
+        guard openCount.trimmingCharacters(in: .whitespacesAndNewlines) == "0" else {
+            throw XCTSkip("Photoshop has open documents; leave the user's editing session untouched")
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("Toolkit-Session-Live-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -52,6 +70,36 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
         let inspect = """
         (function(){for(var i=0;i<app.documents.length;i++){var d=app.documents[i];try{if(d.fullName.fsName.replace(/^\\/private(?=\\/(tmp|var)\\/)/,'')===new File(\(path)).fsName.replace(/^\\/private(?=\\/(tmp|var)\\/)/,''))return String(d.id);}catch(e){}}return 'closed';}());
         """
+        let inspectLayers = """
+        (function(){var doc=app.activeDocument;
+            var original=doc.layerSets.getByName('原始堆栈'), layers=[];
+            function addLayers(parent) {
+                for(var i=0;i<parent.layers.length;i++){
+                    var layer=parent.layers[i];
+                    if(layer.typename==='LayerSet'){addLayers(layer);continue;}
+                    var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);
+                    var descriptor=executeActionGet(ref), key=stringIDToTypeID('hasUserMask');
+                    var hasMask=descriptor.hasKey(key) && descriptor.getBoolean(key);
+                    var d=descriptor.getObjectValue(stringIDToTypeID('boundsNoMask'));
+                    function coord(key){return d.getUnitDoubleValue(stringIDToTypeID(key));}
+                    layers.push('{"id":'+layer.id+',"name":"'+layer.name+'","visible":'+layer.visible+
+                        ',"hasMask":'+hasMask+',"left":'+coord('left')+',"top":'+coord('top')+
+                        ',"right":'+coord('right')+',"bottom":'+coord('bottom')+'}');
+                }
+            }
+            addLayers(original);
+            addLayers(doc.layerSets.getByName('共同调整'));
+            var bg=doc.artLayers.getByName('BG');
+            return '{"originalVisible":'+original.visible+',"backgroundLocked":'+bg.allLocked+
+                ',"backgroundVisible":'+bg.visible+',"layers":['+layers.join(',')+']}';
+        }());
+        """
+        struct DocumentGeometry: Decodable {
+            let originalVisible: Bool
+            let backgroundLocked: Bool
+            let backgroundVisible: Bool
+            let layers: [LayerGeometry]
+        }
         let result = try await bridge.withTaskDocument(owner: owner, document: work) {
             let stack = try await bridge.stack(job: FocusStackJob(id: 1, sourceFiles: sources, destinationURL: work, butterflyName: "synthetic", side: "D"), owner: owner)
             let stackID = try await PhotoshopWorkflowBridge.execute(inspect)
@@ -64,11 +112,32 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
             let images = try await bridge.extractRoles(snapshot: subject)
             XCTAssertEqual(images.snapshotVersion, subject.contentVersion)
             var solution = ExecutorFixture.solution(subject.contentVersion)
-            solution.angleDegrees = 7
-            solution.rotationPivot = CGPoint(x: 256, y: 256)
-            solution.sourceCropRect = CGRect(x: 16, y: 16, width: 480, height: 480)
-            solution.outputSize = CGSize(width: 480, height: 480)
+            solution.angleDegrees = 17
+            solution.rotationPivot = CGPoint(x: 192, y: 312)
+            solution.sourceCropRect = CGRect(x: 86, y: 76, width: 366, height: 360)
+            solution.outputSize = solution.sourceCropRect.size
+            let beforeJSON = try await PhotoshopWorkflowBridge.execute(inspectLayers)
+            let before = try JSONDecoder().decode(DocumentGeometry.self, from: Data(beforeJSON.utf8))
+            XCTAssertEqual(before.layers.map(\.name).sorted(),
+                (sources.map(\.lastPathComponent) + ["Keying_Level", "Keying_Origin", "Stack"]).sorted())
             let final = try await bridge.applyGeometry(snapshot: subject, solution: solution)
+            let afterJSON = try await PhotoshopWorkflowBridge.execute(inspectLayers)
+            let after = try JSONDecoder().decode(DocumentGeometry.self, from: Data(afterJSON.utf8))
+            XCTAssertFalse(before.originalVisible)
+            XCTAssertEqual(after.originalVisible, before.originalVisible)
+            XCTAssertTrue(after.backgroundLocked)
+            XCTAssertTrue(after.backgroundVisible)
+            XCTAssertEqual(after.layers.map(\.id), before.layers.map(\.id))
+            XCTAssertEqual(after.layers.map(\.name), before.layers.map(\.name))
+            XCTAssertEqual(after.layers.map(\.visible), before.layers.map(\.visible))
+            XCTAssertEqual(after.layers.map(\.hasMask), before.layers.map(\.hasMask))
+            for (source, rotated) in zip(before.layers, after.layers) {
+                let expected = WorkflowPreviewCoordinates.rotate(source.center,
+                    degrees: solution.angleDegrees, pivot: solution.rotationPivot)
+                XCTAssertEqual(rotated.center.x, expected.x - solution.sourceCropRect.minX, accuracy: 2, source.name)
+                XCTAssertEqual(rotated.center.y, expected.y - solution.sourceCropRect.minY, accuracy: 2, source.name)
+                XCTAssertGreaterThan(rotated.right - rotated.left, solution.outputSize.width)
+            }
             let observedID1 = try await PhotoshopWorkflowBridge.execute(inspect)
             XCTAssertEqual(observedID1, stackID)
             let recovered = try await bridge.applyGeometry(snapshot: subject, solution: solution)
@@ -92,6 +161,37 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
         try await bridge.acknowledgeManualResult(snapshot: final)
         let acknowledged = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: Any])
         XCTAssertNil(acknowledged["pendingMutation"])
+        // 在独立工作副本中合并已矫正的三张素材，换入 Stack 后检查定稿角色和导出。
+        let replacedStack = root.appendingPathComponent("replacement-stack.psd")
+        try FileManager.default.copyItem(at: work, to: replacedStack)
+        try FileManager.default.copyItem(at: record, to: replacedStack.appendingPathExtension("workflow-owner.json"))
+        let replacementPath = String(decoding: try JSONEncoder().encode(replacedStack.path), as: UTF8.self)
+        let replacementID = try await PhotoshopExecutionCoordinator.shared.run(owner: owner) {
+            try await PhotoshopWorkflowBridge.execute("""
+            (function(){var doc=app.open(new File(\(replacementPath)));
+                try {
+                    var original=doc.layerSets.getByName('原始堆栈'),adjust=doc.layerSets.getByName('共同调整');
+                    var replacement=original.duplicate();replacement.visible=true;doc.activeLayer=replacement;
+                    executeAction(stringIDToTypeID('mergeLayersNew'),undefined,DialogModes.NO);
+                    var layer=doc.activeLayer, old=adjust.artLayers.getByName('Stack');
+                    layer.move(old,ElementPlacement.PLACEAFTER);old.remove();
+                    layer.name='Stack';layer.visible=false;doc.save();return String(layer.id);
+                }finally{doc.close(SaveOptions.DONOTSAVECHANGES);}
+            }());
+            """)
+        }
+        let replaced = try await bridge.captureFinalPSD(document: replacedStack, owner: owner)
+        XCTAssertNotEqual(replaced.contentVersion, final.contentVersion)
+        XCTAssertEqual(replaced.finalRoles?.baseLayer, replacementID.trimmingCharacters(in: .whitespacesAndNewlines))
+        let rebuiltRoles = try await bridge.extractRoles(snapshot: replaced)
+        XCTAssertEqual(rebuiltRoles.cropViewport.size, result.2.pixelSize)
+        let jpeg = root.appendingPathComponent("replacement-stack.jpg")
+        let renderer = WorkflowAssetRenderer()
+        try renderer.renderHD(roles: rebuiltRoles, destination: jpeg)
+        let png = root.appendingPathComponent("replacement-stack.png")
+        try renderer.render4K(roles: rebuiltRoles, layout: .png4k, destination: png)
+        XCTAssertEqual(try WorkflowRaster.read(jpeg).size, result.2.pixelSize)
+        XCTAssertEqual(try WorkflowRaster.read(png).size, CGSize(width: 4096, height: 4096))
         let manual = root.appendingPathComponent("manual-mask.psd")
         _ = try await bridge.restoreCheckpoint(snapshot: result.0, destination: manual)
         // 模拟用户在新副本中保存了正确三层；磁盘内容来自刚才已核验的PS识别快照。

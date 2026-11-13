@@ -1372,23 +1372,36 @@ extension PhotoshopWorkflowBridge {
         }finally{if(mask)wfCloseDocument(mask);if(copy)wfCloseDocument(copy);wfClose(o);}
         """
     }
-    // 共同调整组先绕自身中心旋转，再平移补偿为指定支点；裁切保留框外可编辑像素。
+    // 同时旋转原始堆栈与共同调整组；裁切保留框外可编辑像素。
     private static func geometryScript(document: URL, solution: GeometrySolution) -> String {
         let rect = solution.sourceCropRect
         return """
         var o=wfOpen(\(quote(document.resolvingSymlinksInPath().path))),doc=o.doc;
         try {
             var roles=wfRoles(doc);if(!roles)throw new Error('WORKFLOW_STRUCTURE');
-            var bounds=wfBounds(roles.base),cx=(bounds[0]+bounds[2])/2,cy=(bounds[1]+bounds[3])/2;
-            var px=\(solution.rotationPivot.x),py=\(solution.rotationPivot.y),angle=\(solution.angleDegrees),radians=angle*Math.PI/180;
+            var px=\(solution.rotationPivot.x),py=\(solution.rotationPivot.y),angle=\(solution.angleDegrees);
             if(angle!==0){
-                // 用完整底图固定组边界，旋转和位移同时作用于三层及其蒙版。
-                var baseWasVisible=roles.base.visible;roles.base.visible=true;
-                try { roles.adjust.rotate(angle,AnchorPosition.MIDDLECENTER); }
-                finally { roles.base.visible=baseWasVisible; }
-                var dx=px+(cx-px)*Math.cos(radians)-(cy-py)*Math.sin(radians)-cx;
-                var dy=py+(cx-px)*Math.sin(radians)+(cy-py)*Math.cos(radians)-cy;
-                roles.adjust.translate(UnitValue(dx,'px'),UnitValue(dy,'px'));
+                var active=doc.activeLayer;
+                function selectLayer(layer, add){
+                    var select=new ActionDescriptor(),ref=new ActionReference();
+                    ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);
+                    select.putReference(charIDToTypeID('null'),ref);
+                    select.putBoolean(charIDToTypeID('MkVs'),false);
+                    if(add)select.putEnumerated(stringIDToTypeID('selectionModifier'),stringIDToTypeID('selectionModifierType'),stringIDToTypeID('addToSelection'));
+                    executeAction(charIDToTypeID('slct'),select,DialogModes.NO);
+                }
+                // 使用文档坐标指定同一支点，避免图层组边界或蒙版改变旋转中心。
+                selectLayer(roles.adjust,false);selectLayer(roles.original,true);
+                var transform=new ActionDescriptor(),target=new ActionReference(),pivot=new ActionDescriptor();
+                target.putEnumerated(charIDToTypeID('Lyr '),charIDToTypeID('Ordn'),charIDToTypeID('Trgt'));
+                transform.putReference(charIDToTypeID('null'),target);
+                transform.putEnumerated(charIDToTypeID('FTcs'),charIDToTypeID('QCSt'),stringIDToTypeID('QCSIndependent'));
+                pivot.putUnitDouble(charIDToTypeID('Hrzn'),charIDToTypeID('#Pxl'),px);
+                pivot.putUnitDouble(charIDToTypeID('Vrtc'),charIDToTypeID('#Pxl'),py);
+                transform.putObject(charIDToTypeID('Pstn'),charIDToTypeID('Pnt '),pivot);
+                transform.putUnitDouble(charIDToTypeID('Angl'),charIDToTypeID('#Ang'),angle);
+                executeAction(charIDToTypeID('Trnf'),transform,DialogModes.NO);
+                selectLayer(active,false);
             }
             var d=new ActionDescriptor(),r=new ActionDescriptor();
             r.putUnitDouble(charIDToTypeID('Top '),charIDToTypeID('#Pxl'),\(rect.minY));r.putUnitDouble(charIDToTypeID('Left'),charIDToTypeID('#Pxl'),\(rect.minX));

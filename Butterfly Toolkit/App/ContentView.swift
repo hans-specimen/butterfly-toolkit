@@ -74,7 +74,7 @@ enum ToolPage: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
 
-    @State private var selectedPage: ToolPage? = .aiCutout
+    @State private var selectedPage: ToolPage? = .photoWorkflow
     // 状态由主窗口持有，避免切换到其他工具时重新创建工作区。
     @StateObject private var aiStore = AIWorkspaceStore()
     @StateObject private var workflowStore = PhotoWorkflowStore()
