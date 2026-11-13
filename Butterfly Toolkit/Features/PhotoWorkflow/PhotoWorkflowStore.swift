@@ -190,6 +190,11 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     @Published private(set) var previewInteractionStarted: [UUID: TimeInterval] = [:]
     @Published var manualTaskID: UUID?
     private var executor: WorkflowExecutor?
+    let batchCatalog: WorkflowBatchCatalog
+    // WindowGroup 可同时持有多个工作流，删除时要保护其他窗口的执行器。
+    private static let openStores = NSHashTable<PhotoWorkflowStore>.weakObjects()
+    private var openingBatch = false
+    private var deletingBatch = false
     @Published private(set) var isUpdatingReview = false
     @Published private(set) var manualReviewSessionID: UUID?
     @Published private(set) var manualObservationError: String?
@@ -208,10 +213,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     init(geometry: WorkflowGeometryCache = WorkflowGeometryCache(),previews: (any WorkflowPreviewServing)? = nil,
          makeExecutor: ((URL) -> WorkflowExecutor)? = nil,
          openPhotoshopDocument: @escaping (URL) async throws -> Void = PhotoWorkflowStore.openInPhotoshop,
-         isApplicationActive: @escaping @MainActor @Sendable () -> Bool = { NSApplication.shared.isActive }) {
+         isApplicationActive: @escaping @MainActor @Sendable () -> Bool = { NSApplication.shared.isActive },
+         batchCatalog: WorkflowBatchCatalog = WorkflowBatchCatalog()) {
         self.geometry = geometry; self.previews = previews ?? WorkflowPreviewService(geometry: geometry)
         self.makeReviewExecutor = makeExecutor; self.openPhotoshopDocument = openPhotoshopDocument
-        self.isApplicationActive = isApplicationActive
+        self.isApplicationActive = isApplicationActive; self.batchCatalog = batchCatalog
+        Self.openStores.add(self)
     }
     var currentSpecimen: WorkflowSpecimen? { batch?.specimens.first { $0.id == currentSpecimenID } }
     var currentTask: WorkflowSideTask? { face == .front ? currentSpecimen?.front : currentSpecimen?.back }
@@ -524,12 +531,15 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         } catch { draft = nil; draftSelectedIDs = []; names = ""; self.error = error.localizedDescription }
     }
     func start() {
+        guard canOpenBatchFiles else { error = "请等待其他窗口完成批次删除"; return }
         guard let draft else { error = "请选择输入文件夹"; return }
-        let outputDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Butterfly Toolkit/PhotoWorkflow/\(UUID().uuidString)", isDirectory: true)
+        let outputDirectory = WorkflowIntermediateCleanup.storageRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let locations = WorkflowOutputLocations(hd: hdDirectory, png4k: png4kDirectory)
         let names = names, request = draftGeometryRequest
+        guard !busy else { return }
+        openingBatch = true
         launch { [self] in
+            defer { openingBatch = false }
             let frozen = try await Task.detached { try draft.freeze(names: names,output: outputDirectory,locations: locations,geometryRequest: request) }.value
             let e = makeExecutor(output: outputDirectory)
             let manifest = outputDirectory.appendingPathComponent("batch.json")
@@ -547,7 +557,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard let directory = draft?.directory else { return nil }
         return directory.resolvingSymlinksInPath().appendingPathComponent(directory.lastPathComponent + (kind == .hd ? "_堆栈原图" : "_4K_PNG"),isDirectory: true)
     }
-    var canChangeExportDirectory: Bool { canSwitchBatch }
+    var canChangeExportDirectory: Bool { canSwitchBatch && canOpenBatchFiles }
     func selectExportDirectory(_ url: URL, kind: WorkflowAssetKind) {
         guard canChangeExportDirectory else { return }
         guard let executor, let batch else {
@@ -558,9 +568,14 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     }
 
     var canSwitchBatch: Bool { !busy && !isUpdatingReview && !hasManualEditing }
+    private var canOpenBatchFiles: Bool { !Self.openStores.allObjects.contains { $0.deletingBatch } }
+
     func openBatch(_ url: URL) {
         guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
+        guard canOpenBatchFiles else { error = "请等待其他窗口完成批次删除"; return }
+        openingBatch = true
         launch { [self] in
+            defer { openingBatch = false }
             try await persistBeforeSwitch()
             let e = makeExecutor(output: url.deletingLastPathComponent())
             let id = try await e.register(manifestURL: url)
@@ -585,10 +600,39 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         guard canSwitchBatch else { error = "请先关闭正在精修的 PSD，等待核对完成"; return }
         launch { [self] in
             try await persistBeforeSwitch()
-            await clearPreviewState(); executor = nil; batch = nil; manualReviewSessionID = nil
-            resetSpecimenSelection()
-            draft = nil; draftSelectedIDs = []; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
+            await resetClosedBatch()
         }
+    }
+    func deleteBatch(_ record: WorkflowBatchCatalog.Record) async throws {
+        guard canSwitchBatch else { throw WorkflowBridgeError.manualReviewActive }
+        let otherStores = Self.openStores.allObjects.filter { $0 !== self }
+        guard !otherStores.contains(where: { $0.openingBatch || $0.deletingBatch }) else {
+            throw WorkflowStateError.invalidManifest("请等待其他窗口完成批次打开或删除")
+        }
+        let directory = record.id.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL
+        let otherBatches = otherStores.compactMap(\.batch)
+        guard !otherBatches.contains(where: { $0.outputDirectory.resolvingSymlinksInPath().standardizedFileURL.path == directory.path }) else {
+            throw WorkflowStateError.invalidManifest("请先在其他窗口关闭此批次")
+        }
+        deletingBatch = true; busy = true
+        defer { deletingBatch = false; busy = false; prepareSelected() }
+
+        let current = batch?.outputDirectory.resolvingSymlinksInPath().standardizedFileURL
+        let deletingCurrent = current?.path == directory.path
+        if deletingCurrent {
+            try await persistBeforeSwitch()
+            let pendingPreviews = Array(previewTasks.values)
+            await clearPreviewState()
+            for preview in pendingPreviews { await preview.value }
+        }
+        let protected = otherBatches + (deletingCurrent ? [] : [batch].compactMap { $0 })
+        try await batchCatalog.delete(record, protecting: protected)
+        if deletingCurrent { await resetClosedBatch() }
+    }
+    private func resetClosedBatch() async {
+        await clearPreviewState(); executor = nil; batch = nil; manualReviewSessionID = nil
+        resetSpecimenSelection()
+        draft = nil; draftSelectedIDs = []; names = ""; hdDirectory = nil; png4kDirectory = nil; stage = .stack
     }
     private func persistBeforeSwitch() async throws {
         guard let executor, let batch else { return }

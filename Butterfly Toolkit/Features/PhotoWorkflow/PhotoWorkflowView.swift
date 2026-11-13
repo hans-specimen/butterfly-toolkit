@@ -23,6 +23,7 @@ struct PhotoWorkflowView: View {
     @FocusState private var draftQueueFocused: Bool
     @FocusState private var queueFocused: Bool
     @State private var singleFace = false
+    @State private var showingBatchPicker = false
     @State private var exportScope = "此图"
     @State private var reprocessStage: WorkflowStage?
     @State private var cleanupReports: [UUID: (version: String,report: MaskCleanupReport?)] = [:]
@@ -46,7 +47,7 @@ struct PhotoWorkflowView: View {
                     Text("收藏标本 · 正面 D / 反面 V").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("打开批次清单…") { chooseFile(types: [.json]) { store.openBatch($0) } }.disabled(!store.canSwitchBatch)
+                Button("打开批次…") { showingBatchPicker = true }.disabled(!store.canSwitchBatch)
                 if store.batch != nil {
                     Button("关闭批次／新建") { store.closeBatch() }.disabled(!store.canSwitchBatch)
                     Menu("查看文件") {
@@ -78,6 +79,7 @@ struct PhotoWorkflowView: View {
         .task(id: store.manualReviewSessionID) {
             if let session = store.manualReviewSessionID { await store.observeManualEdits(sessionID: session) }
         }
+        .sheet(isPresented: $showingBatchPicker) { WorkflowBatchPicker(store: store) }
         .onDisappear { store.cancelMove() }
     }
     // MARK: - 批次准备与固定槽位核对
