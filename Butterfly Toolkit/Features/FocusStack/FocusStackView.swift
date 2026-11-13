@@ -140,7 +140,7 @@ struct FocusStackView: View {
                 Text("每行一只蝴蝶，不要填写 _D、_V 或 .psd")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            TextEditor(text: $namesText)
+            TextEditor(text: $namesText.replacingTabs)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 150, maxHeight: 230)
                 .padding(8)

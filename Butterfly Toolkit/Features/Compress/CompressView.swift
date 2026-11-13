@@ -238,7 +238,7 @@ struct CompressView: View {
         HStack(spacing: 12) {
             Text("目标大小")
 
-            TextField("例如 500", text: $targetSize)
+            TextField("例如 500", text: $targetSize.replacingTabs)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 140)
 
@@ -248,7 +248,7 @@ struct CompressView: View {
     }
 
     private var outputFolderName: String {
-        guard let size = Int(targetSize), size > 0 else {
+        guard let size = ToolkitTextInput.integer(targetSize, in: 1...(Int.max / 1024)), size > 0 else {
             return "压缩后"
         }
 
@@ -342,11 +342,11 @@ struct CompressView: View {
             return
         }
 
-        guard let targetKilobytes = Int(targetSize),
+        guard let targetKilobytes = ToolkitTextInput.integer(targetSize, in: 1...(Int.max / 1024)),
               targetKilobytes > 0 else {
             showMessage(
                 title: "目标大小错误",
-                message: "请输入正确的目标大小，例如 500。"
+                message: ToolkitTextInput.singleLineError(targetSize) ?? "目标大小须为正整数，例如 500。"
             )
             return
         }

@@ -17,20 +17,27 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
     struct Row {
         let source: String
         let info: CardCollectionInfo
+        let line: Int
     }
 
     static func parse(_ raw: String) throws -> Self {
-        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return Self() }
         let rows = try parseBatch(raw)
-        guard rows.count == 1, let row = rows.first else {
-            throw CardError.message("请粘贴一行采集信息。表格可含翅展、国家、采集点、日期和海拔。")
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return Self() }
+        if rows.count > 1 {
+            throw CardError.message("第 \(rows[1].line) 行有多余内容。此处只接受一条采集记录，批量填写请使用「批量填写采集信息」。")
+        }
+        guard let row = rows.first else {
+            throw CardError.message("请粘贴一条采集记录。")
         }
         return row.info
     }
 
     static func parseBatch(_ raw: String) throws -> [Row] {
-        let lines = raw.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: .newlines)
-        let rows = lines.enumerated().compactMap { index, line -> (number: Int, source: String, columns: [String])? in
+        let lines = ToolkitTextInput.lines(raw)
+        let rows = try lines.enumerated().compactMap { index, line -> (number: Int, source: String, columns: [String])? in
+            if let error = ToolkitTextInput.controlError(line, line: index + 1, allowTabs: true) {
+                throw CardError.message(error)
+            }
             guard line.contains("\t") || !line.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
             var text = line
             let separator = line.contains("\t") ? "\t" : "|"
@@ -59,7 +66,7 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
             do {
                 // 保留表头列序，逐只重新整理时仍能正确识别字段。
                 let source = headerSource.map { $0 + "\n" + row.source } ?? row.source
-                return Row(source: source, info: try parseRow(row.columns, header: header, hasLeadingWingspan: hasLeadingWingspan))
+                return Row(source: source, info: try parseRow(row.columns, header: header, hasLeadingWingspan: hasLeadingWingspan), line: row.number)
             } catch {
                 throw CardError.message("第 \(row.number) 行无法解析。\(error.localizedDescription)")
             }

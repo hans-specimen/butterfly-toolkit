@@ -12,7 +12,6 @@ enum FocusStackError: LocalizedError, Sendable {
     case noImages
     case emptyNames
     case invalidName(String)
-    case duplicateName(String)
     case countMismatch(images: Int, names: Int)
     case photoshopNotFound
     case scriptFailed(String)
@@ -27,10 +26,8 @@ enum FocusStackError: LocalizedError, Sendable {
             "原图文件夹中没有找到支持的图片。"
         case .emptyNames:
             "请粘贴 PSD 名称清单，每行填写一只蝴蝶。"
-        case .invalidName(let name):
-            "名称“\(name)”包含 /、:，或已经带有 _D/_V 后缀。请只填写基础名称。"
-        case .duplicateName(let name):
-            "名称清单中存在重复项：\(name)"
+        case .invalidName(let message):
+            message
         case .countMismatch(let images, let names):
             "照片有 \(images) 张，但 \(names) 行名称需要 \(names * 6) 张。每只蝴蝶必须正好对应 6 张照片。"
         case .photoshopNotFound:
@@ -230,24 +227,21 @@ struct FocusStackProcessor {
     // MARK: - 名称与路径约束
 
     nonisolated private static func parseNames(_ text: String) throws -> [String] {
-        let names = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !names.isEmpty else { throw FocusStackError.emptyNames }
-
-        var seen = Set<String>()
-        for name in names {
+        let rows = try ToolkitTextInput.filenameRows(text)
+        var seen: Set<String> = []
+        let names: [String] = try rows.enumerated().compactMap { index, name in
+            let line = index + 1
+            guard !name.isEmpty else { return nil }
             let lower = name.lowercased()
-            guard !name.contains("/"), !name.contains(":"),
-                  !lower.hasSuffix("_d"), !lower.hasSuffix("_v"),
-                  !lower.hasSuffix(".psd") else {
-                throw FocusStackError.invalidName(name)
+            guard !lower.hasSuffix("_d"), !lower.hasSuffix("_v"), !lower.hasSuffix(".psd") else {
+                throw FocusStackError.invalidName("第 \(line) 行请只填写基础名称，去掉 _D、_V 或 .psd 后缀。")
             }
-            let key = name.precomposedStringWithCanonicalMapping.lowercased()
-            guard seen.insert(key).inserted else {
-                throw FocusStackError.duplicateName(name)
+            guard seen.insert(name.precomposedStringWithCanonicalMapping.lowercased()).inserted else {
+                throw FocusStackError.invalidName("第 \(line) 行名称重复「\(name)」。")
             }
+            return name
         }
+        guard !names.isEmpty else { throw FocusStackError.emptyNames }
         return names
     }
 

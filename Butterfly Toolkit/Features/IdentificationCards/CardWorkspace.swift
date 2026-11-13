@@ -88,12 +88,38 @@ nonisolated struct CardWorkspace: Sendable {
         }
         if let coordinationError { throw coordinationError }; if let operationError { throw operationError }
     }
-    func cleanCompleted(_ id: UUID,expectedHash:String? = nil) throws {
+    func workingForRemoval(_ id: UUID) throws -> URL {
+        let folder = try ownedDirectory(id)
+        let working = folder.appendingPathComponent("card.psd")
+        if let values = try? working.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey]),
+           values.isSymbolicLink == true || values.isRegularFile != true {
+            throw CardError.message("工作 PSD 不是普通文件，已保留")
+        }
+        return working
+    }
+
+    private func ownedDirectory(_ id: UUID) throws -> URL {
         let folder = directory(id)
-        guard folder.resolvingSymlinksInPath().deletingLastPathComponent().path == root.resolvingSymlinksInPath().path else { throw CardError.message("工作目录归属不符，未清理") }
+        let expected = root.resolvingSymlinksInPath().appendingPathComponent(id.uuidString)
+        guard folder.resolvingSymlinksInPath().standardizedFileURL.path == expected.standardizedFileURL.path else {
+            throw CardError.message("工作目录归属不符，未清理")
+        }
+        return folder
+    }
+
+    func cleanRemovedCard(_ id: UUID, expectedHash: String?) throws {
+        let working = try workingForRemoval(id)
+        if expectedHash == nil, FileManager.default.fileExists(atPath: working.path) {
+            throw CardError.message("移除后出现新的工作 PSD，已保留")
+        }
+        try cleanCompleted(id, expectedHash: expectedHash)
+    }
+
+    func cleanCompleted(_ id: UUID,expectedHash:String? = nil) throws {
+        let folder = try ownedDirectory(id)
         // 预览保留用于列表回看；仅删除明确命名的本任务工作文件及渲染目录。
         if FileManager.default.fileExists(atPath:working(id).path) {
-            if let expectedHash,try AIFileValidation.hash(working(id).path) != expectedHash { throw CardError.message("PSD 在导出后又有修改，已保留新的人工版本") }
+            if let expectedHash,try AIFileValidation.hash(working(id).path) != expectedHash { throw CardError.message("工作 PSD 已变化，已保留新的人工版本") }
             try FileManager.default.removeItem(at:working(id))
         }
         let prepared=folder.appendingPathComponent("prepared.json")

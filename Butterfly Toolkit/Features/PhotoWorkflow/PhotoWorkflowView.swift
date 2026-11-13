@@ -104,7 +104,7 @@ struct PhotoWorkflowView: View {
         return groups.firstIndex { $0.id == selectedDraftID } ?? 0
     }
     private func draftName(_ index: Int) -> String {
-        let names = store.names.components(separatedBy: .newlines)
+        let names = ToolkitTextInput.lines(store.names)
         if names.indices.contains(index),!names[index].trimmingCharacters(in: .whitespaces).isEmpty { return names[index] }
         return String(format: "标本 %02d",index+1)
     }
@@ -212,10 +212,14 @@ struct PhotoWorkflowView: View {
             }
             Divider()
             inspectorSection("名称清单",icon: "text.alignleft") {
-                TextEditor(text: $store.names).font(.body).scrollContentBackground(.hidden)
+                TextEditor(text: $store.names.replacingTabs).font(.body).scrollContentBackground(.hidden)
                     .padding(8).frame(height: 112)
                     .background(Color(nsColor: .textBackgroundColor),in: RoundedRectangle(cornerRadius: 8))
                     .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary) }
+                if !store.names.isEmpty, let draft = store.draft,
+                   case .failure(let error) = Result(catching: { try draft.specimenNames(store.names) }) {
+                    Text(error.localizedDescription).font(.caption).foregroundStyle(.red)
+                }
                 Text(store.inputMode == .psd ? "已从 PSD 文件名填入；改名仅影响导出名称，不改原 PSD 文件名。" : "每只一行，与左侧顺序对应；排除整组时保留原行。").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
@@ -606,7 +610,11 @@ struct PhotoWorkflowView: View {
             Text("预览底色").font(.caption).foregroundStyle(.secondary)
             Picker("预览底色",selection: $store.previewBackground) { ForEach(["白","黑","棋盘","天蓝"],id: \.self) { Text($0) } }.labelsHidden().pickerStyle(.segmented)
             Toggle("显示安全框",isOn: $store.showSafeFrame)
-            HStack { Text("安全边距 px"); TextField("256",value: Binding(get: { store.currentLayout.safeMargin },set: { value in var l = store.currentLayout; l.safeMargin = min(512,max(0,value)); store.editLayout(l) }),format: .number).frame(width: 70) }
+            WorkflowSafeMarginField(value: store.currentLayout.safeMargin) { value in
+                var layout = store.currentLayout
+                layout.safeMargin = value
+                store.editLayout(layout)
+            }.id(store.currentTask?.id)
             Slider(value: Binding(get: { Double(store.currentLayout.safeMargin) },set: { value in var l = store.currentLayout; l.safeMargin = Int(value.rounded()); store.editLayout(l) }),in: 0...512)
             Button("恢复居中") { var l = store.currentLayout; l.center = CGPoint(x: 2048,y: 2048); store.editLayout(l) }
             Text("拖动预览移动主体。预览底色仅用于看图，输出保留透明。").font(.caption).foregroundStyle(.secondary)
@@ -724,5 +732,36 @@ struct WorkflowFileThumbnail: View {
             // URL 改变会取消旧视图任务，忽略仍在后台解码的旧图返回值。
             guard !Task.isCancelled else { return }; image = decoded
         }
+    }
+}
+
+// MARK: - 导出安全边距输入
+private struct WorkflowSafeMarginField: View {
+    let value: Int
+    let update: (Int) -> Void
+    @State private var invalidText: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("安全边距 px")
+                TextField("256", text: Binding(
+                    get: { invalidText ?? String(value) },
+                    set: { text in
+                        if let margin = ToolkitTextInput.integer(text, in: 0...512) {
+                            invalidText = nil
+                            update(margin)
+                        } else {
+                            invalidText = text
+                        }
+                    }
+                ).replacingTabs).frame(width: 70)
+            }
+            if let invalidText, !invalidText.isEmpty {
+                Text(ToolkitTextInput.singleLineError(invalidText) ?? "安全边距请输入 0 到 512 的整数。")
+                    .font(.caption).foregroundStyle(.red)
+            }
+        }
+        .onChange(of: value) { invalidText = nil }
     }
 }

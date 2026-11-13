@@ -3,11 +3,20 @@
 import Foundation
 
 // MARK: - 事件与状态错误
-nonisolated enum WorkflowStateError: Error, Equatable {
+nonisolated enum WorkflowStateError: LocalizedError, Equatable {
     case staleVersion
     case unknownTask
     case invalidTransition
     case invalidManifest(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .staleVersion: "批次状态已更新，请重试当前操作。"
+        case .unknownTask: "找不到对应的批次或标本。"
+        case .invalidTransition: "当前批次状态无法执行此操作。"
+        case .invalidManifest(let reason): reason
+        }
+    }
 }
 
 nonisolated enum WorkflowPresetScope: Equatable, Sendable {

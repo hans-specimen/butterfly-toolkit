@@ -202,7 +202,10 @@ struct AICurationSheet: View {
         VStack(alignment: .leading, spacing: 18) {
             Text("标本组与用途").font(.title2).fontWeight(.semibold)
             Text(sample.name).foregroundStyle(.secondary)
-            TextField("标本编号（同只标本使用同一编号）", text: $group)
+            TextField("标本编号（同只标本使用同一编号）", text: $group.replacingTabs)
+            if let message = ToolkitTextInput.singleLineError(group) {
+                Text(message).font(.caption).foregroundStyle(.red)
+            }
             Toggle("我已确认：此编号涵盖同一只标本的正反面与所有裁切", isOn: $confirmed)
             Picker("整组用途", selection: $use) { ForEach(AISampleUse.allCases) { Text($0.rawValue).tag($0) } }
             Text("这只保存分组信息，不启动训练。对齐异常的图片即使属于训练组，也无法选入训练任务。")
@@ -210,7 +213,7 @@ struct AICurationSheet: View {
             // 保存操作交由工作区按标本组更新用途，同时清理不再合格的训练选择。
             HStack { Button("取消", role: .cancel) { dismiss() }; Spacer(); Button("保存") {
                 store.updateCuration(sample: sample, group: group, confirmed: confirmed, use: use); dismiss()
-            }.buttonStyle(.borderedProminent).disabled(group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !confirmed) }
+            }.buttonStyle(.borderedProminent).disabled(group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !confirmed || ToolkitTextInput.singleLineError(group) != nil) }
         }.padding(26).frame(width: 500)
             .onAppear { let record = store.record(for: sample); group = record.specimenGroup; confirmed = record.groupConfirmed; use = store.curation.use(for: sample.id) }
     }
@@ -234,7 +237,10 @@ struct AIImportSheet: View {
             HStack { Button("选择原图 PNG…") { original = choosePNG("选择原图 PNG") }; Text(original?.lastPathComponent ?? "未选择").lineLimit(1) }
             HStack { Button("选择人工答案 PNG…") { reference = choosePNG("选择带透明度的人工答案 PNG") }; Text(reference?.lastPathComponent ?? "未选择").lineLimit(1) }
             Picker("答案来源", selection: $kind) { Text("人工精扣").tag("人工精扣"); Text("AI 结果经人工修正").tag("AI 结果经人工修正") }
-            TextField("标本组编号（同只标本使用同一编号）", text: $group)
+            TextField("标本组编号（同只标本使用同一编号）", text: $group.replacingTabs)
+            if let message = ToolkitTextInput.singleLineError(group) {
+                Text(message).font(.caption).foregroundStyle(.red)
+            }
             Toggle("我已逐像素检查对齐，并确认人工答案可作为标准答案", isOn: $confirmed)
             Text("未确认时可以导入供检查，但不能选入训练。AI 原始结果不能直接作为标准答案。")
                 .font(.caption).foregroundStyle(.secondary)
@@ -247,7 +253,7 @@ struct AIImportSheet: View {
                     guard let original, let reference else { return }
                     // 仅成功导入后关闭弹窗；失败时保留选择，便于查看错误并重试。
                     Task { if await store.importPair(original: original, reference: reference, group: group, kind: kind, confirmed: confirmed) { dismiss() } }
-                }.buttonStyle(.borderedProminent).disabled(original == nil || reference == nil || store.busy || (confirmed && group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                }.buttonStyle(.borderedProminent).disabled(original == nil || reference == nil || store.busy || ToolkitTextInput.singleLineError(group) != nil || (confirmed && group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }.padding(26).frame(width: 560)
     }

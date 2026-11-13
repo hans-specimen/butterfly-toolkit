@@ -487,12 +487,13 @@ struct RenameView: View {
     /// 起始编号 10001，共 6 张图片，
     /// 最后编号为 10006。
     private var calculatedLastNumber: String {
-        guard let number = Int(startNumber),
+        guard let number = ToolkitTextInput.integer(startNumber, in: 1...Int.max),
               !renamePlan.isEmpty else {
             return "—"
         }
 
-        return "\(number + max(0, numberedItemCount - 1))"
+        let (lastNumber, overflow) = number.addingReportingOverflow(max(0, numberedItemCount - 1))
+        return overflow ? "—" : String(lastNumber)
     }
 
 
@@ -510,7 +511,7 @@ struct RenameView: View {
                         renameMode == .singleSided
                         ? "可留空，例如 NY"
                         : "例如 NY",
-                        text: $prefix
+                        text: $prefix.replacingTabs
                     )
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 155)
@@ -521,7 +522,7 @@ struct RenameView: View {
 
                     TextField(
                         "例如 10061",
-                        text: $startNumber
+                        text: $startNumber.replacingTabs
                     )
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 150)
@@ -838,9 +839,14 @@ struct RenameView: View {
     /// 3. 读取保存的编号；
     /// 4. 刷新预览。
     private func handlePrefixChanged(_ newValue: String) {
-        let cleaned = newValue
+        let cleaned = ToolkitTextInput.replacingTabs(newValue)
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .uppercased()
+
+        if ToolkitTextInput.singleLineError(newValue, filename: true) != nil {
+            refreshRenamePlan()
+            return
+        }
 
         // 如果清理后的内容和原内容不同，
         // 重新赋值后先结束本次处理。
@@ -923,6 +929,17 @@ struct RenameView: View {
     /// 根据当前设置生成完整的重命名预览。
     private func refreshRenamePlan() {
 
+        if let message = ToolkitTextInput.singleLineError(prefix, filename: true) {
+            renamePlan = []
+            statusMessage = "前缀：\(message)"
+            return
+        }
+        if let message = ToolkitTextInput.singleLineError(startNumber) {
+            renamePlan = []
+            statusMessage = "起始编号：\(message)"
+            return
+        }
+
         // 必须先选择文件夹。
         guard let folderURL else {
             renamePlan = []
@@ -937,7 +954,7 @@ struct RenameView: View {
 
         // 起始编号必须能够转换成整数，
         // 并且必须大于 0。
-        guard let initialNumber = Int(startNumber),
+        guard let initialNumber = ToolkitTextInput.integer(startNumber, in: 1...Int.max),
               initialNumber > 0 else {
             renamePlan = []
             statusMessage = "请输入正确的起始编号"
@@ -970,6 +987,12 @@ struct RenameView: View {
         do {
             // 读取并排序文件夹中的所有支持图片。
             let files = try imageFiles(in: folderURL)
+            let count = renameMode == .doubleSided ? files.count / 2 + files.count % 2 : files.count
+            guard initialNumber <= Int.max - count else {
+                renamePlan = []
+                statusMessage = "起始编号过大，请缩小编号。"
+                return
+            }
 
             var items: [RenameItem] = []
 
@@ -1214,7 +1237,7 @@ struct RenameView: View {
             // 当前一共消耗了多少个编号。
             let usedNumberCount = numberedItemCount
 
-            let initialNumber = Int(startNumber) ?? 0
+            let initialNumber = ToolkitTextInput.integer(startNumber, in: 1...Int.max) ?? 0
 
             // 计算下一次应该使用的起始编号。
             let nextNumber =

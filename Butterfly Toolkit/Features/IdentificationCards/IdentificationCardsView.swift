@@ -1,4 +1,5 @@
 // 图鉴卡片界面：原生三栏组织标本、真实预览与逐只信息，人工构图交给 Photoshop。
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -6,8 +7,23 @@ struct IdentificationCardsView: View {
     @ObservedObject var store: IdentificationCardsStore
     @State private var confirmLayout = false
     @State private var confirmRemove = false
+    @State private var pendingRemoval: RemovalRequest?
+    @FocusState private var queueFocused: Bool
     @State private var confirmRegenerate = false
     @State private var showCollectionBatch = false
+
+    private struct RemovalRequest {
+        let ids: Set<UUID>
+        let clearingList: Bool
+
+        var title: String {
+            if clearingList { return "清空这批 \(ids.count) 张卡片？" }
+            return ids.count == 1 ? "移除这张卡片？" : "移除所选的 \(ids.count) 张卡片？"
+        }
+
+        var buttonTitle: String { clearingList ? "清空列表" : "移除卡片" }
+    }
+
     var body: some View {
         VStack(spacing:0) {
             header
@@ -46,8 +62,12 @@ struct IdentificationCardsView: View {
             Button("重新自动排版",role:.destructive) { store.refresh(layout:true) }
             Button("取消",role:.cancel) {}
         }
-        .confirmationDialog("移除这张卡片及其临时工作 PSD？输入图片与已导出 PNG 会保留。",isPresented:$confirmRemove,titleVisibility:.visible) {
-            Button("移除卡片",role:.destructive) { store.removeCurrent() }
+        .confirmationDialog(pendingRemoval?.title ?? "移除卡片？", isPresented: $confirmRemove,
+                            titleVisibility: .visible, presenting: pendingRemoval) { request in
+            Button(request.buttonTitle, role: .destructive) { store.removeCards(request.ids) }
+            Button("取消", role: .cancel) {}
+        } message: { _ in
+            Text("对应的临时工作 PSD 将被移除，输入图片和已导出的 PNG 会保留。")
         }
         .alert("已导出卡片需要重新生成",isPresented:$confirmRegenerate) {
             Button("重新生成") { store.refresh(layout:true) }
@@ -74,13 +94,37 @@ struct IdentificationCardsView: View {
         }.padding(.horizontal,24).padding(.vertical,18)
     }
     private var queue: some View {
-        VStack(alignment:.leading,spacing:0) {
-            HStack { Text("标本").font(.headline); Spacer(); Text("\(store.session.records.count)").foregroundStyle(.secondary) }.padding(16)
+        let selectedIDs = Set(store.selectedIDs)
+        let total = store.session.records.count
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("标本").font(.headline)
+                    Spacer()
+                    Text("已选 \(selectedIDs.count)/\(total)")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+                HStack {
+                    Button("全选") { store.selectAll() }
+                        .help("全选标本，列表内也可按 ⌘A")
+                        .disabled(store.locked || selectedIDs.count == total)
+                    Spacer()
+                    Button("清空列表…") {
+                        requestRemoval(store.session.records.map(\.id), clearingList: true)
+                    }
+                    .disabled(store.locked)
+                }.controlSize(.small)
+            }.padding(12)
             Divider()
             ScrollView {
                 LazyVStack(spacing:2) {
                     ForEach(store.session.records) { card in
-                        Button { store.select(card.id) } label: {
+                        let isSelected = selectedIDs.contains(card.id)
+                        let isCurrent = card.id == store.selectedID
+                        Button {
+                            store.select(card.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
+                            queueFocused = true
+                        } label: {
                             VStack(alignment:.leading,spacing:7) {
                                 HStack(spacing:6) {
                                     WorkflowFileThumbnail(url:card.input.front).frame(width:70,height:48)
@@ -95,11 +139,30 @@ struct IdentificationCardsView: View {
                                 if let missing = card.missingNames { Text(missing).font(.caption).foregroundStyle(.orange) }
                                 Text(status(card)).font(.caption).foregroundStyle(card.input.issue != nil || card.issue != nil ? .orange : .secondary).lineLimit(3)
                             }.frame(maxWidth:.infinity,alignment:.leading).padding(12)
-                                .background(card.id == store.selectedID ? Color.accentColor.opacity(0.14) : .clear)
+                                .background(isSelected ? Color.accentColor.opacity(isCurrent ? 0.23 : 0.13) : .clear)
+                                .overlay(alignment: .topTrailing) {
+                                    if isSelected {
+                                        Image(systemName: isCurrent ? "checkmark.circle.fill" : "checkmark.circle")
+                                            .font(.caption).foregroundStyle(Color.accentColor)
+                                            .padding(8).accessibilityHidden(true).allowsHitTesting(false)
+                                    }
+                                }
                                 .contentShape(Rectangle())
-                        }.buttonStyle(.plain).disabled(store.locked)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
+                        .accessibilityHint(isCurrent ? "当前显示预览和标本信息" : "")
+                        .disabled(store.locked)
                     }
                 }
+            }
+            .focusable()
+            .focused($queueFocused)
+            .onKeyPress("a", phases: .down) { press in
+                let modifiers = press.modifiers.intersection([.command, .shift, .option, .control])
+                guard modifiers == .command, !store.locked else { return .ignored }
+                store.selectAll()
+                return .handled
             }
         }
     }
@@ -149,8 +212,8 @@ struct IdentificationCardsView: View {
                 Text("工作 PSD 已清理。再次生成会保留文字并重新排版，无法恢复之前的人工细节。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            labeled("中文名") { TextField("中文名",text:field(\.chineseName)) }
-            labeled("拉丁名") { TextField("拉丁名",text:field(\.latinName)) }
+            editableField("中文名", placeholder: "中文名", text: field(\.chineseName))
+            editableField("拉丁名", placeholder: "拉丁名", text: field(\.latinName))
             Picker("性别",selection:Binding(get:{store.current?.fields.sex ?? .unknown},set:{ value in store.edit { $0.sex=value } })) {
                 ForEach(CardSex.allCases,id:\.self) { Text($0.title).tag($0) }
             }.pickerStyle(.segmented)
@@ -161,23 +224,24 @@ struct IdentificationCardsView: View {
                     .border(Color(nsColor:.separatorColor))
             }
             Button("整理粘贴内容",systemImage:"text.alignleft") { store.organizeCollection() }
-            labeled("采集点") { TextField("地点、地区",text:collectionField(\.locality)) }
+            editableField("采集点", placeholder: "地点、地区", text: collectionField(\.locality))
             HStack(alignment:.top) {
-                labeled("日期") { TextField("2026.4",text:collectionField(\.date)) }
-                labeled("国家") { TextField("国家",text:collectionField(\.country)) }
+                editableField("日期", placeholder: "2026.4", text: collectionField(\.date))
+                editableField("国家", placeholder: "国家", text: collectionField(\.country))
             }
             HStack(alignment:.top) {
-                labeled("海拔（米）") { TextField("1000m",text:collectionField(\.altitude)) }
-                labeled("翅展（mm）") {
-                    TextField("74", text: Binding(
-                        get: { store.current?.fields.collection.wingspan ?? "" },
-                        set: { value in store.edit { $0.collection.wingspan = value.isEmpty ? nil : value } }
-                    ))
-                }
+                editableField("海拔（米）", placeholder: "1000m", text: collectionField(\.altitude))
+                editableField("翅展（mm）", placeholder: "74", text: Binding(
+                    get: { store.current?.fields.collection.wingspan ?? "" },
+                    set: { value in store.edit { $0.collection.wingspan = value.isEmpty ? nil : value } }
+                ))
             }
             Button("更新采集文字") { store.composeCollection() }
             labeled("最终采集文字") {
-                TextField("留空则不显示",text:field(\.collectionText),axis:.vertical).lineLimit(2...5)
+                TextField("留空则不显示", text: field(\.collectionText).replacingTabs, axis: .vertical).lineLimit(2...5)
+                if let message = ToolkitTextInput.multilineError(store.current?.fields.collectionText ?? "") {
+                    Text(message).font(.caption).foregroundStyle(.red)
+                }
             }
             ForEach(store.current?.fields.collection.warnings ?? [],id:\.self) { Text($0).font(.caption).foregroundStyle(.orange) }
             Text("Image Hans Collection. 为模板固定署名。")
@@ -189,6 +253,15 @@ struct IdentificationCardsView: View {
     private func labeled<Content:View>(_ title:String,@ViewBuilder content:()->Content) -> some View {
         VStack(alignment:.leading,spacing:6) { Text(title).font(.caption).foregroundStyle(.secondary); content() }
     }
+    private func editableField(_ title: String, placeholder: String, text: Binding<String>) -> some View {
+        labeled(title) {
+            TextField(placeholder, text: text.replacingTabs)
+            if let message = ToolkitTextInput.singleLineError(text.wrappedValue) {
+                Text(message).font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
     private func field(_ key:WritableKeyPath<CardFields,String>) -> Binding<String> {
         Binding(get:{store.current?.fields[keyPath:key] ?? ""},set:{value in store.edit { $0[keyPath:key]=value }})
     }
@@ -206,29 +279,37 @@ struct IdentificationCardsView: View {
         }.frame(maxWidth:.infinity,maxHeight:.infinity)
     }
     private var footer: some View {
-        HStack(spacing:12) {
+        let selected = store.selectedCards
+        let exportable = selected.contains { store.canExport($0) }
+        return HStack(spacing:12) {
             if store.busy { ProgressView().controlSize(.small); Text(store.activity).font(.callout) }
             else {
                 VStack(alignment:.leading,spacing:4) {
                     Text("输出到").font(.caption).foregroundStyle(.secondary)
                     Text(store.session.outputDirectory.path).font(.caption).lineLimit(1).truncationMode(.middle).help(store.session.outputDirectory.path)
-                    if let card=store.current {
+                    if selected.count == 1, let card = selected.first {
                         Text(card.outputName).font(.caption).lineLimit(1).truncationMode(.middle).help(card.outputName).textSelection(.enabled)
                     }
                 }
                 Button("更改…") { chooseOutput() }.disabled(store.locked)
             }
             Spacer(minLength:8)
-            Button(role:.destructive) { confirmRemove=true } label: {
-                Text("移除这张卡片…")
-                    .foregroundStyle(store.locked || store.current == nil ? Color.secondary : .red)
+            Button(role: .destructive) { requestRemoval(selected.map(\.id)) } label: {
+                Text(selected.count == 1 ? "移除这张卡片…" : "移除所选…")
+                    .foregroundStyle(store.locked || selected.isEmpty ? Color.secondary : .red)
             }
-            .disabled(store.locked || store.current == nil)
-            Button("导出当前 PNG") { store.export(all:false) }
+            .disabled(store.locked || selected.isEmpty)
+            Button(selected.count == 1 ? "导出当前 PNG" : "导出所选 PNG") { store.export(all: false) }
                 .buttonStyle(.borderedProminent)
-                .disabled(store.locked || !(store.current.map { store.canExport($0) } ?? false))
+                .disabled(store.locked || !exportable)
         }.padding(.horizontal,24).padding(.vertical,14)
     }
+    private func requestRemoval(_ ids: [UUID], clearingList: Bool = false) {
+        guard !store.locked, !ids.isEmpty else { return }
+        pendingRemoval = RemovalRequest(ids: Set(ids), clearingList: clearingList)
+        confirmRemove = true
+    }
+
     private func chooseInputs() {
         let panel=NSOpenPanel(); panel.title="选择正反面 PNG 或文件夹"; panel.canChooseFiles=true; panel.canChooseDirectories=true; panel.allowsMultipleSelection=true; panel.allowedContentTypes=[.png]
         if panel.runModal() == .OK { store.importFiles(panel.urls) }

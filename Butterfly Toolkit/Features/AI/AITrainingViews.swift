@@ -81,7 +81,10 @@ struct AITrainingView: View {
                             Text("先准备少量已对齐的素材，后续验证模型能否学会细节，再扩大训练范围。")
                                 .foregroundStyle(.secondary)
                             Divider()
-                            HStack { Text("任务名称"); Spacer(); TextField("训练任务名称", text: $store.taskName).textFieldStyle(.roundedBorder).frame(maxWidth: 280) }
+                            HStack { Text("任务名称"); Spacer(); TextField("训练任务名称", text: $store.taskName.replacingTabs).textFieldStyle(.roundedBorder).frame(maxWidth: 280) }
+                            if let message = ToolkitTextInput.singleLineError(store.taskName) {
+                                Text(message).font(.caption).foregroundStyle(.red)
+                            }
                         }.padding(10)
                     }
                     VStack(alignment: .leading, spacing: 16) {

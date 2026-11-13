@@ -129,10 +129,11 @@ final class IdentificationCardStoreTests: XCTestCase {
 
     @MainActor func testExportPublishesCurrentPreviewWithoutPhotoshopAndSkipsEditedCard() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
         let workspace = CardWorkspace(root: root.appendingPathComponent("work"), template: root.appendingPathComponent("template.psd"))
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("template".utf8).write(to: workspace.template)
-        let files = try ["SC1_甲_Test one", "SC2_乙_Test two", "纱栎蛱蝶 Euphaedra sarita sarita"].flatMap { name in
+        let files = try ["SC1_甲_Test one", "SC2_乙_Test two", "SC3_丙_Test three", "纱栎蛱蝶 Euphaedra sarita sarita"].flatMap { name in
             try ["D", "V"].map { side in
                 let url = root.appendingPathComponent(name + "_" + side + ".png")
                 try Data("source".utf8).write(to: url)
@@ -148,21 +149,158 @@ final class IdentificationCardStoreTests: XCTestCase {
         try await settle(store)
         let first = try XCTUnwrap(store.session.records.first { $0.input.specimenNumber == "SC1" })
         let second = try XCTUnwrap(store.session.records.first { $0.input.specimenNumber == "SC2" })
+        let third = try XCTUnwrap(store.session.records.first { $0.input.specimenNumber == "SC3" })
         let cached = try Data(contentsOf: workspace.preview(first.id))
         store.select(second.id)
         store.edit { $0.collectionText = "新的采集信息" }
-        store.export(all:true)
+        store.select(first.id, modifiers: .command)
+        store.select(third.id, modifiers: .command)
+        store.export(all: false)
         try await settle(store)
         XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent(first.outputName)), cached)
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.appendingPathComponent(second.outputName).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent(third.outputName).path))
         let unnumbered = output.appendingPathComponent("纱栎蛱蝶指名亚种_Euphaedra sarita sarita.png")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: unnumbered.path))
+        XCTAssertEqual(store.error, "已跳过 1 张没有有效预览的卡片。")
+
+        store.export(all: true)
+        try await settle(store)
+        XCTAssertEqual(store.overwrite?.cardID, first.id)
+        store.answerOverwrite(false)
+        XCTAssertEqual(store.overwrite?.cardID, third.id)
+        store.answerOverwrite(false)
+        try await settle(store)
         XCTAssertTrue(FileManager.default.fileExists(atPath: unnumbered.path))
         let renders = await bridge.renderCount
         let closes = await bridge.closeCount
-        XCTAssertEqual(renders, 3)
+        XCTAssertEqual(renders, 4)
         XCTAssertEqual(closes, 0)
-        XCTAssertEqual(Set(store.session.records.filter(\.isExported).map(\.outputName)), Set([first.outputName, unnumbered.lastPathComponent]))
+        XCTAssertEqual(Set(store.session.records.filter(\.isExported).map(\.outputName)), Set([first.outputName, third.outputName, unnumbered.lastPathComponent]))
     }
+    @MainActor func testCardSelectionKeepsTheFirstSelectedCardAsCurrent() throws {
+        let workspace = CardWorkspace(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: workspace.root) }
+        let records = (1...5).flatMap { number in
+            CardInputParser.group([URL(fileURLWithPath: "/tmp/SC\(number)_蝶_Test_D.png")])
+        }.map { CardRecord(input: $0) }
+        let ids = records.map(\.id)
+        try workspace.save(CardSession(records: records))
+        let store = IdentificationCardsStore(workspace: workspace)
+
+        XCTAssertEqual(store.selectedIDs, [ids[0]])
+        store.select(ids[1], modifiers: .command)
+        store.select(ids[4], modifiers: .command)
+        XCTAssertEqual(store.selectedIDs, [ids[0], ids[1], ids[4]])
+        XCTAssertEqual(store.current?.id, ids[0])
+
+        store.select(ids[1])
+        store.select(ids[0], modifiers: .command)
+        XCTAssertEqual(store.current?.id, ids[1])
+        store.select(ids[3], modifiers: .shift)
+        XCTAssertEqual(Set(store.selectedIDs), Set(ids[1...3]))
+        XCTAssertEqual(store.current?.id, ids[1])
+        store.select(ids[0], modifiers: [.shift, .command])
+        XCTAssertEqual(Set(store.selectedIDs), Set(ids[0...3]))
+        XCTAssertEqual(store.current?.id, ids[1])
+
+        store.selectAll()
+        XCTAssertEqual(Set(store.selectedIDs), Set(ids))
+        XCTAssertEqual(store.current?.id, ids[1])
+        store.select(ids[1], modifiers: .command)
+        XCTAssertEqual(store.current?.id, ids[2])
+        store.edit { $0.collectionText = "仅编辑当前卡片" }
+        XCTAssertEqual(store.session.records[2].fields.collectionText, "仅编辑当前卡片")
+        XCTAssertTrue(store.session.records.enumerated().allSatisfy { $0.offset == 2 || $0.element.fields.collectionText.isEmpty })
+        store.select(ids[4])
+        store.select(ids[4], modifiers: .command)
+        XCTAssertTrue(store.selectedIDs.isEmpty)
+        XCTAssertNil(store.current)
+        store.selectAll()
+        XCTAssertEqual(store.current?.id, ids[0])
+    }
+
+    @MainActor func testRemoveSelectedThenClearListPreservesInputAndOutputFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = CardWorkspace(root: root.appendingPathComponent("work"))
+        let output = root.appendingPathComponent("output")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let files = try (1...3).map { number in
+            let url = root.appendingPathComponent("SC\(number)_蝶_Test_D.png")
+            try Data("source".utf8).write(to: url)
+            return url
+        }
+        var records = CardInputParser.group(files).map { CardRecord(input: $0) }
+        let exported = output.appendingPathComponent("exported.png")
+        try Data("finished PNG".utf8).write(to: exported)
+        records[2].exportedURL = exported
+        records[2].exportedRevision = records[2].revision
+        for card in records.prefix(2) {
+            try FileManager.default.createDirectory(at: workspace.directory(card.id), withIntermediateDirectories: true)
+            try Data("working".utf8).write(to: workspace.working(card.id))
+        }
+        try workspace.save(CardSession(records: records, outputDirectory: output))
+        let bridge = CardTestBridge()
+        let store = IdentificationCardsStore(workspace: workspace, bridge: bridge)
+
+        store.select(records[2].id, modifiers: .command)
+        store.removeCards(Set(store.selectedIDs))
+        try await settle(store)
+        XCTAssertEqual(store.session.records.map(\.id), [records[1].id])
+        XCTAssertEqual(store.current?.id, records[1].id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workspace.working(records[0].id).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.working(records[1].id).path))
+        let firstCloseCount = await bridge.closeCount
+        XCTAssertEqual(firstCloseCount, 1)
+
+        store.select(records[1].id, modifiers: .command)
+        store.removeCards(Set(store.session.records.map(\.id)))
+        try await settle(store)
+        XCTAssertTrue(try workspace.load().records.isEmpty)
+        XCTAssertEqual(try workspace.load().outputDirectory, output)
+        XCTAssertNil(store.current)
+        XCTAssertNil(store.selectedImage)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workspace.working(records[1].id).path))
+        XCTAssertEqual(try String(contentsOf: exported, encoding: .utf8), "finished PNG")
+        for url in files {
+            XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "source")
+        }
+    }
+
+    @MainActor func testBatchRemovalKeepsCardWhoseWorkingDocumentCouldNotClose() async throws {
+        let workspace = CardWorkspace(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: workspace.root) }
+        let records = (1...2).flatMap { number in
+            CardInputParser.group([URL(fileURLWithPath: "/tmp/SC\(number)_蝶_Test_D.png")])
+        }.map { CardRecord(input: $0) }
+        let blocked = records[0].id
+        try FileManager.default.createDirectory(at: workspace.directory(blocked), withIntermediateDirectories: true)
+        try Data("unsaved".utf8).write(to: workspace.working(blocked))
+        try workspace.save(CardSession(records: records))
+        let store = IdentificationCardsStore(workspace: workspace, bridge: CardTestBridge(refusedClose: blocked))
+        store.selectAll()
+        store.removeCards(Set(store.selectedIDs))
+        try await settle(store)
+        XCTAssertEqual(try workspace.load().records.map(\.id), [blocked])
+        XCTAssertEqual(store.selectedIDs, [blocked])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.working(blocked).path))
+        XCTAssertNotNil(store.error)
+    }
+
+    func testRemovalCleanupKeepsWorkingPSDChangedAfterClose() throws {
+        let workspace = CardWorkspace(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: workspace.root) }
+        let id = UUID()
+        try FileManager.default.createDirectory(at: workspace.directory(id), withIntermediateDirectories: true)
+        try Data("closed".utf8).write(to: workspace.working(id))
+        let expected = try AIFileValidation.hash(workspace.working(id).path)
+        try Data("new edit".utf8).write(to: workspace.working(id))
+        XCTAssertThrowsError(try workspace.cleanRemovedCard(id, expectedHash: expected))
+        XCTAssertThrowsError(try workspace.cleanRemovedCard(id, expectedHash: nil))
+        XCTAssertEqual(try String(contentsOf: workspace.working(id), encoding: .utf8), "new edit")
+    }
+
     @MainActor private func settle(_ store:IdentificationCardsStore) async throws {
         for _ in 0..<200 { if !store.busy { return }; try await Task.sleep(for:.milliseconds(20)) }
         XCTFail("状态操作超时")
@@ -205,6 +343,10 @@ final class IdentificationCardStoreTests: XCTestCase {
 private actor CardTestBridge: CardPhotoshopServing {
     private(set) var renderCount = 0
     private(set) var closeCount = 0
+    let refusedClose: UUID?
+
+    init(refusedClose: UUID? = nil) { self.refusedClose = refusedClose }
+
     func render(_ request:CardRenderRequest,owner:UUID) async throws -> CardRenderResult {
         renderCount += 1
         try FileManager.default.createDirectory(at:request.working.deletingLastPathComponent(),withIntermediateDirectories:true)
@@ -221,5 +363,8 @@ private actor CardTestBridge: CardPhotoshopServing {
     }
     func beginManual(_ url:URL,owner:UUID) async throws {}
     func finishManual(_ request:CardRenderRequest,owner:UUID) async throws -> CardRenderResult { try await render(request,owner:owner) }
-    func close(_ url:URL,owner:UUID,expectedHash:String?) async throws { closeCount += 1 }
+    func close(_ url:URL,owner:UUID,expectedHash:String?) async throws {
+        closeCount += 1
+        if owner == refusedClose { throw CardError.message("工作 PSD 尚未保存") }
+    }
 }

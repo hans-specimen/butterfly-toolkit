@@ -147,7 +147,11 @@ final class AIWorkspaceStore: ObservableObject {
     // MARK: - 分组记录与持久化
 
     func updateCuration(sample: AISample, group: String, confirmed: Bool, use: AISampleUse) {
-        let group = group.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let message = ToolkitTextInput.singleLineError(group) {
+            error = message
+            return
+        }
+        let group = ToolkitTextInput.replacingTabs(group).trimmingCharacters(in: .whitespacesAndNewlines)
         var record = record(for: sample)
         record.specimenGroup = group; record.groupConfirmed = confirmed && !group.isEmpty
         curation.samples[sample.id] = record
@@ -236,6 +240,11 @@ final class AIWorkspaceStore: ObservableObject {
 
     func importPair(original: URL, reference: URL, group: String, kind: String, confirmed: Bool) async -> Bool {
         guard !busy, catalog != nil else { return false }
+        if let message = ToolkitTextInput.singleLineError(group) {
+            error = message
+            return false
+        }
+        let group = ToolkitTextInput.replacingTabs(group).trimmingCharacters(in: .whitespacesAndNewlines)
         isLoading = true; defer { isLoading = false }
         let engine = engineURL
         do {
@@ -248,7 +257,7 @@ final class AIWorkspaceStore: ObservableObject {
             sample.alignment = confirmed ? "aligned" : "unverified"
             sample.alignmentNote = confirmed ? "用户已检查并确认原图与人工答案对齐" : "尺寸一致；内容对齐仍需人工确认，暂不可训练"
             curation.imported.append(sample)
-            curation.samples[sample.id] = AISampleCuration(specimenGroup: group.trimmingCharacters(in: .whitespacesAndNewlines), groupConfirmed: confirmed && !group.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, referenceKind: kind)
+            curation.samples[sample.id] = AISampleCuration(specimenGroup: group, groupConfirmed: confirmed && !group.isEmpty, referenceKind: kind)
             samples.append(sample); selectedID = sample.id; saveCuration()
             status = "已复制导入素材；源文件保持不变"
             return true

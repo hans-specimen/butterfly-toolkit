@@ -11,7 +11,8 @@ struct CardOverwriteRequest: Identifiable {
 
 @MainActor final class IdentificationCardsStore: ObservableObject {
     @Published private(set) var session = CardSession()
-    @Published var selectedID: UUID?
+    // 保留点选顺序。第一个选中的标本决定预览、表单和 Shift 连选起点。
+    @Published private(set) var selectedIDs: [UUID] = []
     @Published private(set) var busy = false
     @Published private(set) var activity = ""
     @Published var error: String?
@@ -23,11 +24,19 @@ struct CardOverwriteRequest: Identifiable {
     private var exportQueue: [UUID] = []
     private var skippedExports = 0
     private var recoveryFailed = false
+    var selectedID: UUID? { selectedIDs.first }
+    var selectedCards: [CardRecord] {
+        let ids = Set(selectedIDs)
+        return session.records.filter { ids.contains($0.id) }
+    }
     var current: CardRecord? { session.records.first { $0.id == selectedID } }
     var locked: Bool { busy || manualID != nil || overwrite != nil || recoveryFailed }
     init(workspace:CardWorkspace = .standard,bridge:any CardPhotoshopServing = CardPhotoshopBridge()) {
         self.workspace = workspace; self.bridge = bridge
-        do { session = try workspace.load(); selectedID = session.records.first?.id; loadImage() }
+        do {
+            session = try workspace.load()
+            reconcileSelection()
+        }
         catch { self.error = "无法恢复图鉴清单：\(error.localizedDescription)"; recoveryFailed = true }
     }
     // MARK: - 输入与表单
@@ -65,14 +74,44 @@ struct CardOverwriteRequest: Identifiable {
             }
             try self.workspace.save(updated)
             self.session = updated
-            if self.current == nil { self.selectedID = updated.records.first?.id }
-            self.loadImage()
+            self.reconcileSelection()
         }
     }
-    func select(_ id: UUID) {
-        guard !locked else { return }
-        selectedID = id; loadImage()
+    func select(_ id: UUID, modifiers: NSEvent.ModifierFlags = []) {
+        guard !locked, let target = index(id) else { return }
+        let extending = modifiers.contains(.command)
+        if modifiers.contains(.shift), let anchor = index(selectedID) {
+            let range = session.records[min(anchor, target)...max(anchor, target)].map(\.id)
+            let startingIDs = extending ? selectedIDs : Array(selectedIDs.prefix(1))
+            let existing = Set(startingIDs)
+            setSelection(startingIDs + range.filter { !existing.contains($0) })
+        } else if extending {
+            setSelection(selectedIDs.contains(id) ? selectedIDs.filter { $0 != id } : selectedIDs + [id])
+        } else {
+            setSelection([id])
+        }
     }
+
+    func selectAll() {
+        guard !locked else { return }
+        let existing = Set(selectedIDs)
+        setSelection(selectedIDs + session.records.map(\.id).filter { !existing.contains($0) })
+    }
+
+    private func setSelection(_ ids: [UUID]) {
+        guard ids != selectedIDs else { return }
+        let previous = selectedID
+        selectedIDs = ids
+        if previous != selectedID { loadImage() }
+    }
+
+    private func reconcileSelection() {
+        let available = Set(session.records.map(\.id))
+        let surviving = selectedIDs.filter { available.contains($0) }
+        selectedIDs = surviving.isEmpty ? Array(session.records.prefix(1).map(\.id)) : surviving
+        loadImage()
+    }
+
     func edit(_ update: (inout CardFields)->Void) {
         guard !locked, let index = index(selectedID) else { return }
         update(&session.records[index].fields); session.records[index].revision += 1
@@ -86,7 +125,17 @@ struct CardOverwriteRequest: Identifiable {
             edit { $0.collection = parsed; $0.collectionText = parsed.formatted }
         } catch { self.error = error.localizedDescription }
     }
-    func composeCollection() { edit { $0.collectionText = $0.collection.formatted } }
+    func composeCollection() {
+        guard let collection = current?.fields.collection else { return }
+        for (label, value) in [("采集点", collection.locality), ("国家", collection.country), ("日期", collection.date),
+                               ("海拔", collection.altitude), ("翅展", collection.wingspan ?? "")] {
+            if let message = ToolkitTextInput.singleLineError(value) {
+                error = "\(label)：\(message)"
+                return
+            }
+        }
+        edit { $0.collectionText = $0.collection.formatted }
+    }
 
     func applyCollectionBatch(_ rows: [CardCollectionInfo.Row], to reviewedIDs: [UUID]) throws {
         guard !locked, reviewedIDs == session.records.map(\.id) else {
@@ -114,14 +163,50 @@ struct CardOverwriteRequest: Identifiable {
         guard !locked else { return }; session.outputDirectory = url
         do { try persist() } catch { self.error = error.localizedDescription }
     }
-    func removeCurrent() {
-        guard !locked, let id = selectedID else { return }
+    func removeCards(_ ids: Set<UUID>) {
+        guard !locked else { return }
+        let candidates = session.records.filter { ids.contains($0.id) }
+        guard !candidates.isEmpty else { return }
         run("正在移除卡片…") {
-            try await self.bridge.close(self.workspace.working(id),owner:id)
-            // 用户明确移除才丢弃对应工作文档，不清理其他记录。
-            try self.workspace.cleanCompleted(id)
-            self.session.records.removeAll { $0.id == id }; self.selectedID = self.session.records.first?.id
-            try self.persist(); self.loadImage()
+            var removable: [(card: CardRecord, workingHash: String?)] = []
+            var failures: [String] = []
+            for card in candidates {
+                do {
+                    let working = try self.workspace.workingForRemoval(card.id)
+                    let workingHash: String?
+                    if FileManager.default.fileExists(atPath: working.path) {
+                        workingHash = try await Task.detached { try AIFileValidation.hash(working.path) }.value
+                        try await self.bridge.close(working, owner: card.id, expectedHash: workingHash)
+                    } else {
+                        workingHash = nil
+                    }
+                    removable.append((card, workingHash))
+                } catch {
+                    failures.append("\(card.title)：\(error.localizedDescription)")
+                }
+            }
+            if !removable.isEmpty {
+                let removedIDs = Set(removable.map { $0.card.id })
+                var updated = self.session
+                updated.records.removeAll { removedIDs.contains($0.id) }
+                // 先保存清单，保存失败时仍能恢复工作文件。
+                try self.workspace.save(updated)
+                self.session = updated
+                self.reconcileSelection()
+                let workspace = self.workspace
+                for (card, workingHash) in removable {
+                    do {
+                        try await Task.detached {
+                            try workspace.cleanRemovedCard(card.id, expectedHash: workingHash)
+                        }.value
+                    } catch {
+                        failures.append("\(card.title)：\(error.localizedDescription)\n\(workspace.working(card.id).path)")
+                    }
+                }
+            }
+            if !failures.isEmpty {
+                self.error = "部分卡片未能移除或清理。\n" + failures.joined(separator: "\n")
+            }
         }
     }
     // MARK: - 预览与人工编辑
@@ -218,6 +303,17 @@ struct CardOverwriteRequest: Identifiable {
     private func request(_ record: CardRecord,layout: Bool) throws -> CardRenderRequest {
         guard let front = record.input.front, let back = record.input.back else { throw CardError.message("请补齐正反面") }
         var fields = record.fields
+        fields.chineseName = ToolkitTextInput.replacingTabs(fields.chineseName)
+        fields.latinName = ToolkitTextInput.replacingTabs(fields.latinName)
+        fields.collectionText = ToolkitTextInput.replacingTabs(fields.collectionText)
+        for (label, name) in [("中文名", fields.chineseName), ("拉丁名", fields.latinName)] {
+            if let message = ToolkitTextInput.singleLineError(name) {
+                throw CardError.message("\(label)：\(message)")
+            }
+        }
+        if let message = ToolkitTextInput.multilineError(fields.collectionText) {
+            throw CardError.message("最终采集文字：\(message)")
+        }
         fields.chineseName = fields.formattedChineseName.trimmingCharacters(in: .whitespacesAndNewlines)
         fields.latinName = fields.latinName.trimmingCharacters(in: .whitespacesAndNewlines)
         return CardRenderRequest(working:workspace.working(record.id),template:workspace.template,front:front,back:back,fields:fields,roles:record.roles,layout:layout)
@@ -246,7 +342,7 @@ struct CardOverwriteRequest: Identifiable {
     // MARK: - 导出队列和逐项覆盖确认
     func export(all: Bool) {
         guard !locked else { return }
-        let candidates = all ? session.records : [current].compactMap { $0 }
+        let candidates = all ? session.records : selectedCards
         let ready = candidates.filter { canExport($0) }
         guard !ready.isEmpty else { error = "请先为要导出的卡片生成有效预览。"; return }
         skippedExports = candidates.count - ready.count

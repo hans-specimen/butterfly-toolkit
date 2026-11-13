@@ -71,9 +71,28 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         }
         return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
     }
+    func specimenNames(_ text: String) throws -> [String] {
+        var rows = try ToolkitTextInput.filenameRows(text)
+        // 从表格复制时末尾常带换行，保留中间空行以免标本错位。
+        while rows.count > groups.count, rows.last == "" {
+            rows.removeLast()
+        }
+        var seen: Set<String> = []
+        for (index, name) in rows.enumerated() {
+            let line = index + 1
+            guard !name.isEmpty else { throw WorkflowStateError.invalidManifest("第 \(line) 行名称为空，请填写对应标本名称。") }
+            guard seen.insert(name.lowercased()).inserted else {
+                throw WorkflowStateError.invalidManifest("第 \(line) 行名称重复「\(name)」。")
+            }
+        }
+        guard !groups.isEmpty, rows.count == groups.count else {
+            throw WorkflowStateError.invalidManifest("有 \(groups.count) 组标本、\(rows.count) 行名称，请为每组填写一行。")
+        }
+        return rows
+    }
+
     func freeze(names: String,output: URL,locations: WorkflowOutputLocations? = nil,geometryRequest: GeometryRequest = GeometryRequest()) throws -> WorkflowBatch {
-        let names = names.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
-        guard !groups.isEmpty,names.count == groups.count,names.allSatisfy({ !$0.isEmpty }),Set(names.map { $0.lowercased() }).count == names.count else { throw WorkflowBridgeError.invalidImage("名称必须每组一行，不能空白或重名") }
+        let names = try specimenNames(names)
         guard remainder.isEmpty || ignoreRemainder else { throw WorkflowBridgeError.invalidImage(inputMode == .psd ? "请补齐 D/V 配对或明确排除未配对 PSD" : "请明确排除剩余未分组照片") }
         guard groups.allSatisfy({ $0.files.count == inputMode.filesPerSide * 2 }) else { throw WorkflowBridgeError.invalidImage("分组与输入方式不符") }
         let activeURLs = groups.filter { !$0.excluded }.flatMap(\.files)
