@@ -144,42 +144,36 @@ struct IdentificationCardsView: View {
     // MARK: - 逐只信息
     private var inspector: some View {
         VStack(alignment:.leading,spacing:18) {
-            Text("卡片信息").font(.headline)
+            Text("标本信息").font(.headline)
             if let card=store.current,card.exportedURL != nil,card.roles == nil {
                 Text("工作 PSD 已清理。再次生成会保留文字并重新排版，无法恢复之前的人工细节。")
                     .font(.caption).foregroundStyle(.secondary)
-            }
-            if let card=store.current,let rasters=card.input.rasters {
-                ForEach(["D","V"],id:\.self) { face in
-                    let url=face == "D" ? card.input.front : card.input.back
-                    if let url,let raster=rasters[url.path] { Text("\(face) · \(raster.width) × \(raster.height) px").font(.caption).foregroundStyle(.secondary) }
-                }
             }
             labeled("中文名") { TextField("中文名",text:field(\.chineseName)) }
             labeled("拉丁名") { TextField("拉丁名",text:field(\.latinName)) }
             Picker("性别",selection:Binding(get:{store.current?.fields.sex ?? .unknown},set:{ value in store.edit { $0.sex=value } })) {
                 ForEach(CardSex.allCases,id:\.self) { Text($0.title).tag($0) }
-            }
+            }.pickerStyle(.segmented)
             Divider()
             Text("采集信息").font(.headline)
-            Text("每只单独填写，所有项目均可留空。")
-                .font(.caption).foregroundStyle(.secondary)
             labeled("粘贴表格") {
                 TextEditor(text:field(\.rawCollection)).font(.callout).frame(height:72)
                     .border(Color(nsColor:.separatorColor))
             }
             Button("整理粘贴内容",systemImage:"text.alignleft") { store.organizeCollection() }
             labeled("采集点") { TextField("地点、地区",text:collectionField(\.locality)) }
-            labeled("国家") { TextField("国家",text:collectionField(\.country)) }
+            HStack(alignment:.top) {
+                labeled("日期") { TextField("2026.4",text:collectionField(\.date)) }
+                labeled("国家") { TextField("国家",text:collectionField(\.country)) }
+            }
             HStack(alignment:.top) {
                 labeled("海拔（米）") { TextField("1000m",text:collectionField(\.altitude)) }
-                labeled("日期") { TextField("2026.4",text:collectionField(\.date)) }
-            }
-            labeled("翅展（mm）") {
-                TextField("74", text: Binding(
-                    get: { store.current?.fields.collection.wingspan ?? "" },
-                    set: { value in store.edit { $0.collection.wingspan = value.isEmpty ? nil : value } }
-                ))
+                labeled("翅展（mm）") {
+                    TextField("74", text: Binding(
+                        get: { store.current?.fields.collection.wingspan ?? "" },
+                        set: { value in store.edit { $0.collection.wingspan = value.isEmpty ? nil : value } }
+                    ))
+                }
             }
             Button("更新采集文字") { store.composeCollection() }
             labeled("最终采集文字") {
@@ -190,7 +184,6 @@ struct IdentificationCardsView: View {
                 .font(.caption).foregroundStyle(.secondary)
             Divider()
             Button("重新自动排版…") { confirmLayout=true }.disabled(store.current?.input.issue != nil)
-            Button("移除这张卡片…",role:.destructive) { confirmRemove=true }
         }.textFieldStyle(.roundedBorder).disabled(store.locked || store.current == nil)
     }
     private func labeled<Content:View>(_ title:String,@ViewBuilder content:()->Content) -> some View {
@@ -226,6 +219,11 @@ struct IdentificationCardsView: View {
                 Button("更改…") { chooseOutput() }.disabled(store.locked)
             }
             Spacer(minLength:8)
+            Button(role:.destructive) { confirmRemove=true } label: {
+                Text("移除这张卡片…")
+                    .foregroundStyle(store.locked || store.current == nil ? Color.secondary : .red)
+            }
+            .disabled(store.locked || store.current == nil)
             Button("导出当前 PNG") { store.export(all:false) }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.locked || !(store.current.map { store.canExport($0) } ?? false))
