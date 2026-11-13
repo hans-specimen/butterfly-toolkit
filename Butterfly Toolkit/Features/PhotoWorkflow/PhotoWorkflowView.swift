@@ -142,9 +142,9 @@ struct PhotoWorkflowView: View {
                                 SpecimenStatusBadge(title: group.excluded ? "已排除" : "等待处理", tone: .neutral)
                             }
                             Spacer(minLength: 0)
-                        }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
-                            .contentShape(Rectangle())
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
                             .opacity(group.excluded ? 0.5 : 1)
+                            .contentShape(.interaction, RoundedRectangle(cornerRadius: 9))
                     }.buttonStyle(.plain).accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
             }
@@ -501,10 +501,7 @@ struct PhotoWorkflowView: View {
                                 get: { isSelected },
                                 set: { store.setSpecimenSelected(specimen.id, selected: $0); queueFocused = true }
                             )).labelsHidden().toggleStyle(.checkbox).disabled(specimen.isExcluded)
-                            Button {
-                                store.selectSpecimen(specimen.id, modifiers: NSApp.currentEvent?.modifierFlags ?? [])
-                                queueFocused = true
-                            } label: {
+                            Button { selectQueueSpecimen(specimen.id) } label: {
                                 Text(specimen.baseName).font(.body.weight(.medium)).lineLimit(1)
                                     .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                             }.buttonStyle(.plain).accessibilityAddTraits(isSelected ? .isSelected : [])
@@ -516,17 +513,26 @@ struct PhotoWorkflowView: View {
                                         get: { store.selectedTaskIDs.contains(task.id) },
                                         set: { store.setFaceSelected(task.id, selected: $0); queueFocused = true }
                                     )).font(.caption).toggleStyle(.checkbox).disabled(specimen.isExcluded)
-                                    Button {
-                                        let modifiers = NSApp.currentEvent?.modifierFlags ?? []
-                                        store.selectSpecimen(specimen.id, modifiers: modifiers)
-                                        if modifiers.intersection([.command, .shift]).isEmpty { store.face = task.side }
-                                        queueFocused = true
-                                    } label: { sideStatus(task) }.buttonStyle(.plain)
+                                    Button { selectQueueSpecimen(specimen.id, side: task.side) } label: {
+                                        sideStatus(task).contentShape(Rectangle())
+                                    }.buttonStyle(.plain)
                                 }.frame(maxWidth: .infinity)
                             }
                         }
-                        if let reason = specimen.exclusionReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-                    }.padding(10).frame(maxWidth: .infinity,alignment: .leading)
+                        if let reason = specimen.exclusionReason {
+                            Text(reason).font(.caption).foregroundStyle(.secondary).allowsHitTesting(false)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        // 留白选择整张卡片，上层复选框和正反面按钮仍优先响应。
+                        Button { selectQueueSpecimen(specimen.id) } label: {
+                            Color.clear.contentShape(.interaction, RoundedRectangle(cornerRadius: 9))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHidden(true)
+                    }
                 }
             }
             .clipped()
@@ -534,6 +540,13 @@ struct PhotoWorkflowView: View {
             .onKeyPress("a", phases: .down) { selectAllShortcut($0, enabled: canSelect, action: store.selectAllVisibleSpecimens) }
             Text("可单独勾选正面或反面").font(.caption).foregroundStyle(.secondary).padding(18)
         }.background(panelBackground)
+    }
+
+    private func selectQueueSpecimen(_ id: UUID, side: WorkflowSide? = nil) {
+        let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+        store.selectSpecimen(id, modifiers: modifiers)
+        if let side, modifiers.intersection([.command, .shift]).isEmpty { store.face = side }
+        queueFocused = true
     }
 
     private func queueHeader(_ title: String, selected: Int, total: Int, allSelected: Bool, selectAll: @escaping () -> Void) -> some View {

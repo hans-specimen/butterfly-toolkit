@@ -143,7 +143,7 @@ struct IdentificationCardsView: View {
                                         .padding(8).accessibilityHidden(true).allowsHitTesting(false)
                                 }
                             }
-                            .contentShape(Rectangle())
+                            .contentShape(.interaction, RoundedRectangle(cornerRadius: 9))
                     }
                     .buttonStyle(.plain)
                     .accessibilityAddTraits(isSelected ? .isSelected : [])
