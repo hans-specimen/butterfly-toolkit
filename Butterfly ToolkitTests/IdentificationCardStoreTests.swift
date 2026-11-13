@@ -90,12 +90,49 @@ final class IdentificationCardStoreTests: XCTestCase {
         XCTAssertNil(store.manualID)
     }
 
+    @MainActor func testReimportRepairsLegacyPairAndKeepsSelectedEdits() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let files = ["D", "V"].map { root.appendingPathComponent("门亮闪蝶_\($0).png") }
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 16, pixelsHigh: 12,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+            bytesPerRow: 0, bitsPerPixel: 0))
+        for y in 0..<12 { for x in 0..<16 {
+            bitmap.setColor(NSColor(deviceRed: 1, green: 0.5, blue: 0, alpha: x < 8 ? 1 : 0), atX: x, y: y)
+        } }
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        for file in files { try png.write(to: file) }
+        var records = files.map { file in
+            CardRecord(input: CardInputGroup(id: file.lastPathComponent, chineseName: "无法识别文件名",
+                latinName: "", sex: .unknown, files: [file], issue: "需要 编号_中文名_拉丁名_D/V.png"))
+        }
+        records[1].fields.collectionText = "人工采集信息"
+        let workspace = CardWorkspace(root: root.appendingPathComponent("work"), template: files[0])
+        try workspace.save(CardSession(records: records))
+        let store = IdentificationCardsStore(workspace: workspace, bridge: CardTestBridge())
+        store.select(records[1].id)
+        store.importFiles(files)
+        try await settle(store)
+        XCTAssertEqual(store.session.records.count, 1)
+        XCTAssertEqual(store.current?.id, records[1].id)
+        XCTAssertEqual(store.current?.title, "门亮闪蝶")
+        XCTAssertEqual(store.current?.fields.collectionText, "人工采集信息")
+        XCTAssertEqual(store.current?.missingNames, "缺少拉丁名")
+        XCTAssertNil(store.current?.input.issue)
+        store.refresh(all: true)
+        try await settle(store)
+        XCTAssertTrue(try store.canExport(XCTUnwrap(store.current)))
+        store.edit { $0.latinName = "Morpho anaxibia" }
+        XCTAssertNil(store.current?.missingNames)
+    }
+
     @MainActor func testExportPublishesCurrentPreviewWithoutPhotoshopAndSkipsEditedCard() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let workspace = CardWorkspace(root: root.appendingPathComponent("work"), template: root.appendingPathComponent("template.psd"))
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("template".utf8).write(to: workspace.template)
-        let files = try ["SC1_甲_Test one", "SC2_乙_Test two"].flatMap { name in
+        let files = try ["SC1_甲_Test one", "SC2_乙_Test two", "纱栎蛱蝶 Euphaedra sarita sarita"].flatMap { name in
             try ["D", "V"].map { side in
                 let url = root.appendingPathComponent(name + "_" + side + ".png")
                 try Data("source".utf8).write(to: url)
@@ -109,20 +146,22 @@ final class IdentificationCardStoreTests: XCTestCase {
         let store = IdentificationCardsStore(workspace: workspace, bridge: bridge)
         store.refresh(all:true)
         try await settle(store)
-        let first = try XCTUnwrap(store.session.records.first)
+        let first = try XCTUnwrap(store.session.records.first { $0.input.specimenNumber == "SC1" })
+        let second = try XCTUnwrap(store.session.records.first { $0.input.specimenNumber == "SC2" })
         let cached = try Data(contentsOf: workspace.preview(first.id))
-        store.select(records[1].id)
+        store.select(second.id)
         store.edit { $0.collectionText = "新的采集信息" }
         store.export(all:true)
         try await settle(store)
         XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent(first.outputName)), cached)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: output.appendingPathComponent(records[1].outputName).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.appendingPathComponent(second.outputName).path))
+        let unnumbered = output.appendingPathComponent("纱栎蛱蝶指名亚种_Euphaedra sarita sarita.png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unnumbered.path))
         let renders = await bridge.renderCount
         let closes = await bridge.closeCount
-        XCTAssertEqual(renders, 2)
+        XCTAssertEqual(renders, 3)
         XCTAssertEqual(closes, 0)
-        XCTAssertTrue(store.session.records[0].isExported)
-        XCTAssertFalse(store.session.records[1].isExported)
+        XCTAssertEqual(Set(store.session.records.filter(\.isExported).map(\.outputName)), Set([first.outputName, unnumbered.lastPathComponent]))
     }
     @MainActor private func settle(_ store:IdentificationCardsStore) async throws {
         for _ in 0..<200 { if !store.busy { return }; try await Task.sleep(for:.milliseconds(20)) }

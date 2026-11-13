@@ -86,8 +86,13 @@ struct IdentificationCardsView: View {
                                     WorkflowFileThumbnail(url:card.input.front).frame(width:70,height:48)
                                     WorkflowFileThumbnail(url:card.input.back).frame(width:70,height:48)
                                 }.accessibilityLabel("正面与反面素材")
-                                Text(card.fields.chineseName).font(.body.weight(.medium)).lineLimit(2)
-                                Text(card.input.id).font(.caption).foregroundStyle(.secondary)
+                                Text(card.title).font(.body.weight(.medium)).lineLimit(2)
+                                if let number = card.input.specimenNumber {
+                                    Text(number).font(.caption).foregroundStyle(.secondary)
+                                } else if card.title != card.fields.latinName && !card.fields.latinName.isEmpty {
+                                    Text(card.fields.latinName).font(.caption).foregroundStyle(.secondary)
+                                }
+                                if let missing = card.missingNames { Text(missing).font(.caption).foregroundStyle(.orange) }
                                 Text(status(card)).font(.caption).foregroundStyle(card.input.issue != nil || card.issue != nil ? .orange : .secondary).lineLimit(3)
                             }.frame(maxWidth:.infinity,alignment:.leading).padding(12)
                                 .background(card.id == store.selectedID ? Color.accentColor.opacity(0.14) : .clear)

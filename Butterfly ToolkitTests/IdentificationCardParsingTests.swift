@@ -31,6 +31,67 @@ final class IdentificationCardParsingTests: XCTestCase {
         XCTAssertNotNil(CardInputParser.group([a,URL(fileURLWithPath: "/tmp/SC1_别名_Euphaedra test_V.png")])[0].issue)
         XCTAssertEqual(CardInputParser.group([a])[0].sex, .male)
     }
+
+    func testUnnumberedPairsKeepColourFormsAndSexesSeparate() throws {
+        let names = ["贝茨蛱蝶黄色 Batesia hypochlora", "贝茨蛱蝶绿色 Batesia hypochlora",
+                     "橙斑黑蛱蝶 Catonephele numilia", "橙斑黑蛱蝶雌 Catonephele numilia",
+                     "梦幻闪蝶M亚 Morpho deidamia mariae-F"]
+        let groups = CardInputParser.group(names.flatMap { name in
+            ["D", "v"].map { URL(fileURLWithPath: "/tmp/\(name)_\($0).png") }
+        })
+        XCTAssertEqual(groups.count, names.count)
+        XCTAssertTrue(groups.allSatisfy { $0.front != nil && $0.back != nil && $0.issue == nil })
+        let colour = try XCTUnwrap(groups.first { $0.chineseName == "贝茨蛱蝶黄色" })
+        XCTAssertEqual(colour.latinName, "Batesia hypochlora")
+        XCTAssertEqual(CardRecord(input: colour).outputName, "贝茨蛱蝶黄色_Batesia hypochlora.png")
+        XCTAssertEqual(groups.filter { $0.chineseName == "橙斑黑蛱蝶" }.map(\.sex).sorted(by: { $0.rawValue < $1.rawValue }), [.female, .male])
+        XCTAssertEqual(groups.first { $0.chineseName == "梦幻闪蝶M亚" }?.sex, .female)
+    }
+
+    func testMissingNamesDoNotBlockPairingOrLeaveEmptyExportComponents() throws {
+        let cases = [("门亮闪蝶", "门亮闪蝶", "", "门亮闪蝶.png"),
+                     ("Morpho anaxibia", "", "Morpho anaxibia", "Morpho anaxibia.png"),
+                     ("SC21", "", "", "SC21.png"),
+                     ("SC22*纱栎蛱蝶 Euphaedra sarita sarita", "纱栎蛱蝶", "Euphaedra sarita sarita", "SC22_纱栎蛱蝶指名亚种_Euphaedra sarita sarita.png")]
+        for (stem, chinese, latin, filename) in cases {
+            let groups = CardInputParser.group(["D", "V"].map { URL(fileURLWithPath: "/tmp/\(stem)_\($0).png") })
+            XCTAssertEqual(groups.count, 1, stem)
+            let group = try XCTUnwrap(groups.first)
+            XCTAssertNil(group.issue, stem)
+            XCTAssertEqual(group.chineseName, chinese)
+            XCTAssertEqual(group.latinName, latin)
+            XCTAssertEqual(CardRecord(input: group).outputName, filename)
+        }
+    }
+
+    func testNominateSubspeciesUsesChineseSuffixOnce() throws {
+        for chinese in ["纱栎蛱蝶", "纱栎蛱蝶 sarita 亚种", "纱栎蛱蝶指名亚种"] {
+            let name = "/tmp/SC8_\(chinese)_Euphaedra sarita sarita_"
+            let input = try XCTUnwrap(CardInputParser.group([URL(fileURLWithPath: name + "D.png"), URL(fileURLWithPath: name + "V.png")]).first)
+            XCTAssertEqual(CardRecord(input: input).fields.chineseName, "纱栎蛱蝶指名亚种")
+        }
+        let other = try XCTUnwrap(CardInputParser.group([URL(fileURLWithPath: "/tmp/SC9_栎蛱蝶 maria 亚种_Euphaedra sarita maria_D.png")]).first)
+        XCTAssertEqual(CardRecord(input: other).fields.chineseName, "栎蛱蝶 maria 亚种")
+    }
+
+    func testNumberedFacesCanSupplyMissingNamesAndUnnumberedFacesStayInTheirFolder() throws {
+        let numbered = CardInputParser.group([
+            URL(fileURLWithPath: "/tmp/a/SC3_门亮闪蝶D.png"),
+            URL(fileURLWithPath: "/tmp/b/SC3_Morpho anaxibia_V.png")
+        ])
+        XCTAssertEqual(numbered.count, 1)
+        let card = CardRecord(input: try XCTUnwrap(numbered.first))
+        XCTAssertNil(card.input.issue)
+        XCTAssertNil(card.missingNames)
+        XCTAssertEqual(card.outputName, "SC3_门亮闪蝶_Morpho anaxibia.png")
+
+        let unnumbered = CardInputParser.group([
+            URL(fileURLWithPath: "/tmp/a/门亮闪蝶_D.png"),
+            URL(fileURLWithPath: "/tmp/b/门亮闪蝶_V.png")
+        ])
+        XCTAssertEqual(unnumbered.count, 2)
+        XCTAssertTrue(unnumbered.allSatisfy { $0.issue != nil })
+    }
     func testCollectionExamplesAndEmptyColumns() throws {
         let first = try CardCollectionInfo.parse("| Ghana | Kwabena Sam Forest, Ashanti | 2025.4.28 |\n| ----- | ---- | ----- |")
         XCTAssertEqual(first.formatted, "Kwabena Sam Forest, Ashanti, Ghana, 2025.4.28")

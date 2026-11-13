@@ -34,17 +34,39 @@ struct CardOverwriteRequest: Identifiable {
     func importFiles(_ urls: [URL]) {
         guard !locked else { return }
         run("正在识别正反面…") {
-            let inputs = urls + self.session.records.flatMap { $0.input.files }
-            let all = try await Task.detached { try CardInputParser.scan(inputs) }.value
-            self.session.records = all.map { group in
-                if var old = self.session.records.first(where:{ $0.input.id == group.id }) {
-                    if old.input != group { old.input = group; old.revision += 1; old.issue = nil }
-                    return old
-                }
-                return CardRecord(input:group)
+            let previous = self.session.records
+            let byInputID = Dictionary(grouping: previous, by: \.input.id)
+            let legacyByFile = Dictionary(grouping: previous.filter(\.input.wasRejectedByLegacyParser)) {
+                $0.input.files.first?.standardizedFileURL.resolvingSymlinksInPath()
             }
-            if self.selectedID == nil { self.selectedID = self.session.records.first?.id }
-            try self.persist(); self.loadImage()
+            let inputs = urls + previous.flatMap { $0.input.files }
+            let all = try await Task.detached { try CardInputParser.scan(inputs) }.value
+            var updated = self.session
+            updated.records = try all.map { group in
+                let rejected = group.files.flatMap { legacyByFile[$0] ?? [] }
+                let edited = rejected.filter { $0.fields != CardRecord(input: $0.input).fields }
+                let existing = byInputID[group.id]?.first
+                let editedFields = edited.map(\.fields) + [existing?.fields].compactMap { $0 }
+                if !edited.isEmpty, let first = editedFields.first, editedFields.contains(where: { $0 != first }) {
+                    throw CardError.message("\(group.sourceName) 的旧记录有不同的人工填写内容，请先核对后再合并正反面。")
+                }
+                guard var old = existing ?? edited.first ?? rejected.first(where: { $0.id == self.selectedID }) ?? rejected.first else {
+                    return CardRecord(input: group)
+                }
+                guard old.input != group else { return old }
+                if old.fields.chineseName.isEmpty || old.input.wasRejectedByLegacyParser && old.fields.chineseName == old.input.chineseName {
+                    old.fields.chineseName = group.chineseName
+                }
+                if old.fields.latinName.isEmpty { old.fields.latinName = group.latinName }
+                if old.fields.sex == old.input.sex { old.fields.sex = group.sex }
+                old.fields.chineseName = old.fields.formattedChineseName
+                old.input = group; old.revision += 1; old.issue = nil
+                return old
+            }
+            try self.workspace.save(updated)
+            self.session = updated
+            if self.current == nil { self.selectedID = updated.records.first?.id }
+            self.loadImage()
         }
     }
     func select(_ id: UUID) {
@@ -105,6 +127,7 @@ struct CardOverwriteRequest: Identifiable {
     // MARK: - 预览与人工编辑
     func hasCurrentPreview(_ card: CardRecord) -> Bool {
         card.renderedRevision == card.revision && card.previewHash != nil
+            && card.fields.chineseName == card.fields.formattedChineseName
             && FileManager.default.fileExists(atPath: workspace.preview(card.id).path)
     }
 
@@ -120,13 +143,14 @@ struct CardOverwriteRequest: Identifiable {
             run("正在生成图鉴预览…") {
                 var failures: [String] = []
                 for (offset, card) in pending.enumerated() {
-                    self.activity = "正在预览 \(offset + 1)/\(pending.count) · \(card.input.id)"
+                    let name = card.input.specimenNumber ?? card.title
+                    self.activity = "正在预览 \(offset + 1)/\(pending.count) · \(name)"
                     do {
                         try await self.render(card.id)
                     } catch {
                         let reason = error.localizedDescription
                         if let i = self.index(card.id) { self.session.records[i].issue = reason }
-                        failures.append("\(card.input.id) \(reason)")
+                        failures.append("\(name) \(reason)")
                     }
                     if self.selectedID == card.id { self.loadImage() }
                 }
@@ -193,7 +217,10 @@ struct CardOverwriteRequest: Identifiable {
     }
     private func request(_ record: CardRecord,layout: Bool) throws -> CardRenderRequest {
         guard let front = record.input.front, let back = record.input.back else { throw CardError.message("请补齐正反面") }
-        return CardRenderRequest(working:workspace.working(record.id),template:workspace.template,front:front,back:back,fields:record.fields,roles:record.roles,layout:layout)
+        var fields = record.fields
+        fields.chineseName = fields.formattedChineseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        fields.latinName = fields.latinName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CardRenderRequest(working:workspace.working(record.id),template:workspace.template,front:front,back:back,fields:fields,roles:record.roles,layout:layout)
     }
     private func accept(_ result: CardRenderResult,id:UUID,revision:Int) throws {
         guard let i = index(id), session.records[i].revision == revision else { throw CardError.message("卡片已更新，旧预览未采用") }

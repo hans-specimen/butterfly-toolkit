@@ -34,7 +34,8 @@ struct CardCollectionBatchView: View {
 
             List(Array(cards.enumerated()), id: \.element.id) { index, card in
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("\(index + 1). \(card.input.id)  \(card.fields.chineseName)").fontWeight(.medium)
+                    let label = [card.input.specimenNumber, card.title].compactMap { $0 }.joined(separator: "  ")
+                    Text("\(index + 1). \(label)").fontWeight(.medium)
                     if matches {
                         let info = rows[index].info
                         Text(info.formatted.isEmpty ? "留空" : info.formatted).foregroundStyle(.secondary)

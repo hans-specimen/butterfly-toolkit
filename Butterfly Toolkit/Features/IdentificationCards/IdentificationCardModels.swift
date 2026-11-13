@@ -17,6 +17,11 @@ nonisolated struct CardInputGroup: Codable, Equatable, Identifiable, Sendable {
     var files: [URL]
     var issue: String?
     var rasters: [String:CardRasterInfo]?
+    // 旧清单只用 id 保存编号，缺少此字段时仍沿用原编号。
+    var hasNoSpecimenNumber: Bool?
+    var specimenNumber: String? { hasNoSpecimenNumber == true || wasRejectedByLegacyParser ? nil : id }
+    var sourceName: String { (front ?? back ?? files.first)?.deletingPathExtension().lastPathComponent ?? id }
+    var wasRejectedByLegacyParser: Bool { front == nil && back == nil && chineseName == "无法识别文件名" }
 }
 
 nonisolated struct CardFields: Codable, Equatable, Sendable {
@@ -26,6 +31,21 @@ nonisolated struct CardFields: Codable, Equatable, Sendable {
     var rawCollection = ""
     var collection = CardCollectionInfo()
     var collectionText = ""
+
+    var formattedChineseName: String {
+        let name = chineseName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let terms = latinName.split(whereSeparator: \.isWhitespace)
+        guard !name.isEmpty, !name.hasSuffix("指名亚种"), terms.count == 3,
+              terms[1].caseInsensitiveCompare(terms[2]) == .orderedSame else { return chineseName }
+        var base = name
+        if base.hasSuffix("亚种") {
+            base = String(base.dropLast(2)).trimmingCharacters(in: .whitespaces)
+            if base.lowercased().hasSuffix(terms[2].lowercased()) {
+                base = String(base.dropLast(terms[2].count)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return base + "指名亚种"
+    }
 }
 
 // MARK: - 工作记录
@@ -49,9 +69,20 @@ nonisolated struct CardRecord: Codable, Identifiable, Sendable {
     init(input: CardInputGroup) {
         self.input = input
         fields = CardFields(chineseName: input.chineseName, latinName: input.latinName, sex: input.sex)
+        fields.chineseName = fields.formattedChineseName
+    }
+    var title: String {
+        [fields.chineseName, fields.latinName].first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? input.sourceName
+    }
+    var missingNames: String? {
+        let missing = [(fields.chineseName, "中文名"), (fields.latinName, "拉丁名")].compactMap { value, label in
+            value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? label : nil
+        }
+        return missing.isEmpty ? nil : "缺少" + missing.joined(separator: "、")
     }
     var outputName: String {
-        [input.id, fields.chineseName, fields.latinName].map(Self.safeName).joined(separator: "_") + ".png"
+        let parts = [input.specimenNumber ?? "", fields.formattedChineseName, fields.latinName].map(Self.safeName).filter { !$0.isEmpty }
+        return (parts.isEmpty ? "图鉴卡片" : parts.joined(separator: "_")) + ".png"
     }
     private static func safeName(_ text: String) -> String {
         text.components(separatedBy: CharacterSet(charactersIn: "/:\\").union(.controlCharacters))
