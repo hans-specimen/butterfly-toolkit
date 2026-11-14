@@ -93,7 +93,7 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
         } else {
             var collection = row
             if row.count == 5 || (row.count == 4 && (normalizedWingspan(row[0]) != nil
-                || (row[0].isEmpty && (hasLeadingWingspan || isCanonicalDate(normalizedDate(row[3])))))) {
+                || (row[0].isEmpty && (hasLeadingWingspan || recognizedDate(row[3]) != nil)))) {
                 result.wingspan = collection.removeFirst()
             }
             result.country = collection[0]; result.locality = collection[1]
@@ -102,9 +102,12 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
             else if isAltitude(collection[3]) || collection[3].isEmpty { result.date = collection[2]; result.altitude = collection[3] }
             else { throw CardError.message("请核对日期、海拔及第一列翅展的格式。") }
         }
-        let normalized = normalizedDate(result.date)
-        if !result.date.isEmpty, !isCanonicalDate(normalized) { result.warnings.append("日期格式不确定，已保留原文，请核对") }
-        result.date = normalized; result.altitude = normalizedAltitude(result.altitude)
+        if let date = recognizedDate(result.date) {
+            result.date = date
+        } else if !result.date.isEmpty {
+            result.warnings.append("日期格式不确定，已保留原文，请核对")
+        }
+        result.altitude = normalizedAltitude(result.altitude)
         if let size = result.wingspan, !size.isEmpty {
             guard let value = normalizedWingspan(size) else {
                 throw CardError.message("翅展请填写毫米数值，例如 74 或 74 mm。")
@@ -131,25 +134,67 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
     }
     static func normalizedDate(_ value: String) -> String {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isCanonicalDate(text) { return text.split(separator: ".").map { String(Int($0)!) }.joined(separator: ".") }
-        let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
-        let parts = text.replacingOccurrences(of: ".", with: "").split(whereSeparator: { $0.isWhitespace })
-        if parts.count == 2, let month = months.firstIndex(of: String(parts[0].prefix(3)).lowercased()), let year = Int(parts[1]), (1000...9999).contains(year), parts[0].allSatisfy({ $0.isLetter }) {
-            let full = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
-            if [months[month], full[month], month == 8 ? "sept" : ""].contains(parts[0].lowercased()) { return "\(year).\(month + 1)" }
-        }
-        return text
+        return recognizedDate(text) ?? text
     }
-    private static func isCanonicalDate(_ text: String) -> Bool {
-        guard text.range(of: "^[0-9]{4}(?:\\.[0-9]{1,2}){0,2}$", options: .regularExpression) != nil else { return false }
-        let p = text.split(separator: ".").compactMap { Int($0) }
-        guard p[0] >= 1000 else { return false }
-        if p.count > 1, !(1...12).contains(p[1]) { return false }
-        if p.count == 3 {
-            var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-            guard let date = calendar.date(from: DateComponents(year: p[0], month: p[1], day: p[2])) else { return false }
-            return calendar.component(.day, from: date) == p[2] && calendar.component(.month, from: date) == p[1]
+
+    private static func recognizedDate(_ text: String) -> String? {
+        if let parts = dateParts(text) { return formatDate(parts) }
+
+        let endpoints = text.components(separatedBy: CharacterSet(charactersIn: "-–—"))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard endpoints.count == 2 else { return nil }
+
+        let explicitEnd = dateParts(endpoints[1])
+        let start = dateParts(endpoints[0]) ?? explicitEnd.flatMap { end in
+            englishMonth(endpoints[0]).map { [end[0], $0] }
         }
-        return true
+        guard let start,
+              let end = explicitEnd ?? abbreviatedEnd(endpoints[1], after: start),
+              start.count == end.count, !end.lexicographicallyPrecedes(start) else { return nil }
+
+        if start.count == 1 { return formatDate(start) + "-" + formatDate(end) }
+        // 末尾保留一个日期分量，即使两端完全相同。
+        let shared = zip(start.dropLast(), end.dropLast()).prefix(while: { $0.0 == $0.1 }).count
+        return formatDate(start) + " - " + formatDate(end.dropFirst(shared))
+    }
+
+    private static func abbreviatedEnd(_ text: String, after start: [Int]) -> [Int]? {
+        if start.count == 2, let month = englishMonth(text) { return [start[0], month] }
+
+        // 只继承右端明确省略的年、月，避免将不完整的年份误当作月份或日期。
+        guard text.range(of: #"^[0-9]{1,2}(?:\.[0-9]{1,2})?$"#, options: .regularExpression) != nil else { return nil }
+        let count = text.split(separator: ".").count
+        guard count < start.count else { return nil }
+        return dateParts(formatDate(start.prefix(start.count - count)) + "." + text)
+    }
+
+    private static func formatDate(_ parts: some Sequence<Int>) -> String {
+        parts.map { String($0) }.joined(separator: ".")
+    }
+
+    private static func dateParts(_ text: String) -> [Int]? {
+        let words = text.replacingOccurrences(of: ".", with: "").split(whereSeparator: { $0.isWhitespace })
+        if words.count == 2, let month = englishMonth(String(words[0])),
+           let year = Int(words[1]), (1000...9999).contains(year) { return [year, month] }
+
+        guard text.range(of: #"^[0-9]{4}(?:\.[0-9]{1,2}){0,2}$"#, options: .regularExpression) != nil else { return nil }
+        let parts = text.split(separator: ".").compactMap { Int($0) }
+        guard parts[0] >= 1000 else { return nil }
+        if parts.count > 1, !(1...12).contains(parts[1]) { return nil }
+        if parts.count == 3 {
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            guard let date = calendar.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])),
+                  calendar.component(.day, from: date) == parts[2],
+                  calendar.component(.month, from: date) == parts[1] else { return nil }
+        }
+        return parts
+    }
+
+    private static func englishMonth(_ text: String) -> Int? {
+        let name = text.replacingOccurrences(of: ".", with: "").lowercased()
+        let months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+        if name == "sept" { return 9 }
+        return months.firstIndex { name == $0 || name == String($0.prefix(3)) }.map { $0 + 1 }
     }
 }

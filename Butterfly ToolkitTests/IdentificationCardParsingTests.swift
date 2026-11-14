@@ -110,6 +110,36 @@ final class IdentificationCardParsingTests: XCTestCase {
         XCTAssertEqual(CardCollectionInfo.normalizedDate("2025.2.30"), "2025.2.30")
     }
 
+    func testCollectionBatchNormalizesDateRanges() throws {
+        let rows = try CardCollectionInfo.parseBatch("""
+        77\tCameroon\tObout, Centre Reg.\tMay. - Aug. 2026
+        83\tCameroon\tObout, Centre Reg.\t2024-2025
+        82\tCameroon\tObout, Centre Reg.\t2025.03.01 – 2025.04.15
+        60\tCameroon\tObout, Centre Reg.\t2025.3.1 - 2025.3.15
+        55\tCameroon\tObout, Centre Reg.\tDec. 2025 — February 2026
+        81\tCameroon\tObout, Centre Reg.\tMay 2026 - August
+        """)
+        let dates = ["2026.5 - 8", "2024-2025", "2025.3.1 - 4.15", "2025.3.1 - 15", "2025.12 - 2026.2", "2026.5 - 8"]
+        XCTAssertEqual(rows.map(\.info.date), dates)
+        for (row, date) in zip(rows, dates) {
+            XCTAssertTrue(row.info.warnings.isEmpty, row.source)
+            XCTAssertEqual(CardCollectionInfo.normalizedDate(date), date)
+        }
+        XCTAssertEqual(rows[0].info.formatted, "Obout, Centre Reg., Cameroon, 2026.5 - 8, 77 mm")
+
+        let blankWingspan = try CardCollectionInfo.parse("\tCameroon\tObout, Centre Reg.\t2025.3.1 - 4.15")
+        XCTAssertEqual(blankWingspan.formatted, "Obout, Centre Reg., Cameroon, 2025.3.1 - 4.15")
+    }
+
+    func testInvalidCollectionDateRangesPreserveOriginalTextAndWarnings() throws {
+        for date in ["2025.2.1 - 29", "Aug. - May 2026", "2025.12 - 2", "2025.3 - 2025.4.15", "2025-03"] {
+            let info = try CardCollectionInfo.parse("Cameroon\tObout, Centre Reg.\t\(date)")
+            XCTAssertEqual(info.date, date)
+            XCTAssertEqual(info.formatted, "Obout, Centre Reg., Cameroon, \(date)")
+            XCTAssertFalse(info.warnings.isEmpty, date)
+        }
+    }
+
     func testCollectionBatchKeepsDataAboveMarkdownSeparatorAndEmptyRows() throws {
         let rows = try CardCollectionInfo.parseBatch("""
         | Cameroon | Ebogo, Centre Reg. | 2026.2 |
