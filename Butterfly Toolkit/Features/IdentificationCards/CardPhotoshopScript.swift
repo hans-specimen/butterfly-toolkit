@@ -108,12 +108,27 @@ function cardRun(q) {
    }return false;
   }
   var images=[front,back];
+  var exceedsBottom=false;
   if(q.operation=='layout'){
-   function fit(layer,frame,factor){var b=bounds(layer),w=b[2]-b[0],h=b[3]-b[1];if(w<=0||h<=0)throw Error('PNG 没有可见主体');var scale=frame[2]*factor/w*100;layer.resize(scale,scale,AnchorPosition.MIDDLECENTER);b=bounds(layer);layer.translate(frame[0]+frame[2]/2-(b[0]+b[2])/2,frame[1]+frame[3]/2-(b[1]+b[3])/2);}
-   for(i=0;i<2;i++)fit(images[i],q.frames[i],1);
-   for(var n=0;n<180&&(collision(front)||collision(back));n++){for(i=0;i<2;i++)fit(images[i],q.frames[i],Math.pow(0.98,n+1));}
+   function fit(layer,frame,factor){
+    var b=bounds(layer),w=b[2]-b[0],h=b[3]-b[1];
+    if(w<=0||h<=0)throw Error('PNG 没有可见主体');
+    var scale=(q.matchHeight ? frame[3]/h : frame[2]/w)*factor*100;
+    if(scale!=100)layer.resize(scale,scale,AnchorPosition.MIDDLECENTER);
+    b=bounds(layer);
+    var dx=frame[0]+frame[2]/2-(b[0]+b[2])/2;
+    var dy=q.topAligned ? frame[1]-b[1] : frame[1]+frame[3]/2-(b[1]+b[3])/2;
+    layer.translate(dx,dy);
+   }
+   // 用变换后的实际边界复查底边，Photoshop 取整时仍受溢出上限约束。
+   for(var n=0;n<=180;n++){
+    var factor=Math.pow(0.98,n);
+    for(i=0;i<2;i++)fit(images[i],q.frames[i],factor);
+    exceedsBottom=bounds(front)[3]>q.bottomLimit||bounds(back)[3]>q.bottomLimit;
+    if(!exceedsBottom&&!collision(front)&&!collision(back))break;
+   }
   }
-  var collided=collision(front)||collision(back), f=bounds(front),v=bounds(back);
+  var collided=exceedsBottom||collision(front)||collision(back), f=bounds(front),v=bounds(back);
   if(f[2]<=f[0]||f[3]<=f[1]||v[2]<=v[0]||v[3]<=v[1])throw Error('PNG 没有可见主体');
   if(f[0]<0||f[1]<0||f[2]>4000||f[3]>2250||v[0]<0||v[1]<0||v[2]>4000||v[3]>2250)collided=true;
   doc.save();

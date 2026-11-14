@@ -151,11 +151,17 @@ nonisolated final class CardPhotoshopBridge: CardPhotoshopServing, @unchecked Se
         try checkpoint(metadata,pending:request.layout && !inspectOnly)
         if request.layout && !inspectOnly {
             guard metadata.frontSize.count == 2, metadata.backSize.count == 2 else { throw CardError.message("无法读取蝴蝶可见轮廓") }
-            let frames = CardLayout.frames(front:CGSize(width:metadata.frontSize[0],height:metadata.frontSize[1]),back:CGSize(width:metadata.backSize[0],height:metadata.backSize[1]))
+            guard let placement = CardLayout.placement(front: CGSize(width: metadata.frontSize[0], height: metadata.frontSize[1]),
+                                                       back: CGSize(width: metadata.backSize[0], height: metadata.backSize[1])) else {
+                throw CardError.message("无法读取蝴蝶可见轮廓")
+            }
             payload = document
             payload["operation"] = "layout"
             payload["roles"] = metadata.roles
-            payload["frames"] = frames.map { [$0.minX,$0.minY,$0.width,$0.height] }
+            payload["frames"] = placement.frames.map { [$0.minX, $0.minY, $0.width, $0.height] }
+            payload["matchHeight"] = placement.matchHeight
+            payload["topAligned"] = placement.topAligned
+            payload["bottomLimit"] = placement.bottomLimit
             metadata = try await invoke(payload)
             try checkpoint(metadata,pending:false)
         }
