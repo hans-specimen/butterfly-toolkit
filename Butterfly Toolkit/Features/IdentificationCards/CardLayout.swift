@@ -23,7 +23,8 @@ nonisolated enum CardLayout {
         let matchHeight = preferredWidth * tallerRatio > boxHeight
         let heightAtTallInset = (boxWidth - 2 * tallInset) * widerRatio
         let topAligned = matchHeight && heightAtTallInset > boxHeight
-        let width = min(preferredWidth, (boxHeight - 2 * inset) / tallerRatio)
+        let verticalInset = (boxHeight - preferredWidth * tallerRatio) / 2
+        let width = verticalInset > 250 ? boxWidth : min(preferredWidth, (boxHeight - 2 * inset) / tallerRatio)
         // 同高时以较宽的一面限制宽度，另一面可以有更多侧边留白。
         let height = topAligned ? min(heightAtTallInset, boxHeight + maxOverflow) : min(preferredWidth * widerRatio, boxHeight)
         let frames = sizes.enumerated().map { index, size in

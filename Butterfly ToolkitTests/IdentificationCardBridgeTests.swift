@@ -21,6 +21,20 @@ final class IdentificationCardBridgeTests: XCTestCase {
         XCTAssertEqual(tight[1].midY, 900, accuracy: 0.01)
     }
 
+    func testVeryWidePairUsesTheFullBoxWidthOnlyAbove250PixelsOfVerticalInset() throws {
+        let wide = CGSize(width: 1870, height: 1000)
+        let cases: [(height: CGFloat, expectedWidth: CGFloat)] = [(1099, 1920), (1100, 1870), (1101, 1870)]
+        for (height, expectedWidth) in cases {
+            let frames = try XCTUnwrap(CardLayout.placement(front: wide, back: CGSize(width: 1870, height: height))).frames
+            XCTAssertEqual(frames[0].width, expectedWidth, accuracy: 0.01)
+            XCTAssertEqual(frames[1].width, expectedWidth, accuracy: 0.01)
+            XCTAssertEqual(frames[0].minX, 1000 - expectedWidth / 2, accuracy: 0.01)
+            XCTAssertEqual(frames[1].maxX, 3000 + expectedWidth / 2, accuracy: 0.01)
+            XCTAssertEqual(frames[0].midY, 900, accuracy: 0.01)
+            XCTAssertEqual(frames[1].midY, 900, accuracy: 0.01)
+        }
+    }
+
     func testTallPairUsesTheLargestContainedHeightBeforeAllowingOverflow() throws {
         let pair = try XCTUnwrap(CardLayout.placement(front: CGSize(width: 1870, height: 1630), back: CGSize(width: 2000, height: 1730))).frames
         for frame in pair {
