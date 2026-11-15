@@ -58,15 +58,16 @@ import XCTest
             let maskCheck = try await PhotoshopExecutionCoordinator.shared.run(owner: task.id) {
                 try await PhotoshopWorkflowBridge.execute("""
                 (function(){var d=app.open(new File(\(path)));try{
-                    var a=d.layerSets.getByName('共同调整'),c=a.layers[0],o=a.layers[1],s=a.layers[2];
+                    var a=d.layerSets.getByName('共同调整'),c=a.layers[0],e=a.layers[1],u=a.layers[2],o=a.layers[3],s=a.layers[4];
                     function matches(layer,name,mask,color,visible){
                         if(!layer || layer.name!==name || layer.visible!==visible)return false;
                         var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);
                         var desc=executeActionGet(ref),key=charIDToTypeID('Clr ');
                         var userMask=stringIDToTypeID('hasUserMask');
-                        return (desc.hasKey(userMask) && desc.getBoolean(userMask))===mask && desc.getEnumerationValue(key)===charIDToTypeID(color);
+                        return (desc.hasKey(userMask) && desc.getBoolean(userMask))===mask && (!color || desc.getEnumerationValue(key)===charIDToTypeID(color));
                     }
-                    var editable=a.layers.length===3 && matches(c,'Keying_Level',true,'Rd  ',true)
+                    var editable=a.layers.length===5 && matches(c,'Keying_Level',true,'Rd  ',true)
+                        && matches(e,'edge',false,null,true) && matches(u,'outline',true,null,false)
                         && matches(o,'Keying_Origin',true,'Grn ',false) && matches(s,'Stack',false,'Bl  ',false);
                     var bg=d.layers[d.layers.length-1];
                     return String(editable && d.layers.length===3 && bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);

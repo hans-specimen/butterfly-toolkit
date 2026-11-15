@@ -72,9 +72,11 @@ final class WorkflowResidueLiveTests: XCTestCase {
             try await PhotoshopWorkflowBridge.execute("""
             (function(){var d=app.open(new File(\(docPath)));
             try {
-                var g=d.layerSets.getByName('共同调整'),level=g.layers[0],origin=g.layers[1],stack=g.layers[2];
+                var g=d.layerSets.getByName('共同调整'),level=g.layers[0],edge=g.layers[1],outline=g.layers[2],origin=g.layers[3],stack=g.layers[4];
                 function hasMask(layer){var ref=new ActionReference();ref.putIdentifier(charIDToTypeID('Lyr '),layer.id);var desc=executeActionGet(ref);return desc.hasKey(stringIDToTypeID('hasUserMask'))&&desc.getBoolean(stringIDToTypeID('hasUserMask'));}
-                return String(g.layers.length===3 && level.name==='Keying_Level' && level.visible && hasMask(level)
+                return String(g.layers.length===5 && level.name==='Keying_Level' && level.visible && hasMask(level)
+                    && edge.name==='edge' && edge.visible && !hasMask(edge)
+                    && outline.name==='outline' && !outline.visible && hasMask(outline)
                     && origin.name==='Keying_Origin' && !origin.visible && hasMask(origin)
                     && stack.name==='Stack' && !stack.visible && !hasMask(stack));
             }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());

@@ -127,11 +127,16 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
             XCTAssertEqual(after.originalVisible, before.originalVisible)
             XCTAssertTrue(after.backgroundLocked)
             XCTAssertTrue(after.backgroundVisible)
-            XCTAssertEqual(after.layers.map(\.id), before.layers.map(\.id))
-            XCTAssertEqual(after.layers.map(\.name), before.layers.map(\.name))
-            XCTAssertEqual(after.layers.map(\.visible), before.layers.map(\.visible))
-            XCTAssertEqual(after.layers.map(\.hasMask), before.layers.map(\.hasMask))
-            for (source, rotated) in zip(before.layers, after.layers) {
+            let fringeLayers = after.layers.filter { ["edge", "outline"].contains($0.name) }
+            XCTAssertEqual(Array(after.layers.suffix(5)).map(\.name), ["Keying_Level", "edge", "outline", "Keying_Origin", "Stack"])
+            XCTAssertEqual(fringeLayers.map(\.hasMask), [false, true])
+            XCTAssertEqual(fringeLayers.map(\.visible), [true, false])
+            let rotatedLayers = after.layers.filter { !["edge", "outline"].contains($0.name) }
+            XCTAssertEqual(rotatedLayers.map(\.id), before.layers.map(\.id))
+            XCTAssertEqual(rotatedLayers.map(\.name), before.layers.map(\.name))
+            XCTAssertEqual(rotatedLayers.map(\.visible), before.layers.map(\.visible))
+            XCTAssertEqual(rotatedLayers.map(\.hasMask), before.layers.map(\.hasMask))
+            for (source, rotated) in zip(before.layers, rotatedLayers) {
                 let expected = WorkflowPreviewCoordinates.rotate(source.center,
                     degrees: solution.angleDegrees, pivot: solution.rotationPivot)
                 XCTAssertEqual(rotated.center.x, expected.x - solution.sourceCropRect.minX, accuracy: 2, source.name)

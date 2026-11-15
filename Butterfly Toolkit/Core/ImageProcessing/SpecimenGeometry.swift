@@ -247,14 +247,17 @@ nonisolated struct PreparedMaskGeometry: Sendable {
         let factor = 1-2*request.targetMargin
         // 有效旋转源区域的边长不会超过原宽高之和；转为 Int 前限制不可实现的留白请求。
         let maximumSide = input.sourcePixelSize.width+input.sourcePixelSize.height+2
+        let adaptiveTarget: (width: Int,height: Int)?
         let low: Int,high: Int
         let size: (Int) -> (Int,Int)
         if let (uw,uh) = units {
+            adaptiveTarget = nil
             low = max((minW+uw-1)/uw,(minH+uh-1)/uh)
             high = max(low,Int(ceil(min(maximumSide/Double(min(uw,uh)),max(bounds.width/factor/Double(uw),bounds.height/factor/Double(uh)))-1e-8)))
             size = { ($0*uw,$0*uh) }
         } else {
             let targetW = max(minW,Int(ceil(min(maximumSide,bounds.width/factor)-1e-8))),targetH = max(minH,Int(ceil(min(maximumSide,bounds.height/factor)-1e-8)))
+            adaptiveTarget = (targetW,targetH)
             low = 0; high = max(targetW-minW,targetH-minH)
             size = { step in
                 guard high > 0 else { return (minW,minH) }
@@ -262,20 +265,53 @@ nonisolated struct PreparedMaskGeometry: Sendable {
                         minH+Int(ceil(Double(targetH-minH)*Double(step)/Double(high))))
             }
         }
+        func crop(width: Int,height: Int) throws -> CGRect? {
+            try background.findCrop(width: width,height: height,containing: bounds,center: center,angle: angle,pivot: pivot,allowRepositioning: request.centerOverride != nil)
+        }
         func crop(_ step: Int) throws -> CGRect? {
             let (w,h) = size(step)
-            return try background.findCrop(width: w,height: h,containing: bounds,center: center,angle: angle,pivot: pivot,allowRepositioning: request.centerOverride != nil)
+            return try crop(width: w,height: h)
+        }
+        func largestCrop(from initial: CGRect,low: Int,high: Int,candidate: (Int) throws -> CGRect?) rethrows -> CGRect {
+            var best = initial
+            var a = low,b = high
+            while a < b {
+                let mid = a+(b-a+1)/2
+                if let fitted = try candidate(mid) { a = mid; best = fitted } else { b = mid-1 }
+            }
+            return best
         }
         if let target = try crop(high) { return solution(crop: target,applicable: true,reason: review) }
-        guard var best = try crop(low) else {
+        guard let minimum = try crop(low) else {
             let failure = units == nil ? "构图需调整：完整主体范围没有不露空的裁切结果" : "比例无法容纳主体：所选比例没有完整且不露空的裁切结果"
             return solution(crop: input.cropViewport,applicable: false,reason: [review,failure].compactMap { $0 }.joined(separator: "；"))
         }
-        // 目标留白无法实现时，在可行最小框与目标框之间搜索更大的有效裁切。
-        var a = low,b = high
-        while a+1 < b {
-            let mid = (a+b)/2
-            if let candidate = try crop(mid) { a = mid; best = candidate } else { b = mid }
+        let best: CGRect
+        if let target = adaptiveTarget {
+            func growWidth(_ start: CGRect) throws -> CGRect {
+                try largestCrop(from: start,low: Int(start.width),high: target.width) {
+                    try crop(width: $0,height: Int(start.height))
+                }
+            }
+            func growHeight(_ start: CGRect) throws -> CGRect {
+                try largestCrop(from: start,low: Int(start.height),high: target.height) {
+                    try crop(width: Int(start.width),height: $0)
+                }
+            }
+            // 先保住能达到目标的方向，再尽量补足另一方向，避免旋转空角或透明像素形成的相互限制。
+            let wide = try crop(width: target.width,height: minH).map(growHeight)
+            let tall = try crop(width: minW,height: target.height).map(growWidth)
+            if let wide,let tall {
+                // 两个方向各自能达标但无法同时达标，选择另一方向留白更多的裁切。
+                best = wide.height/bounds.height >= tall.width/bounds.width ? wide : tall
+            } else if let singleTarget = wide ?? tall {
+                best = singleTarget
+            } else {
+                let balanced = try largestCrop(from: minimum,low: low,high: high-1,candidate: crop)
+                best = try growHeight(growWidth(balanced))
+            }
+        } else {
+            best = try largestCrop(from: minimum,low: low,high: high-1,candidate: crop)
         }
         return solution(crop: best,applicable: true,reason: [review,"留白不足：完整主体已保留，原图有效背景不足以达到目标留白"].compactMap { $0 }.joined(separator: "；"))
     }

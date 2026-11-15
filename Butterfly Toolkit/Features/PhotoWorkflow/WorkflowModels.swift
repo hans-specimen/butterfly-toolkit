@@ -74,7 +74,7 @@ nonisolated struct WorkflowPreset: Codable, Equatable, Sendable {
 }
 
 nonisolated struct WorkflowPresets: Codable, Equatable, Sendable {
-    var geometry = WorkflowPreset(fingerprint: "geometry-adaptive-margin-0.1-v1")
+    var geometry = WorkflowPreset(fingerprint: "geometry-adaptive-margin-0.1-v2")
     var png4k = WorkflowPreset(fingerprint: "square-4096-margin-256-v1")
     var hd = WorkflowPreset(fingerprint: "jpeg-quality-0.82-v1")
 }

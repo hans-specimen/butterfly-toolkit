@@ -1110,14 +1110,18 @@ extension PhotoshopWorkflowBridge {
         if(count===0) return null;
         var background=doc.layers.length===3 ? doc.layers[2] : null;
         var validRoot=doc.layers.length===2 || (background && background.name==='BG' && wfIsPreviewBackground(background));
-        if(count!==2 || !original || !adjust || !validRoot || adjust.layers.length!==3 ||
+        if(count!==2 || !original || !adjust || !validRoot ||
+           (adjust.layers.length!==3 && adjust.layers.length!==5) ||
            adjust.opacity!==100 || wfHasMask(adjust,true)) throw new Error('WORKFLOW_STRUCTURE');
-        var cutout=adjust.layers[0],origin=adjust.layers[1],base=adjust.layers[2];
+        var layers=adjust.layers, cutout=layers[0],origin=layers[layers.length-2],base=layers[layers.length-1];
+        var outline=layers.length===5 ? layers[2] : null;
+        if(outline && (!wfRoleLayer(layers[1],'edge') || wfHasMask(layers[1],true) ||
+           !wfRoleLayer(outline,'outline') || !wfHasMask(outline))) throw new Error('WORKFLOW_STRUCTURE');
         if(!wfRoleLayer(base,'Stack') || !wfRoleLayer(origin,'Keying_Origin') || !wfRoleLayer(cutout,'Keying_Level') ||
            wfHasMask(base,true) || !wfHasMask(origin) || !wfHasMask(cutout)) throw new Error('WORKFLOW_STRUCTURE');
         var b=wfBounds(base),c=wfBounds(cutout),o=wfBounds(origin);
         for(var k=0;k<4;k++) if(Math.abs(b[k]-c[k])>0.1 || Math.abs(b[k]-o[k])>0.1) throw new Error('WORKFLOW_STRUCTURE');
-        return {original:original,adjust:adjust,base:base,cutout:cutout,ids:{originalStackGroup:String(original.id),adjustmentGroup:String(adjust.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id),mask:String(cutout.id)+':userMask'}};
+        return {original:original,adjust:adjust,base:base,cutout:cutout,origin:origin,outline:outline,ids:{originalStackGroup:String(original.id),adjustmentGroup:String(adjust.id),baseLayer:String(base.id),cutoutLayer:String(cutout.id),mask:String(cutout.id)+':userMask'}};
     }
     function wfFinalRoles(doc) {
         var group=null,count=0;
@@ -1189,6 +1193,55 @@ extension PhotoshopWorkflowBridge {
         app.activeDocument.activeLayer=layer;var d=new ActionDescriptor(),to=new ActionReference(),from=new ActionReference();
         to.putProperty(charIDToTypeID('Chnl'),charIDToTypeID('fsel'));d.putReference(charIDToTypeID('null'),to);
         from.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));d.putReference(charIDToTypeID('T   '),from);executeAction(charIDToTypeID('setd'),d,DialogModes.NO);
+    }
+    function wfMakeSelectionMask() {
+        var id=charIDToTypeID,make=new ActionDescriptor(),ref=new ActionReference();
+        make.putClass(id('Nw  '),id('Chnl'));
+        ref.putEnumerated(id('Chnl'),id('Chnl'),id('Msk '));make.putReference(id('At  '),ref);
+        make.putEnumerated(id('Usng'),id('UsrM'),id('RvlS'));executeAction(id('Mk  '),make,DialogModes.NO);
+    }
+    function wfApplyUserMask(doc,layer) {
+        doc.activeLayer=layer;
+        var id=charIDToTypeID,remove=new ActionDescriptor(),ref=new ActionReference();
+        ref.putEnumerated(id('Chnl'),id('Chnl'),id('Msk '));remove.putReference(id('null'),ref);
+        remove.putBoolean(id('Aply'),true);executeAction(id('Dlt '),remove,DialogModes.NO);
+    }
+    function wfPrepareFringeLayers(doc,roles) {
+        if(roles.outline)return;
+        wfMaskToSelection(roles.origin);
+        // 约为画布短边的 1%，并限制在 Photoshop 选区扩展支持的范围内。
+        var expand=Math.round(Math.min(doc.width.as('px'),doc.height.as('px'))*0.01);
+        doc.selection.expand(Math.max(1,Math.min(100,expand)));
+        var outline=roles.base.duplicate();outline.name='outline';
+        outline.move(roles.cutout,ElementPlacement.PLACEAFTER);doc.activeLayer=outline;
+        wfMakeSelectionMask();doc.selection.deselect();wfSelectRGB();outline.visible=false;
+
+        var preset=new File(Folder.userData.fsName+'/Adobe/'+app.path.name+'/Presets/Color Range/papilio.axt');
+        var edge=null;
+        if(preset.exists) {
+            var visibility=[];
+            function remember(parent) {
+                for(var i=0;i<parent.layers.length;i++)visibility.push({layer:parent.layers[i],visible:parent.layers[i].visible});
+            }
+            remember(doc);remember(roles.adjust);
+            try {
+                wfShowRole(doc,roles.adjust,outline);doc.activeLayer=outline;wfSelectRGB();
+                var s=stringIDToTypeID,range=new ActionDescriptor();range.putPath(s('using'),preset);
+                executeAction(s('colorRange'),range,DialogModes.NO);
+                var document=new ActionReference();document.putEnumerated(s('document'),s('ordinal'),s('targetEnum'));
+                if(executeActionGet(document).hasKey(s('selection'))) {
+                    // 先落实扩展轮廓，再落实色彩选区；透明区域与 Photoshop 的部分选中值均被保留。
+                    edge=outline.duplicate();
+                    wfApplyUserMask(doc,edge);wfMakeSelectionMask();doc.selection.deselect();wfApplyUserMask(doc,edge);
+                }
+            } finally {
+                doc.selection.deselect();
+                for(var i=0;i<visibility.length;i++)visibility[i].layer.visible=visibility[i].visible;
+            }
+        }
+        if(!edge)edge=roles.adjust.artLayers.add();
+        edge.name='edge';edge.move(roles.cutout,ElementPlacement.PLACEAFTER);edge.visible=true;
+        doc.activeLayer=roles.cutout;wfSelectRGB();
     }
     function wfHideAll(doc) {for(var i=0;i<doc.layers.length;i++)doc.layers[i].visible=false;}
     // 只在导出副本中隔离角色，避免原始蒙版和预览背景混入结果。
@@ -1307,10 +1360,7 @@ extension PhotoshopWorkflowBridge {
             app.activeDocument=doc;var base=doc.activeLayer;base.name='Stack';base.move(adjust,ElementPlacement.INSIDE);
             var origin=base.duplicate();origin.name='Keying_Origin';base.visible=false;origin.visible=true;doc.activeLayer=origin;
             \(selection)
-            var make=new ActionDescriptor(),ref=new ActionReference();make.putClass(charIDToTypeID('Nw  '),charIDToTypeID('Chnl'));
-            ref.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));make.putReference(charIDToTypeID('At  '),ref);
-            make.putEnumerated(charIDToTypeID('Usng'),charIDToTypeID('UsrM'),charIDToTypeID('RvlS'));executeAction(charIDToTypeID('Mk  '),make,DialogModes.NO);
-            doc.selection.deselect();if(typeof imported!=='undefined')imported.remove();wfSelectRGB();
+            wfMakeSelectionMask();doc.selection.deselect();if(typeof imported!=='undefined')imported.remove();wfSelectRGB();
             var cutout=origin.duplicate();cutout.name='Keying_Level';
             cutout.move(origin,ElementPlacement.PLACEBEFORE);
             if(\(alpha == nil ? "true" : "false"))wfApplyMaskLevels(cutout);
@@ -1408,6 +1458,7 @@ extension PhotoshopWorkflowBridge {
             r.putUnitDouble(charIDToTypeID('Btom'),charIDToTypeID('#Pxl'),\(rect.maxY));r.putUnitDouble(charIDToTypeID('Rght'),charIDToTypeID('#Pxl'),\(rect.maxX));
             d.putObject(charIDToTypeID('T   '),charIDToTypeID('Rctn'),r);d.putUnitDouble(charIDToTypeID('Angl'),charIDToTypeID('#Ang'),0);
             d.putBoolean(charIDToTypeID('Dlt '),false);executeAction(charIDToTypeID('Crop'),d,DialogModes.NO);
+            wfPrepareFringeLayers(doc,roles);
             wfSave(doc);return wfJSON(wfMetadata(doc));
         }finally{wfClose(o);}
         """

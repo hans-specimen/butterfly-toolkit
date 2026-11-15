@@ -86,6 +86,7 @@ final class WorkflowBridgeTests: XCTestCase {
             wfMetadata=function(doc){events.push('inspect:'+doc.fullName.fsName);return \(metadata);};
             wfRoles=function(doc){return {base:{},adjust:{rotate:function(){},translate:function(){}}};};
             wfBounds=function(){return [0,0,2,2];};
+            wfPrepareFringeLayers=function(){};
             wfSave=function(doc){events.push('save:'+doc.id);};
             """
             let result = context.evaluateScript(script.replacingOccurrences(of: "#target photoshop", with: "").replacingOccurrences(of: anchor, with: anchor + overrides))
@@ -108,6 +109,7 @@ final class WorkflowBridgeTests: XCTestCase {
         function fixture() {
             var group={id:1,name:'共同调整',typename:'LayerSet',visible:true,opacity:100,layers:[
                 layer(2,'手工精修结果',true,false),layer(3,'Keying_Level',true,true),
+                layer(8,'edge',false,true),layer(9,'outline',true,true),
                 layer(4,'Keying_Origin',true,true),layer(5,'Stack',false,false),layer(6,'底图',false,true)
             ]};
             var bg=layer(7,'BG',false,true);bg.kind=LayerKind.SOLIDFILL;
@@ -164,7 +166,7 @@ final class WorkflowBridgeTests: XCTestCase {
         XCTAssertEqual(stride(from: 0, to: mask.pixels.count, by: 4).map { mask.pixels[$0] },
                        stride(from: 3, to: cutout.pixels.count, by: 4).map { cutout.pixels[$0] })
         XCTAssertEqual(context.evaluateScript("source.layers[0].layers.map(function(layer){return layer.visible;});")?.toArray() as? [Bool],
-                       [false, true, true, false, true])
+                       [false, true, true, true, true, false, true])
         XCTAssertEqual(try AIFileValidation.hash(f.document.path), saved.contentVersion)
 
         context.evaluateScript("source.layers[0].layers[0].mask=false;source.layers[0].layers[0].name='Keying_Level copy';")
@@ -173,7 +175,7 @@ final class WorkflowBridgeTests: XCTestCase {
         context.evaluateScript("source.layers[0].layers[0].name='Keying_Level';source.layers[0].layers[1].kind='smart';")
         let duplicateName = try await bridge.captureFinalPSD(document: f.document,owner: f.owner)
         XCTAssertEqual(duplicateName.finalRoles?.cutoutLayer,"2")
-        context.evaluateScript("source=fixture();var origin=source.layers[0].layers.splice(2,1)[0];source.layers[0].layers.unshift(origin);")
+        context.evaluateScript("source=fixture();var origin=source.layers[0].layers.splice(4,1)[0];source.layers[0].layers.unshift(origin);")
         let reordered = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
         XCTAssertEqual(reordered.finalRoles?.cutoutLayer,"4")
         for edit in ["source.layers[0].layers[0].kind='solid'", "source.layers[0].layers[0].grouped=true"] {
@@ -186,16 +188,22 @@ final class WorkflowBridgeTests: XCTestCase {
             }
         }
         context.evaluateScript("source=fixture();")
-        context.evaluateScript("source.layers[0].layers.splice(3,1);")
+        context.evaluateScript("source.layers[0].layers.splice(5,1);")
         do {
             _ = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
             XCTFail("Legacy 底图 cannot substitute for Stack")
         } catch WorkflowBridgeError.photoshop(let error) {
             XCTAssertTrue(error.contains("Stack"), error)
         }
+        let automaticFixture = """
+        source.layers[0].layers=source.layers[0].layers.slice(1,6);
+        source.layers.splice(1,0,{id:10,name:'原始堆栈',typename:'LayerSet',layers:[]});
+        """
+        context.evaluateScript("source=fixture();\(automaticFixture)")
+        XCTAssertEqual(context.evaluateScript("wfRoles(source).ids.cutoutLayer")?.toString(), "3")
         for (edit,diagnostic) in [("source.layers[0].vectorMask=true","蒙版"),
                                   ("source.layers[0].opacity=50","不透明度"),
-                                  ("source.layers[0].layers[3].vectorMask=true","Stack")] {
+                                  ("source.layers[0].layers[5].vectorMask=true","Stack")] {
             context.evaluateScript("source=fixture();\(edit);")
             do {
                 _ = try await bridge.captureFinalPSD(document: f.document, owner: f.owner)
@@ -205,11 +213,7 @@ final class WorkflowBridgeTests: XCTestCase {
             }
 
             context.exception = nil
-            context.evaluateScript("""
-            source.layers[0].layers=source.layers[0].layers.slice(1,4);
-            source.layers.splice(1,0,{id:8,name:'原始堆栈',typename:'LayerSet',layers:[]});
-            wfRoles(source);
-            """)
+            context.evaluateScript(automaticFixture + "wfRoles(source);")
             XCTAssertTrue(context.exception?.toString()?.contains("WORKFLOW_STRUCTURE") == true,
                           "Automatic role read accepted \(edit)")
         }

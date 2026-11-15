@@ -65,7 +65,7 @@ Xcode 运行测试时用 `TEST_RUNNER_` 前缀传递变量，并用 `-only-testi
 | Photoshop 文档与首层输出 | `WORKFLOW_SESSION_SYNTHETIC=1` 启用 [WorkflowDocumentSessionLiveTests](<../Butterfly ToolkitTests/WorkflowDocumentSessionLiveTests.swift>)。素材由测试生成，检查合成、主体识别、矫正使用同一工作文档，验证保存凭据重用和文档释放。另验证改名且隐藏的精修首层实际像素，以及只读查询的路径、文档 ID、保存和关闭状态。首层用例发现已有打开文档时跳过；整个类运行前须确认 Photoshop 空闲。临时证据位置见 `SESSION_EVIDENCE`、`FIRST_LAYER_EVIDENCE` 输出。 |
 | 新照片逐面工作流 | `WORKFLOW_PS_BATCH/EVIDENCE`，可选 `WORKFLOW_PS_NAMES` 指定逗号分隔的标本编号前缀。[WorkflowPhotoshopMatteLiveTests](<../Butterfly ToolkitTests/WorkflowPhotoshopMatteLiveTests.swift>) 从指定清单复制原照到新目录，检查自动处理、图层、人工保存刷新与双输出。 |
 | 已有 PSD 原生处理 | `WORKFLOW_IMPORT_REAL_SOURCE/EVIDENCE`，选用合成 PSD 并在独立副本验证 PS 选择主体、角色提取与几何。`WORKFLOW_IMPORT_FLATTEN=1` 额外验证单层背景 PSD。 |
-| 人工定稿 | `WORKFLOW_FINAL_SOURCE/EVIDENCE` 需符合当前三层角色的 PSD，验证保存版本、人工编辑、角色隔离及双输出。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 用于从指定清单读取并分析蒙版。 |
+| 人工定稿 | `WORKFLOW_FINAL_SOURCE/EVIDENCE` 需含「共同调整」组、可导出的第一层、`Keying_Origin` 和 `Stack` 的 PSD，验证保存版本、人工编辑、角色隔离及双输出。`WORKFLOW_FINAL_GEOMETRY_BATCH/EVIDENCE` 用于从指定清单读取并分析蒙版。 |
 | 既有蒙版回放与分析 | `WORKFLOW_RESIDUE_BATCH/EVIDENCE` 回放已保存的蒙版，可用 `WORKFLOW_RESIDUE_NAME` 与 `WORKFLOW_RESIDUE_SIDE=D/V` 缩小范围。`TASK3_EVIDENCE_DIR` 依赖历史 `/tmp/butterfly-task2-real/` 夹具。 |
 | 独立 AI worker 协议 | `WORKFLOW_WORKER_REAL_INPUT/EVIDENCE/ENGINE`，使用已配置引擎验证真实推理。 |
 
