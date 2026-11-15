@@ -1115,8 +1115,14 @@ extension PhotoshopWorkflowBridge {
            adjust.opacity!==100 || wfHasMask(adjust,true)) throw new Error('WORKFLOW_STRUCTURE');
         var layers=adjust.layers, cutout=layers[0],origin=layers[layers.length-2],base=layers[layers.length-1];
         var outline=layers.length===5 ? layers[2] : null;
-        if(outline && (!wfRoleLayer(layers[1],'edge') || wfHasMask(layers[1],true) ||
-           !wfRoleLayer(outline,'outline') || !wfHasMask(outline))) throw new Error('WORKFLOW_STRUCTURE');
+        if(outline) {
+            var edge=layers[1];
+            if(!wfRoleLayer(edge,'edge') || !wfRoleLayer(outline,'outline')) throw new Error('WORKFLOW_STRUCTURE');
+            // 兼容 4.9.0 已保存的工作 PSD，读取时保留原有蒙版。
+            var legacy=!wfHasMask(edge,true) && wfHasMask(outline);
+            var current=wfHasMask(edge) && !wfHasMask(outline,true);
+            if(!legacy && !current) throw new Error('WORKFLOW_STRUCTURE');
+        }
         if(!wfRoleLayer(base,'Stack') || !wfRoleLayer(origin,'Keying_Origin') || !wfRoleLayer(cutout,'Keying_Level') ||
            wfHasMask(base,true) || !wfHasMask(origin) || !wfHasMask(cutout)) throw new Error('WORKFLOW_STRUCTURE');
         var b=wfBounds(base),c=wfBounds(cutout),o=wfBounds(origin);
@@ -1194,11 +1200,11 @@ extension PhotoshopWorkflowBridge {
         to.putProperty(charIDToTypeID('Chnl'),charIDToTypeID('fsel'));d.putReference(charIDToTypeID('null'),to);
         from.putEnumerated(charIDToTypeID('Chnl'),charIDToTypeID('Chnl'),charIDToTypeID('Msk '));d.putReference(charIDToTypeID('T   '),from);executeAction(charIDToTypeID('setd'),d,DialogModes.NO);
     }
-    function wfMakeSelectionMask() {
+    function wfMakeUserMask(mode) {
         var id=charIDToTypeID,make=new ActionDescriptor(),ref=new ActionReference();
         make.putClass(id('Nw  '),id('Chnl'));
         ref.putEnumerated(id('Chnl'),id('Chnl'),id('Msk '));make.putReference(id('At  '),ref);
-        make.putEnumerated(id('Usng'),id('UsrM'),id('RvlS'));executeAction(id('Mk  '),make,DialogModes.NO);
+        make.putEnumerated(id('Usng'),id('UsrM'),id(mode));executeAction(id('Mk  '),make,DialogModes.NO);
     }
     function wfApplyUserMask(doc,layer) {
         doc.activeLayer=layer;
@@ -1209,42 +1215,29 @@ extension PhotoshopWorkflowBridge {
     function wfPrepareFringeLayers(doc,roles) {
         if(roles.outline)return;
         wfMaskToSelection(roles.origin);
-        // 约为画布短边的 1%，并限制在 Photoshop 选区扩展支持的范围内。
-        var expand=Math.round(Math.min(doc.width.as('px'),doc.height.as('px'))*0.01);
-        doc.selection.expand(Math.max(1,Math.min(100,expand)));
+        doc.selection.expand(15);
         var outline=roles.base.duplicate();outline.name='outline';
         outline.move(roles.cutout,ElementPlacement.PLACEAFTER);doc.activeLayer=outline;
-        wfMakeSelectionMask();doc.selection.deselect();wfSelectRGB();outline.visible=false;
+        wfMakeUserMask('RvlS');doc.selection.deselect();wfApplyUserMask(doc,outline);
+
+        var edge=outline.duplicate();edge.name='edge';edge.move(roles.cutout,ElementPlacement.PLACEAFTER);
+        wfShowRole(doc,roles.adjust,edge);doc.activeLayer=edge;wfSelectRGB();
 
         var preset=new File(Folder.userData.fsName+'/Adobe/'+app.path.name+'/Presets/Color Range/papilio.axt');
-        var edge=null;
+        var hasColorSelection=false;
         if(preset.exists) {
-            var visibility=[];
-            function remember(parent) {
-                for(var i=0;i<parent.layers.length;i++)visibility.push({layer:parent.layers[i],visible:parent.layers[i].visible});
-            }
-            remember(doc);remember(roles.adjust);
-            try {
-                wfShowRole(doc,roles.adjust,outline);doc.activeLayer=outline;wfSelectRGB();
-                var s=stringIDToTypeID,range=new ActionDescriptor();range.putPath(s('using'),preset);
-                executeAction(s('colorRange'),range,DialogModes.NO);
-                var document=new ActionReference();document.putEnumerated(s('document'),s('ordinal'),s('targetEnum'));
-                if(executeActionGet(document).hasKey(s('selection'))) {
-                    // 先落实扩展轮廓，再落实色彩选区；透明区域与 Photoshop 的部分选中值均被保留。
-                    edge=outline.duplicate();
-                    wfApplyUserMask(doc,edge);wfMakeSelectionMask();doc.selection.deselect();wfApplyUserMask(doc,edge);
-                }
-            } finally {
-                doc.selection.deselect();
-                for(var i=0;i<visibility.length;i++)visibility[i].layer.visible=visibility[i].visible;
-            }
+            var s=stringIDToTypeID,range=new ActionDescriptor();range.putPath(s('using'),preset);
+            executeAction(s('colorRange'),range,DialogModes.NO);
+            var document=new ActionReference();document.putEnumerated(s('document'),s('ordinal'),s('targetEnum'));
+            hasColorSelection=executeActionGet(document).hasKey(s('selection'));
         }
-        if(!edge)edge=roles.adjust.artLayers.add();
-        edge.name='edge';edge.move(roles.cutout,ElementPlacement.PLACEAFTER);edge.visible=true;
+        // 没有颜色选区时用全黑蒙版遮住边缘层，仍保留完整轮廓以供精修。
+        wfMakeUserMask(hasColorSelection ? 'RvlS' : 'HdAl');doc.selection.deselect();
+        roles.cutout.visible=true;
         doc.activeLayer=roles.cutout;wfSelectRGB();
     }
     function wfHideAll(doc) {for(var i=0;i<doc.layers.length;i++)doc.layers[i].visible=false;}
-    // 只在导出副本中隔离角色，避免原始蒙版和预览背景混入结果。
+    // 取样或导出时隔离指定图层，避免其他图层及预览背景混入结果。
     function wfShowRole(doc,group,role) {
         wfHideAll(doc);group.visible=true;
         for(var i=0;i<group.layers.length;i++)group.layers[i].visible=group.layers[i].id===role.id;
@@ -1360,7 +1353,7 @@ extension PhotoshopWorkflowBridge {
             app.activeDocument=doc;var base=doc.activeLayer;base.name='Stack';base.move(adjust,ElementPlacement.INSIDE);
             var origin=base.duplicate();origin.name='Keying_Origin';base.visible=false;origin.visible=true;doc.activeLayer=origin;
             \(selection)
-            wfMakeSelectionMask();doc.selection.deselect();if(typeof imported!=='undefined')imported.remove();wfSelectRGB();
+            wfMakeUserMask('RvlS');doc.selection.deselect();if(typeof imported!=='undefined')imported.remove();wfSelectRGB();
             var cutout=origin.duplicate();cutout.name='Keying_Level';
             cutout.move(origin,ElementPlacement.PLACEBEFORE);
             if(\(alpha == nil ? "true" : "false"))wfApplyMaskLevels(cutout);

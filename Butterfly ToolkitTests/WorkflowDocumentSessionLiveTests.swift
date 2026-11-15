@@ -126,10 +126,10 @@ final class WorkflowDocumentSessionLiveTests: XCTestCase {
             XCTAssertFalse(before.originalVisible)
             XCTAssertEqual(after.originalVisible, before.originalVisible)
             XCTAssertTrue(after.backgroundLocked)
-            XCTAssertTrue(after.backgroundVisible)
+            XCTAssertFalse(after.backgroundVisible)
             let fringeLayers = after.layers.filter { ["edge", "outline"].contains($0.name) }
             XCTAssertEqual(Array(after.layers.suffix(5)).map(\.name), ["Keying_Level", "edge", "outline", "Keying_Origin", "Stack"])
-            XCTAssertEqual(fringeLayers.map(\.hasMask), [false, true])
+            XCTAssertEqual(fringeLayers.map(\.hasMask), [true, false])
             XCTAssertEqual(fringeLayers.map(\.visible), [true, false])
             let rotatedLayers = after.layers.filter { !["edge", "outline"].contains($0.name) }
             XCTAssertEqual(rotatedLayers.map(\.id), before.layers.map(\.id))

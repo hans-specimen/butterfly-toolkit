@@ -67,14 +67,14 @@ import XCTest
                         return (desc.hasKey(userMask) && desc.getBoolean(userMask))===mask && (!color || desc.getEnumerationValue(key)===charIDToTypeID(color));
                     }
                     var editable=a.layers.length===5 && matches(c,'Keying_Level',true,'Rd  ',true)
-                        && matches(e,'edge',false,null,true) && matches(u,'outline',true,null,false)
+                        && matches(e,'edge',true,null,true) && matches(u,'outline',false,null,false)
                         && matches(o,'Keying_Origin',true,'Grn ',false) && matches(s,'Stack',false,'Bl  ',false);
                     var bg=d.layers[d.layers.length-1];
-                    return String(editable && d.layers.length===3 && bg.name==='BG' && bg.typename==='ArtLayer' && bg.visible && bg.allLocked);
+                    return String(editable && d.layers.length===3 && bg.name==='BG' && bg.typename==='ArtLayer' && !bg.visible && bg.allLocked);
                 }finally{d.close(SaveOptions.DONOTSAVECHANGES);}}());
                 """)
             }
-            XCTAssertEqual(maskCheck, "true", "Editable mask and locked visible root BG must remain after geometry")
+            XCTAssertEqual(maskCheck, "true", "Editable masks and the hidden locked root BG must remain after geometry")
         }
         // 仅在副本修改蒙版中心一个像素，确认保存刷新读取蒙版而非隐藏的旧成品。
         let task = try XCTUnwrap(processed.activeTasks.first), saved = try XCTUnwrap(task.snapshot)

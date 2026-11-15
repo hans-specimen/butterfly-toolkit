@@ -109,7 +109,7 @@ final class WorkflowBridgeTests: XCTestCase {
         function fixture() {
             var group={id:1,name:'共同调整',typename:'LayerSet',visible:true,opacity:100,layers:[
                 layer(2,'手工精修结果',true,false),layer(3,'Keying_Level',true,true),
-                layer(8,'edge',false,true),layer(9,'outline',true,true),
+                layer(8,'edge',true,true),layer(9,'outline',false,true),
                 layer(4,'Keying_Origin',true,true),layer(5,'Stack',false,false),layer(6,'底图',false,true)
             ]};
             var bg=layer(7,'BG',false,true);bg.kind=LayerKind.SOLIDFILL;
@@ -201,6 +201,8 @@ final class WorkflowBridgeTests: XCTestCase {
         """
         context.evaluateScript("source=fixture();\(automaticFixture)")
         XCTAssertEqual(context.evaluateScript("wfRoles(source).ids.cutoutLayer")?.toString(), "3")
+        context.evaluateScript("source.layers[0].layers[1].mask=false;source.layers[0].layers[2].mask=true;")
+        XCTAssertEqual(context.evaluateScript("wfRoles(source).ids.cutoutLayer")?.toString(), "3", "Previously saved work PSDs remain readable")
         for (edit,diagnostic) in [("source.layers[0].vectorMask=true","蒙版"),
                                   ("source.layers[0].opacity=50","不透明度"),
                                   ("source.layers[0].layers[5].vectorMask=true","Stack")] {
