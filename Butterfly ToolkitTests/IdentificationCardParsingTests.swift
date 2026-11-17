@@ -4,6 +4,48 @@ import AppKit
 @testable import Butterfly_Toolkit
 
 final class IdentificationCardParsingTests: XCTestCase {
+    func testFemaleMarkerBeforeTrailingNumberKeepsLatinName() throws {
+        for stem in ["SC1_梦幻闪蝶M亚 Morpho deidamia mariae-F",
+                     "梦幻闪蝶M亚 Morpho deidamia mariae-F_SC1",
+                     "梦幻闪蝶M亚 Morpho deidamia mariae♀_SC1"] {
+            let group = try XCTUnwrap(CardInputParser.group(["D", "V"].map {
+                URL(fileURLWithPath: "/tmp/\(stem)_\($0).png")
+            }).first)
+            XCTAssertEqual(group.specimenNumber, "SC1")
+            XCTAssertEqual(group.sex, .female, stem)
+            XCTAssertEqual(group.chineseName, "梦幻闪蝶M亚", stem)
+            XCTAssertEqual(group.latinName, "Morpho deidamia mariae", stem)
+            XCTAssertNil(group.issue)
+        }
+    }
+
+    func testNewAndLegacyNumberLocationsPreserveNamesSexAndIdentity() throws {
+        for code in ["SC10140", "GC10052", "MT10005"] {
+            for stem in ["\(code)_玛格丽特栎蛱蝶雌_Euphaedra margaritifera",
+                         "玛格丽特栎蛱蝶雌_Euphaedra margaritifera_\(code)",
+                         "玛格丽特栎蛱蝶雌 Euphaedra margaritifera_\(code)"] {
+                let group = try XCTUnwrap(CardInputParser.group(["D", "V"].map {
+                    URL(fileURLWithPath: "/tmp/\(stem)_\($0).png")
+                }).first)
+                XCTAssertEqual(group.specimenNumber, code, stem)
+                XCTAssertEqual(group.chineseName, "玛格丽特栎蛱蝶", stem)
+                XCTAssertEqual(group.latinName, "Euphaedra margaritifera", stem)
+                XCTAssertEqual(group.sex, .female, stem)
+                XCTAssertNil(group.issue, stem)
+                XCTAssertEqual(CardRecord(input: group).outputName, "玛格丽特栎蛱蝶_Euphaedra margaritifera_\(code).png")
+            }
+        }
+        let mixed = CardInputParser.group([
+            URL(fileURLWithPath: "/tmp/SC1_长翅德凤蝶 Papilio antimachus_D.png"),
+            URL(fileURLWithPath: "/tmp/长翅德凤蝶 Papilio antimachus_SC1_V.png"),
+            URL(fileURLWithPath: "/tmp/长翅德凤蝶 Papilio antimachus_SC2_D.png"),
+            URL(fileURLWithPath: "/tmp/长翅德凤蝶 Papilio antimachus_SC2_V.png")
+        ])
+        XCTAssertEqual(mixed.count, 2)
+        XCTAssertEqual(mixed.compactMap(\.specimenNumber), ["SC1", "SC2"])
+        XCTAssertTrue(mixed.allSatisfy { $0.issue == nil && $0.front != nil && $0.back != nil })
+    }
+
     func testOpaquePNGIsRejected() throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
@@ -52,7 +94,7 @@ final class IdentificationCardParsingTests: XCTestCase {
         let cases = [("门亮闪蝶", "门亮闪蝶", "", "门亮闪蝶.png"),
                      ("Morpho anaxibia", "", "Morpho anaxibia", "Morpho anaxibia.png"),
                      ("SC21", "", "", "SC21.png"),
-                     ("SC22*纱栎蛱蝶 Euphaedra sarita sarita", "纱栎蛱蝶", "Euphaedra sarita sarita", "SC22_纱栎蛱蝶指名亚种_Euphaedra sarita sarita.png")]
+                     ("SC22*纱栎蛱蝶 Euphaedra sarita sarita", "纱栎蛱蝶", "Euphaedra sarita sarita", "纱栎蛱蝶指名亚种_Euphaedra sarita sarita_SC22.png")]
         for (stem, chinese, latin, filename) in cases {
             let groups = CardInputParser.group(["D", "V"].map { URL(fileURLWithPath: "/tmp/\(stem)_\($0).png") })
             XCTAssertEqual(groups.count, 1, stem)
@@ -83,7 +125,7 @@ final class IdentificationCardParsingTests: XCTestCase {
         let card = CardRecord(input: try XCTUnwrap(numbered.first))
         XCTAssertNil(card.input.issue)
         XCTAssertNil(card.missingNames)
-        XCTAssertEqual(card.outputName, "SC3_门亮闪蝶_Morpho anaxibia.png")
+        XCTAssertEqual(card.outputName, "门亮闪蝶_Morpho anaxibia_SC3.png")
 
         let unnumbered = CardInputParser.group([
             URL(fileURLWithPath: "/tmp/a/门亮闪蝶_D.png"),

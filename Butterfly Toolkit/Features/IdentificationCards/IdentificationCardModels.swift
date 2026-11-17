@@ -81,7 +81,7 @@ nonisolated struct CardRecord: Codable, Identifiable, Sendable {
         return missing.isEmpty ? nil : "缺少" + missing.joined(separator: "、")
     }
     var outputName: String {
-        let parts = [input.specimenNumber ?? "", fields.formattedChineseName, fields.latinName].map(Self.safeName).filter { !$0.isEmpty }
+        let parts = [fields.formattedChineseName, fields.latinName, input.specimenNumber ?? ""].map(Self.safeName).filter { !$0.isEmpty }
         return (parts.isEmpty ? "图鉴卡片" : parts.joined(separator: "_")) + ".png"
     }
     private static func safeName(_ text: String) -> String {

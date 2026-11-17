@@ -34,8 +34,6 @@ nonisolated enum CardInputParser {
 
     // MARK: - 文件名及分组
     private static let sideSuffix = /(?:^|[_*\s-]+)[DdVv]$/
-    private static let specimenNumber = /(?i)(?:[a-z]+[ -]?)?[0-9]+(?:-[0-9]+)?/
-    private static let numberPrefix = /(?i)(?:[a-z]+[ -]?)?[0-9]+(?:-[0-9]+)?(?=\s|\p{Han})/
     private static let latinSuffix = /(?:^|[^A-Za-z])([A-Z][a-z]+(?:\s+[a-z][a-z-]*){1,2})$/
     private static let han = /\p{Han}/
 
@@ -93,15 +91,14 @@ nonisolated enum CardInputParser {
     }
 
     private static func parseNames(_ stem: String, sex: inout CardSex) -> (number: String?, chinese: String, latin: String) {
-        var parts = stem.components(separatedBy: CharacterSet(charactersIn: "_*")).map { trimmed($0) }
-        var number: String?
-        if let first = parts.first, first.wholeMatch(of: specimenNumber) != nil
-            || (parts.count == 3 && !first.isEmpty && parts[2].firstMatch(of: han) == nil
-                && (parts[1].firstMatch(of: han) != nil || first.firstMatch(of: han) == nil)) {
+        let parsed = SpecimenFilename.components(stem)
+        var nameWithoutNumber = parsed.name
+        stripFemaleSuffix(&nameWithoutNumber, sex: &sex)
+        var parts = nameWithoutNumber.components(separatedBy: CharacterSet(charactersIn: "_*")).map { trimmed($0) }
+        var number = parsed.number
+        if number == nil, let first = parts.first, parts.count == 3 && !first.isEmpty && parts[2].firstMatch(of: han) == nil
+            && (parts[1].firstMatch(of: han) != nil || first.firstMatch(of: han) == nil) {
             number = parts.removeFirst()
-        } else if let first = parts.first, let match = first.prefixMatch(of: numberPrefix) {
-            number = String(match.output)
-            parts[0] = trimmed(first[match.range.upperBound...])
         }
         parts = parts.filter { !$0.isEmpty }
         let name = parts.joined(separator: " ")

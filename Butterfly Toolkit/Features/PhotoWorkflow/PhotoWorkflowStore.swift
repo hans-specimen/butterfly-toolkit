@@ -40,7 +40,12 @@ nonisolated struct WorkflowBatchDraft: Sendable {
     var ignoreRemainder = false
     var photoCount: Int { groups.reduce(0) { $0 + $1.files.count } + remainder.count }
     static func scan(directory: URL,inputMode: WorkflowInputMode = .photos) throws -> Self {
-        let files = try FileManager.default.contentsOfDirectory(at: directory.resolvingSymlinksInPath(),includingPropertiesForKeys: [.isRegularFileKey],options: [.skipsHiddenFiles]).filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        let files = try FileManager.default.contentsOfDirectory(at: directory.resolvingSymlinksInPath(),includingPropertiesForKeys: [.isRegularFileKey],options: [.skipsHiddenFiles]).filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }.sorted {
+            let first = SpecimenFilename.sortKey($0.deletingPathExtension().lastPathComponent)
+            let second = SpecimenFilename.sortKey($1.deletingPathExtension().lastPathComponent)
+            let order = first.localizedStandardCompare(second)
+            return order == .orderedSame ? $0.lastPathComponent < $1.lastPathComponent : order == .orderedAscending
+        }
         if inputMode == .psd {
             let psds = files.filter { $0.pathExtension.lowercased() == "psd" }
             let pairs = try psdGroups(files: psds)
@@ -58,13 +63,13 @@ nonisolated struct WorkflowBatchDraft: Sendable {
             guard stem.count > 2,stem.suffix(2).first == "_",let side = stem.last?.uppercased(),["D","V"].contains(side) else {
                 remainder.append(file); continue
             }
-            let name = String(stem.dropLast(2)), key = name.precomposedStringWithCanonicalMapping.lowercased()
+            let name = SpecimenFilename.normalized(String(stem.dropLast(2))), key = name.precomposedStringWithCanonicalMapping.lowercased()
             var pair = pairs[key] ?? (name,[:])
             guard pair.faces[side] == nil else { throw WorkflowBridgeError.invalidImage("PSD 正反面重复：\(file.lastPathComponent)") }
             pair.faces[side] = file; pairs[key] = pair
         }
         var groups: [WorkflowDraftGroup] = []
-        for pair in pairs.values.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
+        for pair in pairs.values.sorted(by: { SpecimenFilename.sortKey($0.name).localizedStandardCompare(SpecimenFilename.sortKey($1.name)) == .orderedAscending }) {
             if let front = pair.faces["D"],let back = pair.faces["V"] {
                 groups.append(WorkflowDraftGroup(files: [front,back],suggestedName: pair.name))
             } else { remainder.append(contentsOf: pair.faces.values) }
@@ -72,7 +77,7 @@ nonisolated struct WorkflowBatchDraft: Sendable {
         return (groups,remainder.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
     }
     func specimenNames(_ text: String) throws -> [String] {
-        var rows = try ToolkitTextInput.filenameRows(text)
+        var rows = try ToolkitTextInput.filenameRows(text).map(SpecimenFilename.normalized)
         // 从表格复制时末尾常带换行，保留中间空行以免标本错位。
         while rows.count > groups.count, rows.last == "" {
             rows.removeLast()

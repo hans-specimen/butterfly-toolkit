@@ -18,11 +18,52 @@ import XCTest
         XCTAssertEqual(WorkflowSide.back.fileSuffix,"V")
     }
 
+    func testMixedFilenameFormatsPairAndNormalizeBeforeFreezing() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["SC2_蝶_D.psd", "蝶_SC2_V.psd", "蝶_SC10_D.psd", "SC10_蝶_V.psd"] {
+            _ = try write(name, in: root)
+        }
+        let draft = try WorkflowBatchDraft.scan(directory: root, inputMode: .psd)
+        XCTAssertEqual(draft.groups.map(\.suggestedName), ["蝶_SC2", "蝶_SC10"])
+        XCTAssertTrue(draft.remainder.isEmpty)
+        let batch = try draft.freeze(names: "SC2_蝶\n蝶_SC10", output: root.appendingPathComponent("batch"))
+        XCTAssertEqual(batch.specimens.map(\.baseName), ["蝶_SC2", "蝶_SC10"])
+        try batch.validate()
+        try batch.validateOutputURL(batch.generatedPSDDirectory.appendingPathComponent("蝶_SC2_D.psd"))
+        XCTAssertThrowsError(try draft.specimenNames("SC2_蝶\n蝶_SC2"))
+        XCTAssertThrowsError(try WorkflowBatchDraft.psdGroups(files: [
+            root.appendingPathComponent("SC2_蝶_D.psd"), root.appendingPathComponent("蝶_SC2_D.psd")
+        ]))
+    }
+
+    func testRenamedPhotoSlotsSortByNumberBeforeLetter() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        for number in [2, 10, 11, 12] {
+            for letter in ["A", "B", "C"] { _ = try write("\(letter)_MT\(number).JPG", in: root) }
+        }
+        let draft = try WorkflowBatchDraft.scan(directory: root)
+        XCTAssertEqual(draft.groups.count, 2)
+        XCTAssertEqual(draft.groups[0].files.compactMap { $0?.lastPathComponent },
+                       ["A_MT2.JPG", "B_MT2.JPG", "C_MT2.JPG", "A_MT10.JPG", "B_MT10.JPG", "C_MT10.JPG"])
+        XCTAssertEqual(draft.groups[1].files.compactMap { $0?.lastPathComponent },
+                       ["A_MT11.JPG", "B_MT11.JPG", "C_MT11.JPG", "A_MT12.JPG", "B_MT12.JPG", "C_MT12.JPG"])
+    }
+
+    func testOrdinaryCameraPrefixesKeepTheirTripletsTogether() throws {
+        let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
+        for prefix in ["DSC", "IMG"] {
+            for number in 1...3 { _ = try write("\(prefix)_\(number).JPG", in: root) }
+        }
+        let draft = try WorkflowBatchDraft.scan(directory: root)
+        XCTAssertEqual(draft.groups[0].files.compactMap { $0?.lastPathComponent },
+                       ["DSC_1.JPG", "DSC_2.JPG", "DSC_3.JPG", "IMG_1.JPG", "IMG_2.JPG", "IMG_3.JPG"])
+    }
+
     func testPSDPairsAreNamedAndFrozenWithoutJPGs() throws {
         let root = try directory(); defer { try? FileManager.default.removeItem(at: root) }
         for name in ["SC10_蝶_V.psd","SC2_蝶_d.PSD","SC10_蝶_D.psd","SC2_蝶_v.psd","DSC001.JPG"] { _ = try write(name,in: root) }
         let draft = try WorkflowBatchDraft.scan(directory: root,inputMode: .psd)
-        XCTAssertEqual(draft.groups.map(\.suggestedName),["SC2_蝶","SC10_蝶"])
+        XCTAssertEqual(draft.groups.map(\.suggestedName),["蝶_SC2","蝶_SC10"])
         XCTAssertEqual(draft.groups[0].files.compactMap { $0?.lastPathComponent },["SC2_蝶_d.PSD","SC2_蝶_v.psd"])
         let batch = try draft.freeze(names: "SC2_蝶\nSC10_蝶",output: root.appendingPathComponent("batch"))
         XCTAssertTrue(batch.activeTasks.allSatisfy { $0.sources.isPSD && $0.sources.files.count == 1 })
@@ -30,7 +71,7 @@ import XCTest
         XCTAssertEqual(restored,batch)
         try restored.validate()
         for task in restored.activeTasks { XCTAssertThrowsError(try restored.validateOutputURL(task.sources.first.url), "Input PSD is never an authorized output") }
-        try restored.validateOutputURL(restored.generatedPSDDirectory.appendingPathComponent("SC2_蝶_D.psd"))
+        try restored.validateOutputURL(restored.generatedPSDDirectory.appendingPathComponent("蝶_SC2_D.psd"))
         XCTAssertThrowsError(try restored.validateOutputURL(root.appendingPathComponent("foreign.psd")))
     }
     func testUnpairedAndUnknownPSDRequireExplicitExclusionAndDuplicatesFail() throws {

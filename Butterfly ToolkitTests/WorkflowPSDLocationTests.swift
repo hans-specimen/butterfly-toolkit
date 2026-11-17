@@ -3,6 +3,47 @@ import XCTest
 @testable import Butterfly_Toolkit
 
 @MainActor final class WorkflowPSDLocationTests: XCTestCase {
+    func testFilenameMigrationManifestsWhenRequested() async throws {
+        guard let paths = ProcessInfo.processInfo.environment["WORKFLOW_FILENAME_MIGRATION_MANIFESTS"], !paths.isEmpty else {
+            throw XCTSkip("仅在明确指定的命名迁移记录上执行只读恢复和归属验证")
+        }
+        struct OwnershipProbe: Decodable {
+            let owner: UUID
+            let sources: [WorkflowSourceFile]
+        }
+        for path in paths.split(separator: "\n") {
+            let manifest = URL(fileURLWithPath: String(path))
+            let batch = try JSONDecoder().decode(WorkflowBatch.self, from: Data(contentsOf: manifest))
+            try batch.validate()
+            let loaded = try await WorkflowBatchStore().load(from: manifest)
+            XCTAssertEqual(loaded.id, batch.id)
+            for specimen in batch.specimens {
+                XCTAssertEqual(specimen.baseName, SpecimenFilename.normalized(specimen.baseName))
+                guard !specimen.isExcluded else { continue }
+                for task in [specimen.front, specimen.back] {
+                    for source in task.sources.files {
+                        XCTAssertTrue(FileManager.default.fileExists(atPath: source.url.path), source.url.path)
+                    }
+                    guard let snapshot = task.snapshot else { continue }
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: snapshot.workingURL.path), snapshot.workingURL.path)
+                    let record = snapshot.workingURL.appendingPathExtension("workflow-owner.json")
+                    let ownership = try JSONDecoder().decode(OwnershipProbe.self, from: Data(contentsOf: record))
+                    XCTAssertEqual(ownership.owner, task.id)
+                    // 已有 PSD 先复制为工作文档再接管，凭据记录的是工作副本，批次仍保留原件。
+                    let expectedSources = task.sources.isPSD
+                        ? [WorkflowSourceFile(url: snapshot.workingURL, fingerprint: task.sources.first.fingerprint)]
+                        : task.sources.files
+                    XCTAssertEqual(ownership.sources, expectedSources)
+                    for artifact in task.artifacts where artifact.state == .completed {
+                        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.url.path), artifact.url.path)
+                        let receipt = artifact.url.deletingLastPathComponent().appendingPathComponent(".\(artifact.url.lastPathComponent).workflow.json")
+                        XCTAssertTrue(FileManager.default.fileExists(atPath: receipt.path), receipt.path)
+                    }
+                }
+            }
+        }
+    }
+
     func testManualWorkflowCreatesPSDsInSourceSubdirectoryAndReopens() async throws {
         let f = try ExecutorFixture()
         defer { try? FileManager.default.removeItem(at: f.batch.sourceDirectory) }

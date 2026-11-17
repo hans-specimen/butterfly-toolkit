@@ -56,6 +56,8 @@ python3 scripts/version.py check
 
 图鉴卡片的解析、批量采集信息填入及工作目录验证纳入常规测试。
 
+`SpecimenFilenameTests`、`IdentificationCardParsingTests` 和 `WorkflowPSDImportTests` 覆盖新旧编号位置、图鉴输出顺序、混用格式的 D/V 配对、规范化后重名及原片槽位排序。迁移批次可用 `TEST_RUNNER_WORKFLOW_FILENAME_MIGRATION_MANIFESTS` 指定以换行分隔的清单路径，单独运行 `WorkflowPSDLocationTests.testFilenameMigrationManifestsWhenRequested`，只读验证当前模型恢复、原件路径、工作 PSD 归属及已完成成品的配套凭据，不启动 Photoshop、不改写清单。
+
 `IdentificationCardBatchLiveTests.testSelectedBatchAndInterface` 使用 `TEST_RUNNER_CARD_LIVE_TEMPLATE` 和 `TEST_RUNNER_CARD_LIVE_INPUT` 指定明确授权的模板与十组 D/V PNG，使用素材副本验证快速导出及工作 PSD 清理。可额外指定 `TEST_RUNNER_CARD_LIVE_COLLECTION` 验证采集表格按序填入及 Photoshop 文字读回。`testInterfaceSnapshotsWhenRequested` 使用 `TEST_RUNNER_CARD_UI_SESSION` 对已有隔离会话重拍界面。
 
 Xcode 运行测试时用 `TEST_RUNNER_` 前缀传递变量，并用 `-only-testing` 限定测试类。下表列的是测试内部读取的变量名，缩写的 `BATCH/EVIDENCE` 表示两个完整变量名。素材与路径约束以各测试方法为准。
