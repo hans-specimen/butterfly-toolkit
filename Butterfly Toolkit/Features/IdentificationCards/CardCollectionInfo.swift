@@ -10,8 +10,15 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
     var warnings: [String] = []
     var formatted: String {
         let size = wingspan ?? ""
-        return [locality, country, Self.normalizedAltitude(altitude), Self.normalizedDate(date), Self.normalizedWingspan(size) ?? size]
+        let place = [locality, country, Self.normalizedAltitude(altitude)]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: ", ")
+        let sections = [place, Self.normalizedDate(date), Self.normalizedWingspan(size) ?? size]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        return sections.reduce("") { text, section in
+            guard !text.isEmpty else { return section }
+            // C.A.R. 等缩写末尾已有句点，不再重复添加。
+            return text + (text.hasSuffix(".") ? " " : ". ") + section
+        }
     }
     // MARK: - 表格解析
     struct Row {
@@ -146,36 +153,61 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
 
         let explicitEnd = dateParts(endpoints[1])
         let start = dateParts(endpoints[0]) ?? explicitEnd.flatMap { end in
-            englishMonth(endpoints[0]).map { [end[0], $0] }
+            abbreviatedEnglishDate(endpoints[0], relativeTo: end)
         }
         guard let start,
               let end = explicitEnd ?? abbreviatedEnd(endpoints[1], after: start),
               start.count == end.count, !end.lexicographicallyPrecedes(start) else { return nil }
 
         if start.count == 1 { return formatDate(start) + "-" + formatDate(end) }
-        // 末尾保留一个日期分量，即使两端完全相同。
-        let shared = zip(start.dropLast(), end.dropLast()).prefix(while: { $0.0 == $0.1 }).count
-        return formatDate(start) + " - " + formatDate(end.dropFirst(shared))
+        if start[0] != end[0] { return formatDate(start) + " - " + formatDate(end) }
+        if start.count == 2 {
+            return monthNames[start[1] - 1] + "-" + formatDate(end)
+        }
+        if start[1] == end[1] { return "\(start[2])-" + formatDate(end) }
+        return formatDate(start, includeYear: false) + " - " + formatDate(end)
     }
 
     private static func abbreviatedEnd(_ text: String, after start: [Int]) -> [Int]? {
-        if start.count == 2, let month = englishMonth(text) { return [start[0], month] }
+        if let parts = abbreviatedEnglishDate(text, relativeTo: start) { return parts }
 
         // 只继承右端明确省略的年、月，避免将不完整的年份误当作月份或日期。
         guard text.range(of: #"^[0-9]{1,2}(?:\.[0-9]{1,2})?$"#, options: .regularExpression) != nil else { return nil }
         let count = text.split(separator: ".").count
         guard count < start.count else { return nil }
-        return dateParts(formatDate(start.prefix(start.count - count)) + "." + text)
+        let prefix = start.prefix(start.count - count).map { String($0) }.joined(separator: ".")
+        return dateParts(prefix + "." + text)
     }
 
-    private static func formatDate(_ parts: some Sequence<Int>) -> String {
-        parts.map { String($0) }.joined(separator: ".")
+    private static func abbreviatedEnglishDate(_ text: String, relativeTo reference: [Int]) -> [Int]? {
+        if reference.count == 2, let month = englishMonth(text) { return [reference[0], month] }
+        guard reference.count == 3 else { return nil }
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        if words.count == 2, let day = Int(words[0]), let month = englishMonth(String(words[1])) {
+            return dateParts("\(reference[0]).\(month).\(day)")
+        }
+        if text.range(of: #"^[0-9]{1,2}$"#, options: .regularExpression) != nil {
+            return dateParts("\(reference[0]).\(reference[1]).\(text)")
+        }
+        return nil
+    }
+
+    private static let monthNames = ["Jan.", "Feb.", "Mar.", "Apr.", "May", "Jun.", "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec."]
+
+    private static func formatDate(_ parts: [Int], includeYear: Bool = true) -> String {
+        guard parts.count > 1 else { return String(parts[0]) }
+        let day = parts.count == 3 ? "\(parts[2]) " : ""
+        return day + monthNames[parts[1] - 1] + (includeYear ? " \(parts[0])" : "")
     }
 
     private static func dateParts(_ text: String) -> [Int]? {
         let words = text.replacingOccurrences(of: ".", with: "").split(whereSeparator: { $0.isWhitespace })
         if words.count == 2, let month = englishMonth(String(words[0])),
            let year = Int(words[1]), (1000...9999).contains(year) { return [year, month] }
+        if words.count == 3, let day = Int(words[0]), let month = englishMonth(String(words[1])),
+           let year = Int(words[2]) {
+            return dateParts("\(year).\(month).\(day)")
+        }
 
         guard text.range(of: #"^[0-9]{4}(?:\.[0-9]{1,2}){0,2}$"#, options: .regularExpression) != nil else { return nil }
         let parts = text.split(separator: ".").compactMap { Int($0) }

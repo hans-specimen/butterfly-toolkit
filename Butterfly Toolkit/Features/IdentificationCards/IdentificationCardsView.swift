@@ -230,7 +230,7 @@ struct IdentificationCardsView: View {
             Button("整理粘贴内容",systemImage:"text.alignleft") { store.organizeCollection() }
             editableField("采集点", placeholder: "地点、地区", text: collectionField(\.locality))
             HStack(alignment:.top) {
-                editableField("日期", placeholder: "2026.4", text: collectionField(\.date))
+                editableField("日期", placeholder: "Apr. 2026", text: collectionField(\.date))
                 editableField("国家", placeholder: "国家", text: collectionField(\.country))
             }
             HStack(alignment:.top) {

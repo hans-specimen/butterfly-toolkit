@@ -23,7 +23,7 @@ final class IdentificationCardStoreTests: XCTestCase {
         XCTAssertEqual(store.session.records.map(\.fields.collectionText), ["", ""])
         try store.applyCollectionBatch(rows, to: ids)
         let saved = try workspace.load().records
-        XCTAssertEqual(saved.map(\.fields.collectionText), ["Ebogo, Cameroon, 2026.2", "Bangui, C.A.R., 2024"])
+        XCTAssertEqual(saved.map(\.fields.collectionText), ["Ebogo, Cameroon. Feb. 2026", "Bangui, C.A.R. 2024"])
         XCTAssertEqual(saved[0].fields.chineseName, "人工名称")
         XCTAssertEqual(saved.map(\.revision), [1, 1])
         XCTAssertFalse(saved[0].isExported)

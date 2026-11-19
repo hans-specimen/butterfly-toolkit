@@ -136,12 +136,12 @@ final class IdentificationCardParsingTests: XCTestCase {
     }
     func testCollectionExamplesAndEmptyColumns() throws {
         let first = try CardCollectionInfo.parse("| Ghana | Kwabena Sam Forest, Ashanti | 2025.4.28 |\n| ----- | ---- | ----- |")
-        XCTAssertEqual(first.formatted, "Kwabena Sam Forest, Ashanti, Ghana, 2025.4.28")
+        XCTAssertEqual(first.formatted, "Kwabena Sam Forest, Ashanti, Ghana. 28 Apr. 2025")
         let second = try CardCollectionInfo.parse("| Madagascar | Andekaleka, Alaotra-Mangoro | Apr. 2026 |\n| --- | --- | --- |")
-        XCTAssertEqual(second.formatted, "Andekaleka, Alaotra-Mangoro, Madagascar, 2026.4")
+        XCTAssertEqual(second.formatted, "Andekaleka, Alaotra-Mangoro, Madagascar. Apr. 2026")
         XCTAssertEqual(try CardCollectionInfo.parse("| Ghana | | | 1000米 |").formatted, "Ghana, 1000m")
         XCTAssertEqual(CardCollectionInfo().formatted, "")
-        XCTAssertEqual(try CardCollectionInfo.parse("\tAndekaleka\t2026.04").formatted, "Andekaleka, 2026.4")
+        XCTAssertEqual(try CardCollectionInfo.parse("\tAndekaleka\t2026.04").formatted, "Andekaleka. Apr. 2026")
     }
     func testAmbiguousDatesAndMultipleRowsAreNotGuessed() throws {
         let value = try CardCollectionInfo.parse("Ghana\tForest\t04/05/26")
@@ -161,23 +161,50 @@ final class IdentificationCardParsingTests: XCTestCase {
         55\tCameroon\tObout, Centre Reg.\tDec. 2025 — February 2026
         81\tCameroon\tObout, Centre Reg.\tMay 2026 - August
         """)
-        let dates = ["2026.5 - 8", "2024-2025", "2025.3.1 - 4.15", "2025.3.1 - 15", "2025.12 - 2026.2", "2026.5 - 8"]
+        let dates = ["May-Aug. 2026", "2024-2025", "1 Mar. - 15 Apr. 2025", "1-15 Mar. 2025", "Dec. 2025 - Feb. 2026", "May-Aug. 2026"]
         XCTAssertEqual(rows.map(\.info.date), dates)
         for (row, date) in zip(rows, dates) {
             XCTAssertTrue(row.info.warnings.isEmpty, row.source)
             XCTAssertEqual(CardCollectionInfo.normalizedDate(date), date)
         }
-        XCTAssertEqual(rows[0].info.formatted, "Obout, Centre Reg., Cameroon, 2026.5 - 8, 77 mm")
+        XCTAssertEqual(rows[0].info.formatted, "Obout, Centre Reg., Cameroon. May-Aug. 2026. 77 mm")
 
         let blankWingspan = try CardCollectionInfo.parse("\tCameroon\tObout, Centre Reg.\t2025.3.1 - 4.15")
-        XCTAssertEqual(blankWingspan.formatted, "Obout, Centre Reg., Cameroon, 2025.3.1 - 4.15")
+        XCTAssertEqual(blankWingspan.formatted, "Obout, Centre Reg., Cameroon. 1 Mar. - 15 Apr. 2025")
+    }
+
+    func testEnglishCollectionDatesPreservePrecisionAndRoundTrip() throws {
+        let cases = [
+            ("2026.8.1", "1 Aug. 2026"),
+            ("2025.5.15", "15 May 2025"),
+            ("2026.3.15 - 4.2", "15 Mar. - 2 Apr. 2026"),
+            ("2025.3.3 - 7", "3-7 Mar. 2025"),
+            ("2025.12.31 - 2026.1.2", "31 Dec. 2025 - 2 Jan. 2026"),
+            ("2026.1 - 3", "Jan.-Mar. 2026"),
+            ("1 August 2026", "1 Aug. 2026"),
+            ("15 March 2026 - 2 April", "15 Mar. - 2 Apr. 2026"),
+            ("2024.2.29", "29 Feb. 2024"),
+            ("2025.6", "Jun. 2025"),
+            ("2025.7", "Jul. 2025")
+        ]
+        for (input, expected) in cases {
+            for source in [input, expected] {
+                let info = try CardCollectionInfo.parse("68\tCameroon\tObout, Centre Reg.\t\(source)")
+                XCTAssertEqual(info.date, expected, source)
+                XCTAssertTrue(info.warnings.isEmpty, source)
+                XCTAssertEqual(info.formatted, "Obout, Centre Reg., Cameroon. \(expected). 68 mm", source)
+            }
+        }
+        let example = try CardCollectionInfo.parse("| 61 | Cameroon | Obout, Centre Reg. | May. - Aug. 2026 |\n| -- | -------- | ------------------ | ---------------- |")
+        XCTAssertEqual(example.formatted, "Obout, Centre Reg., Cameroon. May-Aug. 2026. 61 mm")
+        XCTAssertEqual(CardCollectionInfo(country: "Cameroon", wingspan: "68").formatted, "Cameroon. 68 mm")
     }
 
     func testInvalidCollectionDateRangesPreserveOriginalTextAndWarnings() throws {
-        for date in ["2025.2.1 - 29", "Aug. - May 2026", "2025.12 - 2", "2025.3 - 2025.4.15", "2025-03"] {
+        for date in ["2025.2.1 - 29", "Aug. - May 2026", "2025.12 - 2", "2025.3 - 2025.4.15", "2025-03", "29 Feb. 2025", "7-3 Mar. 2025", "31 Apr. - 2 May 2026", "15 Mar. - 2 Apr."] {
             let info = try CardCollectionInfo.parse("Cameroon\tObout, Centre Reg.\t\(date)")
             XCTAssertEqual(info.date, date)
-            XCTAssertEqual(info.formatted, "Obout, Centre Reg., Cameroon, \(date)")
+            XCTAssertEqual(info.formatted, "Obout, Centre Reg., Cameroon. \(date)")
             XCTAssertFalse(info.warnings.isEmpty, date)
         }
     }
@@ -192,13 +219,13 @@ final class IdentificationCardParsingTests: XCTestCase {
         | DR Congo | Biakato, Mambasa, Ituri | 2004.12.15 |
         """)
         XCTAssertEqual(rows.map(\.info.formatted), [
-            "Ebogo, Centre Reg., Cameroon, 2026.2",
-            "Bangui, C.A.R., 2024",
+            "Ebogo, Centre Reg., Cameroon. Feb. 2026",
+            "Bangui, C.A.R. 2024",
             "",
-            "Biakato, Mambasa, Ituri, DR Congo, 2004.12.15"
+            "Biakato, Mambasa, Ituri, DR Congo. 15 Dec. 2004"
         ])
         let tabular = try CardCollectionInfo.parseBatch("date\tcountry\tlocality\r\n2024\tC.A.R.\tBangui\r\n\t\t")
-        XCTAssertEqual(tabular.map(\.info.formatted), ["Bangui, C.A.R., 2024", ""])
+        XCTAssertEqual(tabular.map(\.info.formatted), ["Bangui, C.A.R. 2024", ""])
         XCTAssertEqual(try CardCollectionInfo.parse(tabular[0].source), tabular[0].info)
         XCTAssertThrowsError(try CardCollectionInfo.parseBatch("Cameroon\tEbogo\t2026.2\n缺少列"))
     }
@@ -211,13 +238,13 @@ final class IdentificationCardParsingTests: XCTestCase {
         | 81 mm | Cameroon | Ebogo, Centre Reg. | 2026.2 |
         """)
         XCTAssertEqual(rows.map(\.info.formatted), [
-            "Biakato, Mambasa, Ituri, DR Congo, 2004.12.15, 74 mm",
-            "Ebogo, Centre Reg., Cameroon, 2026.2",
-            "Ebogo, Centre Reg., Cameroon, 2026.2, 81 mm"
+            "Biakato, Mambasa, Ituri, DR Congo. 15 Dec. 2004. 74 mm",
+            "Ebogo, Centre Reg., Cameroon. Feb. 2026",
+            "Ebogo, Centre Reg., Cameroon. Feb. 2026. 81 mm"
         ])
         let legacy = try JSONDecoder().decode(CardCollectionInfo.self, from: Data(
             #"{"country":"Ghana","locality":"Ashanti","altitude":"1000m","date":"2025.4","warnings":[]}"#.utf8))
         XCTAssertNil(legacy.wingspan)
-        XCTAssertEqual(legacy.formatted, "Ashanti, Ghana, 1000m, 2025.4")
+        XCTAssertEqual(legacy.formatted, "Ashanti, Ghana, 1000m. Apr. 2025")
     }
 }
