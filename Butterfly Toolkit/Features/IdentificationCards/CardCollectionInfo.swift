@@ -162,7 +162,7 @@ nonisolated struct CardCollectionInfo: Codable, Equatable, Sendable {
         if start.count == 1 { return formatDate(start) + "-" + formatDate(end) }
         if start[0] != end[0] { return formatDate(start) + " - " + formatDate(end) }
         if start.count == 2 {
-            return monthNames[start[1] - 1] + "-" + formatDate(end)
+            return monthNames[start[1] - 1] + " - " + formatDate(end)
         }
         if start[1] == end[1] { return "\(start[2])-" + formatDate(end) }
         return formatDate(start, includeYear: false) + " - " + formatDate(end)

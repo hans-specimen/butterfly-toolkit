@@ -161,13 +161,13 @@ final class IdentificationCardParsingTests: XCTestCase {
         55\tCameroon\tObout, Centre Reg.\tDec. 2025 — February 2026
         81\tCameroon\tObout, Centre Reg.\tMay 2026 - August
         """)
-        let dates = ["May-Aug. 2026", "2024-2025", "1 Mar. - 15 Apr. 2025", "1-15 Mar. 2025", "Dec. 2025 - Feb. 2026", "May-Aug. 2026"]
+        let dates = ["May - Aug. 2026", "2024-2025", "1 Mar. - 15 Apr. 2025", "1-15 Mar. 2025", "Dec. 2025 - Feb. 2026", "May - Aug. 2026"]
         XCTAssertEqual(rows.map(\.info.date), dates)
         for (row, date) in zip(rows, dates) {
             XCTAssertTrue(row.info.warnings.isEmpty, row.source)
             XCTAssertEqual(CardCollectionInfo.normalizedDate(date), date)
         }
-        XCTAssertEqual(rows[0].info.formatted, "Obout, Centre Reg., Cameroon. May-Aug. 2026. 77 mm")
+        XCTAssertEqual(rows[0].info.formatted, "Obout, Centre Reg., Cameroon. May - Aug. 2026. 77 mm")
 
         let blankWingspan = try CardCollectionInfo.parse("\tCameroon\tObout, Centre Reg.\t2025.3.1 - 4.15")
         XCTAssertEqual(blankWingspan.formatted, "Obout, Centre Reg., Cameroon. 1 Mar. - 15 Apr. 2025")
@@ -180,7 +180,9 @@ final class IdentificationCardParsingTests: XCTestCase {
             ("2026.3.15 - 4.2", "15 Mar. - 2 Apr. 2026"),
             ("2025.3.3 - 7", "3-7 Mar. 2025"),
             ("2025.12.31 - 2026.1.2", "31 Dec. 2025 - 2 Jan. 2026"),
-            ("2026.1 - 3", "Jan.-Mar. 2026"),
+            ("2026.1 - 3", "Jan. - Mar. 2026"),
+            ("Mar.-Aug. 2026", "Mar. - Aug. 2026"),
+            ("May-Aug. 2026", "May - Aug. 2026"),
             ("1 August 2026", "1 Aug. 2026"),
             ("15 March 2026 - 2 April", "15 Mar. - 2 Apr. 2026"),
             ("2024.2.29", "29 Feb. 2024"),
@@ -196,7 +198,7 @@ final class IdentificationCardParsingTests: XCTestCase {
             }
         }
         let example = try CardCollectionInfo.parse("| 61 | Cameroon | Obout, Centre Reg. | May. - Aug. 2026 |\n| -- | -------- | ------------------ | ---------------- |")
-        XCTAssertEqual(example.formatted, "Obout, Centre Reg., Cameroon. May-Aug. 2026. 61 mm")
+        XCTAssertEqual(example.formatted, "Obout, Centre Reg., Cameroon. May - Aug. 2026. 61 mm")
         XCTAssertEqual(CardCollectionInfo(country: "Cameroon", wingspan: "68").formatted, "Cameroon. 68 mm")
     }
 
